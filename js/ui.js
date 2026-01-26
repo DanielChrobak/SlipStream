@@ -1,12 +1,10 @@
 import { S, $, Stage } from './state.js';
 import { toggleAudio } from './media.js';
 
-// Loading overlay elements
 const loadingEl = $('loadingOverlay');
 const statusEl = $('loadingStatus');
 const subEl = $('loadingSubstatus');
 
-// Stage messages
 const stageMessages = {
     [Stage.IDLE]: ['Connecting...', 'Initializing'],
     [Stage.CONNECT]: ['Connecting...', 'Establishing connection'],
@@ -15,23 +13,19 @@ const stageMessages = {
     [Stage.ERR]: ['Failed', 'Retrying...']
 };
 
-// Keyboard lock support
 const supportsKeyboardLock = 'keyboard' in navigator && 'lock' in navigator.keyboard;
 let keyboardLocked = false;
 
 export const isKeyboardLocked = () => keyboardLocked;
 
-// Update loading stage display
 export const updateLoadingStage = (stage, errorMsg = null) => {
     S.stage = stage;
     const [status, substatus] = stageMessages[stage] || stageMessages[Stage.IDLE];
-
     statusEl.textContent = S.isReconnecting ? 'Reconnecting...' : status;
     subEl.textContent = errorMsg || substatus;
     loadingEl.classList.toggle('reconnecting', S.isReconnecting);
 };
 
-// Show loading overlay
 export const showLoading = (isReconnect = false) => {
     S.isReconnecting = isReconnect;
     S.firstFrameReceived = false;
@@ -39,17 +33,14 @@ export const showLoading = (isReconnect = false) => {
     updateLoadingStage(Stage.IDLE);
 };
 
-// Hide loading overlay
 export const hideLoading = () => {
     S.firstFrameReceived = true;
     updateLoadingStage(Stage.OK);
     setTimeout(() => loadingEl.classList.add('hidden'), 300);
 };
 
-// Check if loading is visible
 export const isLoadingVisible = () => !loadingEl.classList.contains('hidden');
 
-// Network callback functions
 let applyFpsFn = null;
 let sendMonFn = null;
 
@@ -58,55 +49,39 @@ export const setNetCbs = (fpsCallback, monitorCallback) => {
     sendMonFn = monitorCallback;
 };
 
-// Panel elements
 const panel = $('pnl');
 const fpsSel = $('fpsSel');
 const monSel = $('monSel');
 
-// Toggle panel visibility
-const togglePanel = on => {
-    ['pnl', 'bk', 'edge'].forEach(id => $(id).classList.toggle('on', on));
-};
+const togglePanel = on => { ['pnl', 'bk', 'edge'].forEach(id => $(id).classList.toggle('on', on)); };
 
-// Panel event handlers
 $('edge').onclick = () => togglePanel(true);
 $('pnlX').onclick = () => togglePanel(false);
 $('bk').onclick = () => togglePanel(false);
 
 document.onkeydown = e => {
-    if (e.key === 'Escape' && panel.classList.contains('on') && !S.controlEnabled) {
-        togglePanel(false);
-    }
+    if (e.key === 'Escape' && panel.classList.contains('on') && !S.controlEnabled) togglePanel(false);
 };
 
-// Selection change handlers
 fpsSel.onchange = () => applyFpsFn?.(fpsSel.value);
 monSel.onchange = () => sendMonFn?.(+monSel.value);
-
-// Audio button handler
 $('aBtn').onclick = toggleAudio;
 
-// Fullscreen elements
 const fsIcon = $('fsi');
 const fsPath = $('fsp');
 const fsText = $('fst');
 
-// Fullscreen path data
 const FS_PATHS = [
-    // Enter fullscreen
     'M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3',
-    // Exit fullscreen
     'M8 3v3a2 2 0 0 1-2 2H3M16 3v3a2 2 0 0 0 2 2h3M8 21v-3a2 2 0 0 0-2-2H3M16 21v-3a2 2 0 0 1 2-2h3'
 ];
 
 const isFullscreen = () => !!document.fullscreenElement;
 
-// Set up fullscreen icon
 fsIcon.setAttribute('fill', 'none');
 fsIcon.setAttribute('stroke', 'currentColor');
 fsIcon.setAttribute('stroke-width', '2');
 
-// Update fullscreen UI
 const updateFullscreenUI = () => {
     const isFs = isFullscreen();
     fsPath.setAttribute('d', FS_PATHS[isFs ? 1 : 0]);
@@ -115,28 +90,17 @@ const updateFullscreenUI = () => {
 
 updateFullscreenUI();
 
-// Fullscreen button handler
 $('fs').onclick = () => {
-    if (isFullscreen()) {
-        document.exitFullscreen();
-    } else {
-        document.documentElement.requestFullscreen?.()
-            .catch(e => console.warn('Fullscreen:', e.message));
-    }
+    if (isFullscreen()) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.().catch(e => console.warn('Fullscreen:', e.message));
 };
 
-// Fullscreen change handler
 document.addEventListener('fullscreenchange', async () => {
     updateFullscreenUI();
-
     if (supportsKeyboardLock) {
         if (document.fullscreenElement) {
-            try {
-                await navigator.keyboard.lock(['Escape']);
-                keyboardLocked = true;
-            } catch {
-                keyboardLocked = false;
-            }
+            try { await navigator.keyboard.lock(['Escape']); keyboardLocked = true; }
+            catch { keyboardLocked = false; }
         } else {
             navigator.keyboard.unlock();
             keyboardLocked = false;
@@ -144,15 +108,7 @@ document.addEventListener('fullscreenchange', async () => {
     }
 });
 
-export const exitFullscreen = () => {
-    if (isFullscreen()) {
-        document.exitFullscreen();
-    }
-};
-
-// ============================================
-// Tabbed Mode Functionality
-// ============================================
+export const exitFullscreen = () => { if (isFullscreen()) document.exitFullscreen(); };
 
 const tabStrip = $('tabStrip');
 const tabContainer = $('tabContainer');
@@ -160,107 +116,66 @@ const tabbedModeBtn = $('tabbedModeBtn');
 const tabBackBtn = $('tabBack');
 const TABBED_MODE_KEY = 'slipstream_tabbed_mode';
 
-// Monitor icon SVG
-const monitorIcon = `
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+const monitorIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
     <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
     <line x1="8" y1="21" x2="16" y2="21"/>
     <line x1="12" y1="17" x2="12" y2="21"/>
 </svg>`;
 
-// Load tabbed mode preference from storage
 const loadTabbedMode = () => {
-    try {
-        const saved = localStorage.getItem(TABBED_MODE_KEY);
-        return saved === 'true';
-    } catch {
-        return false;
-    }
+    try { return localStorage.getItem(TABBED_MODE_KEY) === 'true'; }
+    catch { return false; }
 };
 
-// Save tabbed mode preference to storage
-const saveTabbedMode = (enabled) => {
-    try {
-        localStorage.setItem(TABBED_MODE_KEY, enabled ? 'true' : 'false');
-    } catch {}
+const saveTabbedMode = enabled => {
+    try { localStorage.setItem(TABBED_MODE_KEY, enabled ? 'true' : 'false'); } catch {}
 };
 
-// Update tabbed mode UI state
 const updateTabbedModeUI = () => {
     const enabled = S.tabbedMode;
-
     tabbedModeBtn.classList.toggle('on', enabled);
     document.body.classList.toggle('tabbed-mode', enabled);
 
-    // Only show tab strip if enabled AND there are monitors
     const shouldShow = enabled && S.monitors.length > 0;
     tabStrip.classList.toggle('visible', shouldShow);
-
-    if (shouldShow) {
-        renderTabs();
-    }
+    if (shouldShow) renderTabs();
 };
 
-// Render monitor tabs
 const renderTabs = () => {
-    if (!S.monitors.length) {
-        tabContainer.innerHTML = '';
-        return;
-    }
+    if (!S.monitors.length) { tabContainer.innerHTML = ''; return; }
 
     tabContainer.innerHTML = S.monitors.map(monitor => {
         const displayName = monitor.name || `Display ${monitor.index + 1}`;
         const resolution = `${monitor.width}x${monitor.height}`;
         const isActive = monitor.index === S.currentMon;
-
-        return `
-            <button class="tab-item${isActive ? ' active' : ''}" data-index="${monitor.index}">
-                ${monitorIcon}
-                <div class="tab-item-info">
-                    <span class="tab-item-name">${displayName}${monitor.isPrimary ? '*' : ''}</span>
-                    <span class="tab-item-res">(${resolution})</span>
-                </div>
-            </button>
-        `;
+        return `<button class="tab-item${isActive ? ' active' : ''}" data-index="${monitor.index}">
+            ${monitorIcon}
+            <div class="tab-item-info">
+                <span class="tab-item-name">${displayName}${monitor.isPrimary ? '*' : ''}</span>
+                <span class="tab-item-res">(${resolution})</span>
+            </div>
+        </button>`;
     }).join('');
 
-    // Add click handlers to tabs
     tabContainer.querySelectorAll('.tab-item').forEach(tab => {
         tab.onclick = () => {
             const index = parseInt(tab.dataset.index, 10);
-            if (index !== S.currentMon && sendMonFn) {
-                sendMonFn(index);
-            }
+            if (index !== S.currentMon && sendMonFn) sendMonFn(index);
         };
     });
 };
 
-// Toggle tabbed mode
 const toggleTabbedMode = () => {
     S.tabbedMode = !S.tabbedMode;
     saveTabbedMode(S.tabbedMode);
     updateTabbedModeUI();
 };
 
-// Initialize tabbed mode from saved preference
 S.tabbedMode = loadTabbedMode();
-
-// Tabbed mode button handlers
 tabbedModeBtn.onclick = toggleTabbedMode;
-tabBackBtn.onclick = () => {
-    S.tabbedMode = false;
-    saveTabbedMode(false);
-    updateTabbedModeUI();
-};
-
-// Initial UI update
+tabBackBtn.onclick = () => { S.tabbedMode = false; saveTabbedMode(false); updateTabbedModeUI(); };
 updateTabbedModeUI();
 
-// ============================================
-// Monitor and FPS Option Updates
-// ============================================
-
-// Update monitor selection options
 export const updateMonOpts = () => {
     if (S.monitors.length) {
         monSel.innerHTML = S.monitors.map(m => {
@@ -270,38 +185,21 @@ export const updateMonOpts = () => {
     } else {
         monSel.innerHTML = '<option value="0">Waiting...</option>';
     }
-
     monSel.value = S.currentMon;
-
-    // Also update tabs if tabbed mode is enabled
-    if (S.tabbedMode) {
-        updateTabbedModeUI();
-    }
+    if (S.tabbedMode) updateTabbedModeUI();
 };
 
-// Update FPS selection options
 export const updateFpsOpts = () => {
     const prevValue = fpsSel.value;
-
-    // Build unique sorted list of FPS values
     const fpsValues = [...new Set([15, 30, 60, S.hostFps, S.clientFps])].sort((a, b) => a - b);
 
     fpsSel.innerHTML = fpsValues.map(fps => {
         let label = String(fps);
-
-        if (fps === S.hostFps && fps === S.clientFps) {
-            label += ' (Native)';
-        } else if (fps === S.hostFps) {
-            label += ' (Host)';
-        } else if (fps === S.clientFps) {
-            label += ' (Client)';
-        }
-
+        if (fps === S.hostFps && fps === S.clientFps) label += ' (Native)';
+        else if (fps === S.hostFps) label += ' (Host)';
+        else if (fps === S.clientFps) label += ' (Client)';
         return `<option value="${fps}">${label}</option>`;
     }).join('');
 
-    // Restore previous selection if available
-    if ([...fpsSel.options].some(o => o.value === prevValue)) {
-        fpsSel.value = prevValue;
-    }
+    if ([...fpsSel.options].some(o => o.value === prevValue)) fpsSel.value = prevValue;
 };
