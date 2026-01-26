@@ -18,22 +18,7 @@
         <div class="spinner-ring"></div>
       </div>
       <div class="loading-status" id="loadingStatus">Connecting...</div>
-      <div class="loading-substatus" id="loadingSubstatus">Initializing WebRTC</div>
-      <div class="loading-stages">
-        <div class="stage" id="stageIce"><span class="stage-dot"></span><span class="stage-label">ICE</span></div>
-        <div class="stage" id="stageSignal"><span class="stage-dot"></span><span class="stage-label">Signal</span></div>
-        <div class="stage" id="stageConnect"><span class="stage-dot"></span><span class="stage-label">Connect</span></div>
-        <div class="stage" id="stageAuth"><span class="stage-dot"></span><span class="stage-label">Auth</span></div>
-        <div class="stage" id="stageStream"><span class="stage-dot"></span><span class="stage-label">Stream</span></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Escape Hold Indicator -->
-  <div class="escape-indicator" id="escapeIndicator">
-    <div class="escape-content">
-      <div class="escape-progress" id="escapeProgress"></div>
-      <span class="escape-text">Hold ESC to exit fullscreen</span>
+      <div class="loading-substatus" id="loadingSubstatus">Initializing</div>
     </div>
   </div>
 
@@ -72,19 +57,17 @@
         <input type="text" id="usernameInput" class="auth-input" maxlength="32" autocomplete="username" placeholder="Username" spellcheck="false">
       </div>
       <div class="auth-field">
-        <label class="auth-label" for="pinInput">PIN</label>
-        <input type="text" id="pinInput" class="auth-input auth-input-pin" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="------">
+        <label class="auth-label" for="passwordInput">Password</label>
+        <input type="password" id="passwordInput" class="auth-input" maxlength="128" autocomplete="current-password" placeholder="Password">
       </div>
       <p class="auth-error" id="authError"></p>
-      <button class="auth-btn" id="authSubmit">Connect</button>
+      <button class="auth-btn" id="authSubmit">Login</button>
     </div>
   </div>
 
-  <!-- Settings Panel Toggle -->
+  <!-- Settings Panel -->
   <button class="edge" id="edge"></button>
   <div class="bk" id="bk"></div>
-
-  <!-- Settings Panel -->
   <div class="pnl" id="pnl">
     <div class="ph">
       <span class="pt">Settings</span>
@@ -99,7 +82,7 @@
             </svg>
             <span>Disconnect</span>
           </button>
-          <button class="btn fss-btn" id="fs">
+          <button class="btn" id="fs">
             <svg id="fsi" viewBox="0 0 24 24"><path id="fsp"/></svg>
             <span id="fst">Fullscreen</span>
           </button>
@@ -119,32 +102,11 @@
           <span id="aStT">Tap to enable audio</span>
         </div>
       </div>
-      <div class="sec tch">
-        <div class="sl">Touch</div>
-        <div class="fst tc on">
-          <span class="fd"></span>
-          <span id="tStT">Trackpad mode</span>
-        </div>
-        <div class="tms">
-          <label class="tmo">
-            <input type="radio" name="tm" value="trackpad" checked>
-            <div class="tmr"></div>
-            <span class="tmt">Trackpad</span>
-          </label>
-          <label class="tmo">
-            <input type="radio" name="tm" value="direct">
-            <div class="tmr"></div>
-            <span class="tmt">Direct</span>
-          </label>
-        </div>
-      </div>
       <div class="sec">
         <div class="sl">Capture</div>
         <div class="sw">
           <span class="sla">Monitor</span>
-          <select class="sel" id="monSel">
-            <option value="0">Waiting...</option>
-          </select>
+          <select class="sel" id="monSel"><option value="0">Waiting...</option></select>
         </div>
         <div class="sw">
           <span class="sla">Frame Rate</span>
@@ -155,32 +117,7 @@
           </select>
         </div>
       </div>
-      <div class="sec">
-        <div class="sl">Debug</div>
-        <div class="tog" id="togS" tabindex="0">
-          <div class="tl">Stats Overlay</div>
-          <div class="ts"></div>
-        </div>
-        <div class="tog" id="togC" tabindex="0">
-          <div class="tl">Console</div>
-          <div class="ts"></div>
-        </div>
-      </div>
     </div>
-  </div>
-
-  <!-- Stats Panel -->
-  <div class="stats" id="stats">
-    <div id="sc"></div>
-  </div>
-
-  <!-- Console Panel -->
-  <div class="con" id="con">
-    <div class="ch">
-      <span class="ct">Console</span>
-      <button class="cc" id="conClr">Clear</button>
-    </div>
-    <div class="co" id="conOut"></div>
   </div>
 
   <script type="module" src="js/network.js"></script>
