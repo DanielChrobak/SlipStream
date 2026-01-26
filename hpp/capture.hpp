@@ -1,85 +1,253 @@
-/**
- * @file capture.hpp
- * @brief Screen capture implementation using Windows Graphics Capture API
- * @copyright 2025-2026 Daniel Chrobak
- */
-
 #pragma once
+
 #include "common.hpp"
+
+// ============================================================================
+// Frame Data Structure
+// ============================================================================
 
 struct FrameData {
     ID3D11Texture2D* tex = nullptr;
     int64_t ts = 0;
     uint64_t fence = 0;
     int poolIdx = -1;
+    bool needsSync = false;
 
-    void Release() { SafeRelease(tex); poolIdx = -1; }
+    void Release() {
+        SafeRelease(tex);
+        poolIdx = -1;
+        needsSync = false;
+    }
 };
+
+// ============================================================================
+// Atomic Min/Max/Average Tracker
+// ============================================================================
+
+template<typename T = int64_t>
+struct AtomicMinMaxAvg {
+    std::atomic<T> minVal{std::numeric_limits<T>::max()};
+    std::atomic<T> maxVal{0};
+    std::atomic<T> sum{0};
+    std::atomic<uint64_t> count{0};
+
+    void Record(T val) {
+        if (val <= 0) return;
+
+        count++;
+        sum += val;
+
+        // Update minimum
+        for (T m = minVal.load(); val < m && !minVal.compare_exchange_weak(m, val););
+
+        // Update maximum
+        for (T m = maxVal.load(); val > m && !maxVal.compare_exchange_weak(m, val););
+    }
+
+    void Reset() {
+        minVal = std::numeric_limits<T>::max();
+        maxVal = sum = 0;
+        count = 0;
+    }
+
+    struct Snap {
+        T min, max, avg;
+        uint64_t n;
+    };
+
+    Snap GetAndReset() {
+        Snap s{
+            minVal.exchange(std::numeric_limits<T>::max()),
+            maxVal.exchange(0),
+            0,
+            count.exchange(0)
+        };
+
+        T sm = sum.exchange(0);
+        s.avg = s.n > 0 ? sm / static_cast<T>(s.n) : 0;
+
+        if (s.min == std::numeric_limits<T>::max()) {
+            s.min = 0;
+        }
+
+        return s;
+    }
+};
+
+// ============================================================================
+// GPU Wait Metrics
+// ============================================================================
+
+struct GPUWaitMetrics {
+    AtomicMinMaxAvg<int64_t> waits;
+    std::atomic<uint64_t> timeoutCount{0};
+    std::atomic<uint64_t> alreadyCompleteCount{0};
+
+    void RecordWait(int64_t waitUs, bool timedOut) {
+        if (timedOut) {
+            timeoutCount++;
+        } else if (waitUs <= 0) {
+            alreadyCompleteCount++;
+        } else {
+            waits.Record(waitUs);
+        }
+    }
+
+    struct Snapshot {
+        int64_t minUs, maxUs, avgUs;
+        uint64_t count, timeouts, noWaitCount;
+    };
+
+    Snapshot GetAndReset() {
+        auto s = waits.GetAndReset();
+        return {
+            s.min,
+            s.max,
+            s.avg,
+            s.n,
+            timeoutCount.exchange(0),
+            alreadyCompleteCount.exchange(0)
+        };
+    }
+};
+
+// ============================================================================
+// Frame Slot (Ring Buffer for Frames)
+// ============================================================================
 
 class FrameSlot {
 private:
-    FrameData slots[3];
-    int writeIdx = 0, readIdx = -1;
+    static constexpr int SLOT_COUNT = 4;
+
+    FrameData frames[SLOT_COUNT];
     CRITICAL_SECTION cs;
-    HANDLE event;
-    uint64_t dropCount = 0;
-    std::atomic<uint32_t> inFlightMask{0};
+    HANDLE newFrameEvent;
+
+    int head = 0;
+    int tail = 0;
+    int count = 0;
+    uint32_t inFlightMask = 0;
+    std::atomic<uint64_t> droppedCount{0};
 
 public:
-    FrameSlot() { InitializeCriticalSection(&cs); event = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
-    ~FrameSlot() { DeleteCriticalSection(&cs); CloseHandle(event); for (auto& s : slots) s.Release(); }
+    FrameSlot() {
+        InitializeCriticalSection(&cs);
+        newFrameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    void Push(ID3D11Texture2D* tex, int64_t ts, uint64_t fence, int poolIdx = -1) {
+        for (int i = 0; i < SLOT_COUNT; i++) {
+            frames[i] = {};
+        }
+    }
+
+    ~FrameSlot() {
+        DeleteCriticalSection(&cs);
+        CloseHandle(newFrameEvent);
+
+        for (int i = 0; i < SLOT_COUNT; i++) {
+            frames[i].Release();
+        }
+    }
+
+    void Push(ID3D11Texture2D* tex, int64_t ts, uint64_t fence, bool needsSync, int poolIdx = -1) {
         EnterCriticalSection(&cs);
-        int idx = writeIdx;
-        writeIdx = (writeIdx + 1) % 3;
-        if (writeIdx == readIdx) writeIdx = (writeIdx + 1) % 3;
 
-        if (slots[idx].poolIdx >= 0) inFlightMask.fetch_and(~(1u << slots[idx].poolIdx));
-        slots[idx].Release();
+        // If full, drop oldest frame
+        if (count >= SLOT_COUNT) {
+            droppedCount++;
+
+            int oldPoolIdx = frames[tail].poolIdx;
+            if (oldPoolIdx >= 0) {
+                inFlightMask &= ~(1u << oldPoolIdx);
+            }
+
+            frames[tail].Release();
+            tail = (tail + 1) % SLOT_COUNT;
+            count--;
+        }
+
         tex->AddRef();
-        slots[idx] = {tex, ts, fence, poolIdx};
-        if (poolIdx >= 0) inFlightMask.fetch_or(1u << poolIdx);
-        if (readIdx >= 0) dropCount++;
-        readIdx = idx;
-        SetEvent(event);
+        frames[head] = {tex, ts, fence, poolIdx, needsSync};
+
+        if (poolIdx >= 0) {
+            inFlightMask |= (1u << poolIdx);
+        }
+
+        head = (head + 1) % SLOT_COUNT;
+        count++;
+
+        SetEvent(newFrameEvent);
         LeaveCriticalSection(&cs);
     }
 
-    bool Pop(FrameData& out, DWORD timeoutMs = 8) {
-        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
+    bool Pop(FrameData& out) {
+        WaitForSingleObject(newFrameEvent, INFINITE);
+
         EnterCriticalSection(&cs);
-        ResetEvent(event);
-        if (readIdx < 0) { LeaveCriticalSection(&cs); return false; }
-        out = slots[readIdx];
-        slots[readIdx].tex = nullptr;
-        slots[readIdx].poolIdx = -1;
-        readIdx = -1;
+
+        if (count == 0) {
+            LeaveCriticalSection(&cs);
+            return false;
+        }
+
+        out = frames[tail];
+        frames[tail].tex = nullptr;
+        frames[tail].poolIdx = -1;
+        frames[tail].needsSync = false;
+
+        tail = (tail + 1) % SLOT_COUNT;
+        count--;
+
+        if (count > 0) {
+            SetEvent(newFrameEvent);
+        }
+
         LeaveCriticalSection(&cs);
         return true;
     }
 
-    void MarkReleased(int idx) { if (idx >= 0) inFlightMask.fetch_and(~(1u << idx)); }
-    bool IsInFlight(int idx) const { return idx >= 0 && (inFlightMask.load() & (1u << idx)); }
+    void Wake() {
+        SetEvent(newFrameEvent);
+    }
+
+    void MarkReleased(int idx) {
+        if (idx < 0) return;
+
+        EnterCriticalSection(&cs);
+        inFlightMask &= ~(1u << idx);
+        LeaveCriticalSection(&cs);
+    }
+
+    bool IsInFlight(int idx) {
+        if (idx < 0) return false;
+
+        EnterCriticalSection(&cs);
+        bool r = (inFlightMask & (1u << idx)) != 0;
+        LeaveCriticalSection(&cs);
+        return r;
+    }
 
     void Reset() {
         EnterCriticalSection(&cs);
+
+        for (int i = 0; i < SLOT_COUNT; i++) {
+            frames[i].Release();
+        }
+
+        head = tail = count = 0;
         inFlightMask = 0;
-        for (auto& s : slots) s.Release();
-        writeIdx = 0; readIdx = -1;
-        ResetEvent(event);
+        ResetEvent(newFrameEvent);
+
         LeaveCriticalSection(&cs);
     }
 
     uint64_t GetDropped() {
-        EnterCriticalSection(&cs);
-        uint64_t c = dropCount; dropCount = 0;
-        LeaveCriticalSection(&cs);
-        return c;
+        return droppedCount.exchange(0);
     }
-
-    HANDLE GetEvent() const { return event; }
 };
+
+// ============================================================================
+// GPU Synchronization
+// ============================================================================
 
 class GPUSync {
 private:
@@ -88,260 +256,693 @@ private:
     ID3D11Fence* fence = nullptr;
     ID3D11Query* query = nullptr;
     HANDLE fenceEvent = nullptr;
+    HANDLE queryEvent = nullptr;
     uint64_t fenceValue = 0;
     bool useFence = false;
 
+    static inline const int64_t qpcFreq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+
+    int64_t GetUs() const {
+        LARGE_INTEGER n;
+        QueryPerformanceCounter(&n);
+        return (n.QuadPart * 1000000) / qpcFreq;
+    }
+
 public:
+    GPUWaitMetrics metrics;
+
     bool Init(ID3D11Device* device, ID3D11DeviceContext* context) {
+        queryEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!queryEvent) {
+            return false;
+        }
+
+        // Try to use D3D11 fence (preferred)
         if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5))) &&
             SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4))) &&
             SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence)))) {
+
             fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             useFence = true;
             LOG("GPU sync: Fence");
             return true;
         }
+
+        // Fall back to query-based sync
         SafeRelease(device5, context4, fence);
+
         D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
-        if (SUCCEEDED(device->CreateQuery(&qd, &query))) { LOG("GPU sync: Query"); return true; }
+        if (SUCCEEDED(device->CreateQuery(&qd, &query))) {
+            LOG("GPU sync: Query");
+            return true;
+        }
+
         return false;
     }
 
-    ~GPUSync() { if (fenceEvent) CloseHandle(fenceEvent); SafeRelease(fence, context4, device5, query); }
+    ~GPUSync() {
+        if (fenceEvent) CloseHandle(fenceEvent);
+        if (queryEvent) CloseHandle(queryEvent);
+        SafeRelease(fence, context4, device5, query);
+    }
 
-    uint64_t Signal(ID3D11DeviceContext* context) {
-        if (useFence && context4 && fence) { context4->Signal(fence, ++fenceValue); return fenceValue; }
-        if (query) context->End(query);
+    uint64_t Signal(ID3D11DeviceContext* context, bool& needsSync) {
+        needsSync = true;
+
+        if (useFence && context4 && fence) {
+            context4->Signal(fence, ++fenceValue);
+            return fenceValue;
+        }
+
+        if (query) {
+            context->End(query);
+        }
+
         return 0;
     }
 
     bool IsComplete(uint64_t value, ID3D11DeviceContext* context) {
-        return useFence ? (!fence || fence->GetCompletedValue() >= value)
-                        : (!query || context->GetData(query, nullptr, 0, 0) == S_OK);
+        if (useFence) {
+            return !fence || fence->GetCompletedValue() >= value;
+        }
+        return !query || context->GetData(query, nullptr, 0, 0) == S_OK;
     }
 
-    bool Wait(uint64_t value, ID3D11DeviceContext* context, DWORD timeoutMs = 5) {
-        if (IsComplete(value, context)) return true;
+    bool Wait(uint64_t value, ID3D11DeviceContext* context,
+              ID3D11Multithread* multithread = nullptr, DWORD timeoutMs = 16) {
+
+        int64_t startUs = GetUs();
+
+        // Fence-based wait
         if (useFence && fence && fenceEvent) {
+            if (fence->GetCompletedValue() >= value) {
+                metrics.RecordWait(0, false);
+                return true;
+            }
+
             fence->SetEventOnCompletion(value, fenceEvent);
-            return WaitForSingleObject(fenceEvent, timeoutMs) == WAIT_OBJECT_0 || IsComplete(value, context);
+            bool completed = (WaitForSingleObject(fenceEvent, timeoutMs) == WAIT_OBJECT_0) ||
+                             (fence->GetCompletedValue() >= value);
+            metrics.RecordWait(GetUs() - startUs, !completed);
+            return completed;
         }
-        for (DWORD i = 0; i < 200 && !IsComplete(value, context); i++) YieldProcessor();
-        return IsComplete(value, context);
+
+        // Query-based wait
+        if (query && queryEvent) {
+            {
+                MTLock lock(multithread);
+                context->Flush();
+                if (context->GetData(query, nullptr, 0, 0) == S_OK) {
+                    metrics.RecordWait(0, false);
+                    return true;
+                }
+            }
+
+            bool completed = false;
+            for (DWORD elapsed = 0; elapsed < timeoutMs && !completed; elapsed++) {
+                WaitForSingleObject(queryEvent, 1);
+                MTLock lock(multithread);
+                completed = context->GetData(query, nullptr, 0, 0) == S_OK;
+            }
+
+            if (!completed) {
+                MTLock lock(multithread);
+                completed = context->GetData(query, nullptr, 0, 0) == S_OK;
+            }
+
+            metrics.RecordWait(GetUs() - startUs, !completed);
+            return completed;
+        }
+
+        metrics.RecordWait(0, false);
+        return true;
+    }
+
+    bool UsesFence() const { return useFence; }
+    GPUWaitMetrics::Snapshot GetWaitMetrics() { return metrics.GetAndReset(); }
+    bool IsFenceComplete(uint64_t value) const {
+        return !useFence || !fence || fence->GetCompletedValue() >= value;
     }
 };
 
+// ============================================================================
+// Capture Metrics
+// ============================================================================
+
+struct CaptureMetrics {
+    std::atomic<uint64_t> frameCount{0};
+    std::atomic<uint64_t> capturedCount{0};
+    std::atomic<uint64_t> skippedCount{0};
+    std::atomic<uint64_t> missedCount{0};
+    AtomicMinMaxAvg<int64_t> intervals;
+    std::atomic<int64_t> lastIntervalUs{0};
+
+    void RecordInterval(int64_t us) {
+        lastIntervalUs = us;
+        intervals.Record(us);
+    }
+
+    void Reset() {
+        frameCount = capturedCount = skippedCount = missedCount = lastIntervalUs = 0;
+        intervals.Reset();
+    }
+
+    struct Snapshot {
+        uint64_t frames, captured, skipped, missed;
+        int64_t lastUs, minUs, maxUs, avgUs;
+    };
+
+    Snapshot GetAndReset() {
+        auto i = intervals.GetAndReset();
+        return {
+            frameCount.exchange(0),
+            capturedCount.exchange(0),
+            skippedCount.exchange(0),
+            missedCount.exchange(0),
+            lastIntervalUs.load(),
+            i.min, i.max, i.avg
+        };
+    }
+};
+
+// ============================================================================
+// Encoder Thread Metrics
+// ============================================================================
+
+struct EncoderThreadMetrics {
+    AtomicMinMaxAvg<int64_t> handoffs;
+    AtomicMinMaxAvg<int64_t> encodes;
+    std::atomic<uint64_t> deadlineMissCount{0};
+    std::atomic<uint64_t> stateDropCount{0};
+    std::atomic<int64_t> worstLatenessUs{0};
+
+    void RecordHandoff(int64_t us) { handoffs.Record(us); }
+    void RecordEncode(int64_t us) { encodes.Record(us); }
+
+    void RecordDeadlineMiss(int64_t latenessUs) {
+        deadlineMissCount++;
+        for (int64_t w = worstLatenessUs.load();
+             latenessUs > w && !worstLatenessUs.compare_exchange_weak(w, latenessUs););
+    }
+
+    struct Snapshot {
+        int64_t handoffMinUs, handoffMaxUs, handoffAvgUs;
+        uint64_t handoffCount;
+        int64_t encodeMinUs, encodeMaxUs, encodeAvgUs;
+        uint64_t encodeCount;
+        uint64_t deadlineMisses, stateDrops;
+        int64_t worstLatenessUs;
+    };
+
+    Snapshot GetAndReset() {
+        auto h = handoffs.GetAndReset();
+        auto e = encodes.GetAndReset();
+        return {
+            h.min, h.max, h.avg, h.n,
+            e.min, e.max, e.avg, e.n,
+            deadlineMissCount.exchange(0),
+            stateDropCount.exchange(0),
+            worstLatenessUs.exchange(0)
+        };
+    }
+};
+
+// ============================================================================
+// Screen Capture Class
+// ============================================================================
+
 class ScreenCapture {
 private:
-    static constexpr int TEX_POOL_SIZE = 8;
+    static constexpr int TEX_POOL_SIZE = 6;
+    static constexpr int WGC_FRAME_POOL_SIZE = 4;
 
+    // D3D11 resources
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     ID3D11Multithread* multithread = nullptr;
-    WGD::Direct3D11::IDirect3DDevice winrtDevice{nullptr};
 
+    // WinRT resources
+    WGD::Direct3D11::IDirect3DDevice winrtDevice{nullptr};
     WGC::GraphicsCaptureItem captureItem{nullptr};
     WGC::Direct3D11CaptureFramePool framePool{nullptr};
     WGC::GraphicsCaptureSession captureSession{nullptr};
 
+    // Texture pool
     ID3D11Texture2D* texturePool[TEX_POOL_SIZE] = {};
-    int textureIndex = 0, width = 0, height = 0, hostFps = 60;
+    uint64_t textureFences[TEX_POOL_SIZE] = {};
+    int textureIndex = 0;
 
-    std::atomic<int> targetFps{60}, currentMonitorIdx{0};
+    // Capture dimensions and timing
+    int width = 0;
+    int height = 0;
+    int hostFps = 60;
+    std::atomic<int> targetFps{60};
+    std::atomic<int> currentMonitorIdx{0};
+
+    // Synchronization
     GPUSync gpuSync;
     FrameSlot* frameSlot;
 
-    std::atomic<bool> running{true}, capturing{false}, forceSync{true}, sessionStarted{false};
+    // State flags
+    std::atomic<bool> running{true};
+    std::atomic<bool> capturing{false};
+    std::atomic<bool> sessionStarted{false};
     bool supportsMinInterval = false;
-    int64_t nextFrameTime = 0;
+
+    // Monitor
     HMONITOR currentMonitor = nullptr;
     std::mutex captureMutex;
     std::function<void(int, int, int)> onResolutionChange;
+
+    // Metrics
     std::atomic<uint64_t> textureConflicts{0};
+    int64_t lastCaptureTimestamp = 0;
+    int64_t minFrameIntervalUs = 0;
+    CaptureMetrics metrics;
+
+    // ========================================================================
+    // Find Available Texture in Pool
+    // ========================================================================
 
     int FindAvailableTexture() {
+        // First pass: find a texture not in flight and with completed fence
         for (int i = 0; i < TEX_POOL_SIZE; i++) {
             int idx = (textureIndex + i) % TEX_POOL_SIZE;
-            if (!frameSlot->IsInFlight(idx)) { textureIndex = idx + 1; return idx; }
+            if (!frameSlot->IsInFlight(idx) && gpuSync.IsFenceComplete(textureFences[idx])) {
+                textureIndex = idx + 1;
+                return idx;
+            }
         }
+
+        // Second pass: wait for fence if needed
+        for (int i = 0; i < TEX_POOL_SIZE; i++) {
+            int idx = (textureIndex + i) % TEX_POOL_SIZE;
+            if (!frameSlot->IsInFlight(idx)) {
+                if (textureFences[idx] > 0 && !gpuSync.IsFenceComplete(textureFences[idx])) {
+                    MTLock lock(multithread);
+                    gpuSync.Wait(textureFences[idx], context, multithread, 4);
+                }
+                textureIndex = idx + 1;
+                return idx;
+            }
+        }
+
         textureConflicts++;
-        return textureIndex++ % TEX_POOL_SIZE;
+        return -1;
     }
 
-    void OnFrameArrived(WGC::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&) {
+    // ========================================================================
+    // Frame Arrived Callback
+    // ========================================================================
+
+    void OnFrameArrived(WGC::Direct3D11CaptureFramePool const& sender,
+                        winrt::Windows::Foundation::IInspectable const&) {
+
         auto frame = sender.TryGetNextFrame();
-        if (!frame || !running || !capturing) return;
+        if (!frame || !running || !capturing) {
+            return;
+        }
 
         int64_t timestamp = GetTimestamp();
-        int64_t interval = 1000000 / targetFps.load();
+        metrics.frameCount++;
 
-        if (forceSync.exchange(false)) nextFrameTime = timestamp + interval;
-        else if (timestamp < nextFrameTime) return;
+        // Rate limiting
+        if (minFrameIntervalUs > 0 && lastCaptureTimestamp > 0 &&
+            (timestamp - lastCaptureTimestamp) < minFrameIntervalUs) {
+            metrics.skippedCount++;
+            return;
+        }
 
-        while (nextFrameTime <= timestamp) nextFrameTime += interval;
+        if (lastCaptureTimestamp > 0) {
+            metrics.RecordInterval(timestamp - lastCaptureTimestamp);
+        }
+        lastCaptureTimestamp = timestamp;
 
+        // Get surface
         auto surface = frame.Surface();
-        if (!surface) return;
+        if (!surface) {
+            metrics.missedCount++;
+            return;
+        }
 
+        // Get source texture
         winrt::com_ptr<ID3D11Texture2D> sourceTexture;
         auto access = surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-        if (FAILED(access->GetInterface(IID_PPV_ARGS(sourceTexture.put()))) || !sourceTexture) return;
+        if (FAILED(access->GetInterface(IID_PPV_ARGS(sourceTexture.put()))) || !sourceTexture) {
+            metrics.missedCount++;
+            return;
+        }
 
+        // Get available texture from pool
         int texIdx = FindAvailableTexture();
-        if (!texturePool[texIdx]) return;
+        if (texIdx < 0 || !texturePool[texIdx]) {
+            metrics.missedCount++;
+            return;
+        }
 
-        { MTLock lock(multithread); context->CopyResource(texturePool[texIdx], sourceTexture.get()); context->Flush(); }
-        frameSlot->Push(texturePool[texIdx], timestamp, gpuSync.Signal(context), texIdx);
+        // Copy and signal
+        bool needsSync = false;
+        uint64_t fenceValue = 0;
+        {
+            MTLock lock(multithread);
+            context->CopyResource(texturePool[texIdx], sourceTexture.get());
+            context->Flush();
+            fenceValue = gpuSync.Signal(context, needsSync);
+        }
+
+        textureFences[texIdx] = fenceValue;
+        frameSlot->Push(texturePool[texIdx], timestamp, fenceValue, needsSync, texIdx);
+        metrics.capturedCount++;
     }
 
+    // ========================================================================
+    // Initialize Monitor
+    // ========================================================================
+
     void InitializeMonitor(HMONITOR monitor) {
+        // Get monitor info
         MONITORINFOEXW mi{sizeof(mi)};
         DEVMODEW dm{.dmSize = sizeof(dm)};
-        if (GetMonitorInfoW(monitor, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
-            hostFps = targetFps = dm.dmDisplayFrequency;
 
+        if (GetMonitorInfoW(monitor, &mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+            hostFps = dm.dmDisplayFrequency;
+        }
+
+        targetFps = hostFps;
+        UpdateFrameInterval();
+
+        // Create capture item for monitor
         auto interop = winrt::get_activation_factory<WGC::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        if (FAILED(interop->CreateForMonitor(monitor, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
-                                             winrt::put_abi(captureItem))))
+        if (FAILED(interop->CreateForMonitor(
+                monitor,
+                winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+                winrt::put_abi(captureItem)))) {
             throw std::runtime_error("Failed to create capture item for monitor");
+        }
 
         width = captureItem.Size().Width;
         height = captureItem.Size().Height;
 
-        for (auto& tex : texturePool) SafeRelease(tex);
+        // Release old textures
+        for (auto& tex : texturePool) {
+            SafeRelease(tex);
+        }
+        for (auto& fence : textureFences) {
+            fence = 0;
+        }
 
+        // Create new texture pool
         D3D11_TEXTURE2D_DESC td = {
-            static_cast<UINT>(width), static_cast<UINT>(height), 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
-            {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_SHARED
+            static_cast<UINT>(width),
+            static_cast<UINT>(height),
+            1, 1,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            {1, 0},
+            D3D11_USAGE_DEFAULT,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+            0,
+            D3D11_RESOURCE_MISC_SHARED
         };
-        for (int i = 0; i < TEX_POOL_SIZE; i++)
-            if (FAILED(device->CreateTexture2D(&td, nullptr, &texturePool[i])))
-                throw std::runtime_error("Failed to create texture pool");
 
+        for (int i = 0; i < TEX_POOL_SIZE; i++) {
+            if (FAILED(device->CreateTexture2D(&td, nullptr, &texturePool[i]))) {
+                throw std::runtime_error("Failed to create texture pool");
+            }
+        }
+
+        // Create frame pool
         framePool = WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            winrtDevice, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, {width, height});
+            winrtDevice,
+            WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            WGC_FRAME_POOL_SIZE,
+            {width, height}
+        );
+
         framePool.FrameArrived({this, &ScreenCapture::OnFrameArrived});
+
+        // Create capture session
         captureSession = framePool.CreateCaptureSession(captureItem);
         captureSession.IsCursorCaptureEnabled(true);
-        try { captureSession.IsBorderRequired(false); } catch (...) {}
+
+        try {
+            captureSession.IsBorderRequired(false);
+        } catch (...) {}
+
+        if (supportsMinInterval) {
+            try {
+                captureSession.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(0));
+            } catch (...) {}
+        }
 
         sessionStarted = false;
         currentMonitor = monitor;
     }
 
-    void ApplyMinUpdateInterval() {
-        if (supportsMinInterval)
-            try { captureSession.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(10000000 / hostFps)); } catch (...) {}
+    // ========================================================================
+    // Update Frame Interval
+    // ========================================================================
+
+    void UpdateFrameInterval() {
+        int fps = targetFps.load();
+        minFrameIntervalUs = fps > 0 ? (800000 / fps) : 0;
     }
 
 public:
+    // ========================================================================
+    // Constructor
+    // ========================================================================
+
     explicit ScreenCapture(FrameSlot* slot) : frameSlot(slot) {
         LOG("Initializing screen capture...");
+
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
+        // Create D3D11 device
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_12_1,
+            D3D_FEATURE_LEVEL_12_0,
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0
+        };
         D3D_FEATURE_LEVEL actual;
 
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, _countof(levels),
-                                     D3D11_SDK_VERSION, &device, &actual, &context)))
+        if (FAILED(D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,
+                flags,
+                levels,
+                _countof(levels),
+                D3D11_SDK_VERSION,
+                &device,
+                &actual,
+                &context))) {
             throw std::runtime_error("Failed to create D3D11 device");
+        }
 
-        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&multithread))))
+        // Enable multithread protection
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&multithread)))) {
             multithread->SetMultithreadProtected(TRUE);
+        }
 
-        if (!gpuSync.Init(device, context))
+        // Initialize GPU sync
+        if (!gpuSync.Init(device, context)) {
             throw std::runtime_error("Failed to initialize GPU synchronization");
+        }
 
+        // Create WinRT device
         winrt::com_ptr<IDXGIDevice> dxgi;
         winrt::com_ptr<::IInspectable> insp;
+
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(dxgi.put()))) ||
-            FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), insp.put())))
+            FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), insp.put()))) {
             throw std::runtime_error("Failed to create WinRT device");
+        }
 
         winrtDevice = insp.as<WGD::Direct3D11::IDirect3DDevice>();
+
         RefreshMonitorList();
 
         supportsMinInterval = winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
-            L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval");
+            L"Windows.Graphics.Capture.GraphicsCaptureSession",
+            L"MinUpdateInterval"
+        );
 
         InitializeMonitor(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
-        LOG("Capture initialized: %dx%d @ %dHz", width, height, hostFps);
+
+        LOG("Capture initialized: %dx%d @ %dHz (sync: %s)",
+            width, height, hostFps, gpuSync.UsesFence() ? "fence" : "query");
     }
+
+    // ========================================================================
+    // Destructor
+    // ========================================================================
 
     ~ScreenCapture() {
         running = capturing = false;
-        try { if (captureSession) captureSession.Close(); } catch (...) {}
-        try { if (framePool) framePool.Close(); } catch (...) {}
-        for (auto& tex : texturePool) SafeRelease(tex);
+
+        try {
+            if (captureSession) captureSession.Close();
+        } catch (...) {}
+
+        try {
+            if (framePool) framePool.Close();
+        } catch (...) {}
+
+        for (auto& tex : texturePool) {
+            SafeRelease(tex);
+        }
+
         SafeRelease(multithread, context, device);
         winrt::uninit_apartment();
     }
 
-    void SetResolutionChangeCallback(std::function<void(int, int, int)> cb) { onResolutionChange = cb; }
+    // ========================================================================
+    // Public Methods
+    // ========================================================================
+
+    void SetResolutionChangeCallback(std::function<void(int, int, int)> cb) {
+        onResolutionChange = cb;
+    }
 
     void StartCapture() {
         std::lock_guard<std::mutex> lock(captureMutex);
+
         if (capturing) return;
-        frameSlot->Reset(); textureIndex = 0; forceSync = true;
-        ApplyMinUpdateInterval();
-        if (!sessionStarted.exchange(true)) captureSession.StartCapture();
+
+        frameSlot->Reset();
+        textureIndex = 0;
+        lastCaptureTimestamp = 0;
+        metrics.Reset();
+
+        for (auto& fence : textureFences) {
+            fence = 0;
+        }
+
+        if (!sessionStarted.exchange(true)) {
+            captureSession.StartCapture();
+        }
+
         capturing = true;
-        LOG("Capture started at %dHz", hostFps);
+        LOG("Capture started at target %dHz", targetFps.load());
     }
 
-    void PauseCapture() { if (capturing) { capturing = false; LOG("Capture paused"); } }
+    void PauseCapture() {
+        if (capturing) {
+            capturing = false;
+        }
+    }
 
     bool SwitchMonitor(int index) {
         std::lock_guard<std::mutex> lock(captureMutex);
         std::lock_guard<std::mutex> ml(g_monitorsMutex);
 
-        if (index < 0 || index >= static_cast<int>(g_monitors.size())) return false;
-        if (currentMonitorIdx == index && currentMonitor == g_monitors[index].hMon) return true;
+        if (index < 0 || index >= static_cast<int>(g_monitors.size())) {
+            return false;
+        }
 
-        bool was = capturing.load();
+        if (currentMonitorIdx == index && currentMonitor == g_monitors[index].hMon) {
+            return true;
+        }
+
+        bool wasCapturing = capturing.load();
         capturing = false;
 
-        try { if (captureSession) captureSession.Close(); } catch (...) {}
-        try { if (framePool) framePool.Close(); } catch (...) {}
-        captureSession = nullptr; framePool = nullptr; captureItem = nullptr;
-        frameSlot->Reset(); textureIndex = 0;
+        try {
+            if (captureSession) captureSession.Close();
+        } catch (...) {}
+
+        try {
+            if (framePool) framePool.Close();
+        } catch (...) {}
+
+        captureSession = nullptr;
+        framePool = nullptr;
+        captureItem = nullptr;
+        frameSlot->Reset();
+        textureIndex = 0;
 
         try {
             InitializeMonitor(g_monitors[index].hMon);
             currentMonitorIdx = index;
+
             LOG("Switched to monitor %d: %dx%d @ %dHz", index, width, height, hostFps);
-            if (onResolutionChange) onResolutionChange(width, height, hostFps);
-            if (was) { forceSync = true; ApplyMinUpdateInterval(); captureSession.StartCapture(); sessionStarted = true; capturing = true; }
+
+            if (onResolutionChange) {
+                onResolutionChange(width, height, hostFps);
+            }
+
+            if (wasCapturing) {
+                captureSession.StartCapture();
+                sessionStarted = true;
+                capturing = true;
+            }
+
             return true;
-        } catch (const std::exception& e) { ERR("Monitor switch failed: %s", e.what()); return false; }
+        } catch (const std::exception& e) {
+            ERR("Monitor switch failed: %s", e.what());
+            return false;
+        }
     }
 
     bool SetFPS(int fps) {
-        if (fps < 1 || fps > 240) return false;
-        if (targetFps.exchange(fps) != fps) forceSync = true;
+        if (fps < 1 || fps > 240) {
+            return false;
+        }
+
+        int oldFps = targetFps.exchange(fps);
+        if (oldFps != fps) {
+            UpdateFrameInterval();
+        }
         return true;
     }
 
     int RefreshHostFPS() {
         if (currentMonitor) {
-            MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize = sizeof(dm)};
-            if (GetMonitorInfoW(currentMonitor, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+            MONITORINFOEXW mi{sizeof(mi)};
+            DEVMODEW dm{.dmSize = sizeof(dm)};
+
+            if (GetMonitorInfoW(currentMonitor, &mi) &&
+                EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
                 hostFps = dm.dmDisplayFrequency;
+            }
         }
         return hostFps;
     }
+
+    // ========================================================================
+    // Getters
+    // ========================================================================
 
     int GetCurrentMonitorIndex() const { return currentMonitorIdx; }
     int GetHostFPS() const { return hostFps; }
     int GetCurrentFPS() const { return targetFps; }
     bool IsCapturing() const { return capturing; }
-    bool IsReady(uint64_t fence) { return gpuSync.IsComplete(fence, context); }
-    bool WaitReady(uint64_t fence) { return gpuSync.Wait(fence, context); }
+
+    bool IsReady(uint64_t fence) {
+        if (gpuSync.UsesFence()) {
+            return gpuSync.IsFenceComplete(fence);
+        }
+        MTLock lock(multithread);
+        return gpuSync.IsComplete(fence, context);
+    }
+
+    bool WaitReady(uint64_t fence) {
+        return gpuSync.Wait(fence, context, multithread, 16);
+    }
+
     uint64_t GetTexConflicts() { return textureConflicts.exchange(0); }
     ID3D11Device* GetDev() const { return device; }
     ID3D11DeviceContext* GetCtx() const { return context; }
     ID3D11Multithread* GetMT() const { return multithread; }
     int GetW() const { return width; }
     int GetH() const { return height; }
+    CaptureMetrics::Snapshot GetMetrics() { return metrics.GetAndReset(); }
+    GPUWaitMetrics::Snapshot GetGPUWaitMetrics() { return gpuSync.GetWaitMetrics(); }
 };
