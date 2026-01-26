@@ -1,16 +1,9 @@
-/**
- * @file main.cpp
- * @brief SlipStream Server - Main entry point
- * @copyright 2025-2026 Daniel Chrobak
- */
-
 #include "common.hpp"
 #include "capture.hpp"
 #include "encoder.hpp"
 #include "webrtc.hpp"
 #include "audio.hpp"
 #include "input.hpp"
-
 #include <conio.h>
 
 std::vector<MonitorInfo> g_monitors;
@@ -24,23 +17,43 @@ void RefreshMonitorList() {
         auto* mons = reinterpret_cast<std::vector<MonitorInfo>*>(lp);
         MONITORINFOEXW mi{sizeof(mi)};
         DEVMODEW dm{.dmSize = sizeof(dm)};
-        char name[64];
+        char name[64] = {};
 
-        if (!GetMonitorInfoW(hMon, &mi)) return TRUE;
+        if (!GetMonitorInfoW(hMon, &mi)) {
+            return TRUE;
+        }
+
         EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm);
-        WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
 
-        mons->push_back({hMon, static_cast<int>(mons->size()),
-            mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-            dm.dmDisplayFrequency ? static_cast<int>(dm.dmDisplayFrequency) : 60,
-            (mi.dwFlags & MONITORINFOF_PRIMARY) != 0, name});
+        // Get the friendly monitor name (e.g., "VX2768-2KP", "HP 24w") instead of device path
+        DISPLAY_DEVICEW dd = {sizeof(dd)};
+        if (EnumDisplayDevicesW(mi.szDevice, 0, &dd, 0) && dd.DeviceString[0]) {
+            WideCharToMultiByte(CP_UTF8, 0, dd.DeviceString, -1, name, sizeof(name), nullptr, nullptr);
+        } else {
+            WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, name, sizeof(name), nullptr, nullptr);
+        }
+
+        mons->push_back({
+            hMon,
+            (int)mons->size(),
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top,
+            dm.dmDisplayFrequency ? (int)dm.dmDisplayFrequency : 60,
+            (mi.dwFlags & MONITORINFOF_PRIMARY) != 0,
+            name
+        });
+
         return TRUE;
-    }, reinterpret_cast<LPARAM>(&g_monitors));
+    }, (LPARAM)&g_monitors);
 
-    std::sort(g_monitors.begin(), g_monitors.end(), [](const auto& a, const auto& b) {
+    std::sort(g_monitors.begin(), g_monitors.end(), [](auto& a, auto& b) {
         return a.isPrimary != b.isPrimary ? a.isPrimary : a.index < b.index;
     });
-    for (size_t i = 0; i < g_monitors.size(); i++) g_monitors[i].index = static_cast<int>(i);
+
+    for (size_t i = 0; i < g_monitors.size(); i++) {
+        g_monitors[i].index = (int)i;
+    }
+
     LOG("Found %zu monitor(s)", g_monitors.size());
 }
 
@@ -49,60 +62,41 @@ std::string LoadFile(const char* path) {
     return f.is_open() ? std::string(std::istreambuf_iterator<char>(f), {}) : "";
 }
 
-// Configuration with hashed password
 struct Config {
     std::string username;
     std::string passwordHash;
     std::string salt;
 } g_config;
 
-// Global authentication manager
 AuthManager g_auth;
 
 bool LoadConfig() {
     try {
         std::ifstream f("auth.json");
-        if (!f.is_open()) return false;
-        json c = json::parse(f);
+        if (!f.is_open()) {
+            return false;
+        }
 
+        json c = json::parse(f);
         if (c.contains("username") && c.contains("passwordHash") && c.contains("salt")) {
-            g_config.username = c["username"];
-            g_config.passwordHash = c["passwordHash"];
-            g_config.salt = c["salt"];
+            g_config = {
+                c["username"],
+                c["passwordHash"],
+                c["salt"]
+            };
             return g_config.username.size() >= 3 &&
                    g_config.passwordHash.size() == 64 &&
-                   g_config.salt.size() == 64;
-        }
-
-        // Handle legacy format with plaintext pin - migrate to new format
-        if (c.contains("username") && c.contains("pin")) {
-            std::string oldUsername = c["username"];
-            std::string oldPin = c["pin"];
-
-            g_config.username = oldUsername;
-            g_config.salt = GenerateSalt();
-            g_config.passwordHash = HashPassword(oldPin, g_config.salt);
-
-            std::ofstream out("auth.json");
-            out << json{
-                {"username", g_config.username},
-                {"passwordHash", g_config.passwordHash},
-                {"salt", g_config.salt}
-            }.dump(2);
-
-            LOG("Migrated auth.json from plaintext PIN to hashed password");
-            return true;
+                   g_config.salt.size() == 32;
         }
     } catch (const std::exception& e) {
-        ERR("Failed to load config: %s", e.what());
+        ERR("Config load failed: %s", e.what());
     }
     return false;
 }
 
 bool SaveConfig() {
     try {
-        std::ofstream out("auth.json");
-        out << json{
+        std::ofstream("auth.json") << json{
             {"username", g_config.username},
             {"passwordHash", g_config.passwordHash},
             {"salt", g_config.salt}
@@ -114,14 +108,23 @@ bool SaveConfig() {
 }
 
 bool ValidateUsername(const std::string& u) {
-    if (u.length() < 3 || u.length() > 32) return false;
-    for (char c : u) if (!isalnum(c) && c != '_' && c != '-') return false;
+    if (u.length() < 3 || u.length() > 32) {
+        return false;
+    }
+    for (char c : u) {
+        if (!isalnum(c) && c != '_' && c != '-') {
+            return false;
+        }
+    }
     return true;
 }
 
 bool ValidatePassword(const std::string& p) {
-    if (p.length() < 8 || p.length() > 128) return false;
-    bool hasLetter = false, hasDigit = false;
+    if (p.length() < 8 || p.length() > 128) {
+        return false;
+    }
+    bool hasLetter = false;
+    bool hasDigit = false;
     for (char c : p) {
         if (isalpha(c)) hasLetter = true;
         if (isdigit(c)) hasDigit = true;
@@ -130,35 +133,30 @@ bool ValidatePassword(const std::string& p) {
 }
 
 std::string GetPasswordInput() {
-    std::string password;
+    std::string pw;
     int ch;
 
-    while (true) {
-        ch = _getch();
-
-        if (ch == '\r' || ch == '\n') {
-            printf("\n");
-            break;
-        }
-        else if (ch == 8 || ch == 127) {
-            if (!password.empty()) {
-                password.pop_back();
+    while ((ch = _getch()) != '\r' && ch != '\n') {
+        if (ch == 8 || ch == 127) {
+            // Backspace
+            if (!pw.empty()) {
+                pw.pop_back();
                 printf("\b \b");
             }
-        }
-        else if (ch == 27) {
-            while (!password.empty()) {
-                password.pop_back();
+        } else if (ch == 27) {
+            // Escape - clear input
+            while (!pw.empty()) {
+                pw.pop_back();
                 printf("\b \b");
             }
-        }
-        else if (ch >= 32 && ch <= 126) {
-            password += static_cast<char>(ch);
+        } else if (ch >= 32 && ch <= 126) {
+            pw += (char)ch;
             printf("*");
         }
     }
 
-    return password;
+    printf("\n");
+    return pw;
 }
 
 void SetupConfig() {
@@ -169,83 +167,86 @@ void SetupConfig() {
 
     printf("\n\033[1;36m=== First Time Setup ===\033[0m\n\n\033[1mAuthentication\033[0m\n");
 
+    // Get username
     while (true) {
         printf("  Username (3-32 chars): ");
         std::getline(std::cin, g_config.username);
-        if (ValidateUsername(g_config.username)) break;
-        printf("  \033[31mInvalid username (use letters, numbers, _ or -)\033[0m\n");
+        if (ValidateUsername(g_config.username)) {
+            break;
+        }
+        printf("  \033[31mInvalid username\033[0m\n");
     }
 
-    std::string password, confirm;
+    // Get password
+    std::string pw, conf;
     while (true) {
-        printf("  Password (8+ chars, must include letter and number): ");
-        password = GetPasswordInput();
-        if (!ValidatePassword(password)) {
-            printf("  \033[31mPassword must be 8+ chars with at least one letter and one number\033[0m\n");
+        printf("  Password (8+ chars, letter+number): ");
+        pw = GetPasswordInput();
+
+        if (!ValidatePassword(pw)) {
+            printf("  \033[31mInvalid password\033[0m\n");
             continue;
         }
+
         printf("  Confirm password: ");
-        confirm = GetPasswordInput();
-        if (password == confirm) break;
+        conf = GetPasswordInput();
+
+        if (pw == conf) {
+            break;
+        }
         printf("  \033[31mPasswords don't match\033[0m\n");
     }
 
     g_config.salt = GenerateSalt();
-    g_config.passwordHash = HashPassword(password, g_config.salt);
+    g_config.passwordHash = HashPassword(pw, g_config.salt);
 
     if (SaveConfig()) {
-        printf("\n\033[32mConfiguration saved to auth.json (password is hashed)\033[0m\n\n");
+        printf("\n\033[32mConfiguration saved\033[0m\n\n");
     } else {
-        printf("\n\033[31mFailed to save configuration\033[0m\n");
+        printf("\n\033[31mFailed to save\033[0m\n");
         SetupConfig();
     }
 }
 
-// ============================================================================
-// HTTP Helpers
-// ============================================================================
-
 std::string ExtractBearerToken(const httplib::Request& req) {
     auto it = req.headers.find("Authorization");
-    if (it != req.headers.end() && it->second.substr(0, 7) == "Bearer ")
+    if (it != req.headers.end() && it->second.substr(0, 7) == "Bearer ") {
         return it->second.substr(7);
+    }
     return "";
 }
 
 std::string GetClientIP(const httplib::Request& req) {
     auto it = req.headers.find("X-Forwarded-For");
     if (it != req.headers.end() && !it->second.empty()) {
-        size_t comma = it->second.find(',');
-        return comma != std::string::npos ? it->second.substr(0, comma) : it->second;
+        size_t c = it->second.find(',');
+        return c != std::string::npos ? it->second.substr(0, c) : it->second;
     }
     return req.remote_addr;
 }
 
-void JsonError(httplib::Response& res, int status, const std::string& error) {
+void JsonError(httplib::Response& res, int status, const std::string& err) {
     res.status = status;
-    res.set_content(json{{"error", error}}.dump(), "application/json");
+    res.set_content(json{{"error", err}}.dump(), "application/json");
 }
 
-// Middleware: Require valid session token
 template<typename F>
-auto AuthRequired(F handler) {
-    return [handler](const httplib::Request& req, httplib::Response& res) {
-        std::string token = ExtractBearerToken(req);
-        if (token.empty() || !g_auth.ValidateSession(token)) {
-            JsonError(res, 401, token.empty() ? "Authentication required" : "Session expired or invalid");
+auto AuthRequired(F h) {
+    return [h](const httplib::Request& req, httplib::Response& res) {
+        std::string t = ExtractBearerToken(req);
+        if (t.empty() || !g_auth.ValidateSession(t)) {
+            JsonError(res, 401, t.empty() ? "Authentication required" : "Session expired");
             return;
         }
-        handler(req, res, token);
+        h(req, res, t);
     };
 }
 
-// Middleware: Parse JSON body with error handling
 template<typename F>
-auto JsonHandler(F handler) {
-    return [handler](const httplib::Request& req, httplib::Response& res) {
+auto JsonHandler(F h) {
+    return [h](const httplib::Request& req, httplib::Response& res) {
         try {
-            auto body = json::parse(req.body);
-            handler(req, res, body);
+            h(req, res, json::parse(req.body));
         } catch (...) {
             JsonError(res, 400, "Invalid JSON");
         }
@@ -254,20 +255,21 @@ auto JsonHandler(F handler) {
 
 int main() {
     try {
-        SetConsoleOutputCP(CP_UTF8); SetConsoleCP(CP_UTF8);
-        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (h != INVALID_HANDLE_VALUE) {
+        // Setup console
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+
+        if (HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE); h != INVALID_HANDLE_VALUE) {
             DWORD m = 0;
-            if (GetConsoleMode(h, &m)) SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            if (GetConsoleMode(h, &m)) {
+                SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
         }
 
-        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-        if (hIn != INVALID_HANDLE_VALUE) {
-            DWORD mode = 0;
-            if (GetConsoleMode(hIn, &mode)) {
-                mode &= ~ENABLE_QUICK_EDIT_MODE;
-                mode |= ENABLE_EXTENDED_FLAGS;
-                SetConsoleMode(hIn, mode);
+        if (HANDLE h = GetStdHandle(STD_INPUT_HANDLE); h != INVALID_HANDLE_VALUE) {
+            DWORD m = 0;
+            if (GetConsoleMode(h, &m)) {
+                SetConsoleMode(h, (m & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
             }
         }
 
@@ -277,282 +279,594 @@ int main() {
         constexpr int PORT = 6060;
         SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 
+        // Initialize components
         FrameSlot frameSlot;
-        auto rtcServer = std::make_shared<WebRTCServer>();
-
+        EncoderThreadMetrics encMetrics;
+        auto rtc = std::make_shared<WebRTCServer>();
         ScreenCapture capture(&frameSlot);
+
         std::unique_ptr<AV1Encoder> encoder;
-        std::mutex encoderMutex;
-        std::atomic<bool> encoderReady{false}, running{true};
+        std::mutex encMtx;
+        std::atomic<bool> encReady{false};
+        std::atomic<bool> running{true};
 
-        InputHandler inputHandler;
-        inputHandler.Enable();
+        InputHandler input;
+        input.Enable();
 
-        auto updateInputBounds = [&](int idx) {
-            std::lock_guard<std::mutex> lock(g_monitorsMutex);
-            if (idx >= 0 && idx < static_cast<int>(g_monitors.size()))
-                inputHandler.UpdateFromMonitorInfo(g_monitors[idx]);
+        auto updateBounds = [&](int i) {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            if (i >= 0 && i < (int)g_monitors.size()) {
+                input.UpdateFromMonitorInfo(g_monitors[i]);
+            }
         };
+        updateBounds(capture.GetCurrentMonitorIndex());
 
-        updateInputBounds(capture.GetCurrentMonitorIndex());
+        // Initialize audio capture
+        std::unique_ptr<AudioCapture> audio;
+        try {
+            audio = std::make_unique<AudioCapture>();
+        } catch (...) {
+            // Audio capture failed, continue without it
+        }
 
-        std::unique_ptr<AudioCapture> audioCapture;
-        try { audioCapture = std::make_unique<AudioCapture>(); } catch (...) {}
-
-        auto createEncoder = [&](int w, int h, int fps) {
-            std::lock_guard<std::mutex> lock(encoderMutex);
-            encoderReady = false;
+        // Encoder creation lambda
+        auto mkEncoder = [&](int w, int h, int fps) {
+            std::lock_guard<std::mutex> lk(encMtx);
+            encReady = false;
             encoder.reset();
+
             try {
-                encoder = std::make_unique<AV1Encoder>(w, h, fps, capture.GetDev(), capture.GetCtx(), capture.GetMT());
-                encoderReady = true;
-                LOG("Encoder: %dx%d @ %d FPS", w, h, fps);
+                encoder = std::make_unique<AV1Encoder>(
+                    w, h, fps,
+                    capture.GetDev(),
+                    capture.GetCtx(),
+                    capture.GetMT()
+                );
+                encReady = true;
+                LOG("Encoder: %dx%d@%d", w, h, fps);
             } catch (const std::exception& e) {
                 ERR("Encoder: %s", e.what());
             }
         };
 
-        createEncoder(capture.GetW(), capture.GetH(), capture.GetHostFPS());
-        capture.SetResolutionChangeCallback([&](int w, int h, int fps) { createEncoder(w, h, fps); });
+        mkEncoder(capture.GetW(), capture.GetH(), capture.GetHostFPS());
 
-        // Initialize WebRTC with all callbacks at once
-        rtcServer->Init({
-            .inputHandler = &inputHandler,
-            .onFpsChange = [&](int fps, uint8_t) {
+        capture.SetResolutionChangeCallback([&](int w, int h, int fps) {
+            mkEncoder(w, h, fps);
+        });
+
+        // Initialize WebRTC callbacks
+        rtc->Init({
+            &input,
+            [&](int fps, uint8_t) {
                 capture.SetFPS(fps);
-                if (!capture.IsCapturing()) capture.StartCapture();
+                if (!capture.IsCapturing()) {
+                    capture.StartCapture();
+                }
+                frameSlot.Wake();
             },
-            .getHostFps = [&] { return capture.RefreshHostFPS(); },
-            .onMonitorChange = [&](int idx) {
-                bool ok = capture.SwitchMonitor(idx);
+            [&] { return capture.RefreshHostFPS(); },
+            [&](int i) {
+                bool ok = capture.SwitchMonitor(i);
                 if (ok) {
-                    updateInputBounds(idx);
-                    std::thread([&] { std::this_thread::sleep_for(100ms); inputHandler.WiggleCenter(); }).detach();
+                    updateBounds(i);
+                    std::thread([&] {
+                        std::this_thread::sleep_for(100ms);
+                        input.WiggleCenter();
+                    }).detach();
                 }
                 return ok;
             },
-            .getCurrentMonitor = [&] { return capture.GetCurrentMonitorIndex(); },
-            .onDisconnect = [&] { capture.PauseCapture(); },
-            .onConnected = [&] {
-                std::thread([&] { std::this_thread::sleep_for(100ms); inputHandler.WiggleCenter(); }).detach();
+            [&] { return capture.GetCurrentMonitorIndex(); },
+            [&] {
+                capture.PauseCapture();
+                frameSlot.Wake();
+            },
+            [&] {
+                frameSlot.Wake();
+                std::thread([&] {
+                    std::this_thread::sleep_for(100ms);
+                    input.WiggleCenter();
+                }).detach();
             }
         });
 
-        httplib::Server httpServer;
+        httplib::Server srv;
 
-        // CORS and caching headers
-        httpServer.set_post_routing_handler([](auto&, auto& r) {
-            r.set_header("Access-Control-Allow-Origin", "*");
-            r.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            r.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-            r.set_header("Cache-Control", "no-cache");
+        // Security headers - remove CORS wildcards, add CSP and other protections
+        srv.set_post_routing_handler([](const httplib::Request& req, httplib::Response& r) {
+            std::string origin = req.get_header_value("Origin");
+
+            if (!origin.empty()) {
+                std::string host = req.get_header_value("Host");
+
+                // Extract host from origin (remove protocol)
+                size_t protocolEnd = origin.find("://");
+                std::string originHost = (protocolEnd != std::string::npos)
+                    ? origin.substr(protocolEnd + 3)
+                    : origin;
+
+                // Remove port from comparison if present
+                size_t portPos = originHost.find(':');
+                size_t hostPortPos = host.find(':');
+                std::string originHostNoPort = (portPos != std::string::npos)
+                    ? originHost.substr(0, portPos)
+                    : originHost;
+                std::string hostNoPort = (hostPortPos != std::string::npos)
+                    ? host.substr(0, hostPortPos)
+                    : host;
+
+                // Allow localhost variants and same host
+                bool isLocalhost = (originHostNoPort == "localhost" ||
+                                   originHostNoPort == "127.0.0.1" ||
+                                   hostNoPort == "localhost" ||
+                                   hostNoPort == "127.0.0.1");
+                bool isSameHost = (originHostNoPort == hostNoPort);
+
+                if (isLocalhost || isSameHost) {
+                    r.set_header("Access-Control-Allow-Origin", origin);
+                    r.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    r.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                    r.set_header("Access-Control-Allow-Credentials", "true");
+                }
+            }
+
+            // Security headers
+            r.set_header("X-Content-Type-Options", "nosniff");
+            r.set_header("X-Frame-Options", "SAMEORIGIN");
+            r.set_header("Referrer-Policy", "strict-origin-when-cross-origin");
+            r.set_header("X-XSS-Protection", "1; mode=block");
+            r.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            r.set_header("Pragma", "no-cache");
+
+            // Content Security Policy
+            r.set_header("Content-Security-Policy",
+                "default-src 'self'; "
+                "script-src 'self'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "connect-src 'self' wss: ws:; "
+                "frame-ancestors 'self'; "
+                "form-action 'self'; "
+                "base-uri 'self'");
         });
 
-        httpServer.Options(".*", [](auto&, auto& r) { r.status = 204; });
+        // Routes
+        srv.Options(".*", [](auto&, auto& r) {
+            r.status = 204;
+        });
 
-        // Static file routes
-        httpServer.Get("/", [](auto&, auto& r) {
+        srv.Get("/", [](auto&, auto& r) {
             auto c = LoadFile("index.html");
             r.set_content(c.empty() ? "<h1>index.html not found</h1>" : c, "text/html");
         });
-        httpServer.Get("/styles.css", [](auto&, auto& r) {
+
+        srv.Get("/styles.css", [](auto&, auto& r) {
             r.set_content(LoadFile("styles.css"), "text/css");
         });
 
-        for (auto js : {"input", "media", "network", "renderer", "state", "ui"})
-            httpServer.Get(std::string("/js/") + js + ".js", [js](auto&, auto& r) {
+        // JavaScript routes
+        for (auto js : {"input", "media", "network", "renderer", "state", "ui"}) {
+            srv.Get(std::string("/js/") + js + ".js", [js](auto&, auto& r) {
                 r.set_content(LoadFile((std::string("js/") + js + ".js").c_str()), "application/javascript");
             });
+        }
 
         // Authentication endpoint
-        httpServer.Post("/api/auth", JsonHandler([&](const httplib::Request& req, httplib::Response& res, const json& body) {
-            std::string clientIP = GetClientIP(req);
+        srv.Post("/api/auth", JsonHandler([&](const httplib::Request& req, httplib::Response& res, const json& body) {
+            std::string ip = GetClientIP(req);
 
-            if (!g_auth.IsAllowed(clientIP)) {
+            if (!g_auth.IsAllowed(ip)) {
                 res.status = 429;
-                res.set_content(json{{"error", "Too many failed attempts"}, {"lockoutSeconds", g_auth.LockoutSecondsRemaining(clientIP)}}.dump(), "application/json");
-                WARN("Rate limited auth attempt from %s", clientIP.c_str());
+                res.set_content(json{
+                    {"error", "Too many attempts"},
+                    {"lockoutSeconds", g_auth.LockoutSecondsRemaining(ip)}
+                }.dump(), "application/json");
+                WARN("Rate limited: %s", ip.c_str());
                 return;
             }
 
-            std::string username = body.value("username", "");
-            std::string password = body.value("password", "");
+            std::string u = body.value("username", "");
+            std::string p = body.value("password", "");
 
-            if (username.empty() || password.empty()) {
-                g_auth.RecordAttempt(clientIP, false);
-                JsonError(res, 400, "Username and password required");
+            if (u.empty() || p.empty()) {
+                g_auth.RecordAttempt(ip, false);
+                JsonError(res, 400, "Credentials required");
                 return;
             }
 
-            bool valid = (username == g_config.username) && VerifyPassword(password, g_config.salt, g_config.passwordHash);
-
-            if (!valid) {
-                g_auth.RecordAttempt(clientIP, false);
+            if (u != g_config.username || !VerifyPassword(p, g_config.salt, g_config.passwordHash)) {
+                g_auth.RecordAttempt(ip, false);
                 res.status = 401;
-                res.set_content(json{{"error", "Invalid credentials"}, {"remainingAttempts", g_auth.RemainingAttempts(clientIP)}}.dump(), "application/json");
-                WARN("Failed auth attempt from %s (user: %s)", clientIP.c_str(), username.c_str());
+                res.set_content(json{
+                    {"error", "Invalid credentials"},
+                    {"remainingAttempts", g_auth.RemainingAttempts(ip)}
+                }.dump(), "application/json");
+                WARN("Failed auth: %s (%s)", ip.c_str(), u.c_str());
                 return;
             }
 
-            g_auth.RecordAttempt(clientIP, true);
-            std::string token = g_auth.CreateSession(username, clientIP);
-            res.set_content(json{{"token", token}, {"expiresIn", 24 * 60 * 60}}.dump(), "application/json");
-            LOG("User '%s' authenticated from %s", username.c_str(), clientIP.c_str());
+            g_auth.RecordAttempt(ip, true);
+            res.set_content(json{
+                {"token", g_auth.CreateSession(u, ip)},
+                {"expiresIn", 86400}
+            }.dump(), "application/json");
+            LOG("Auth: %s from %s", u.c_str(), ip.c_str());
         }));
 
         // Logout endpoint
-        httpServer.Post("/api/logout", [&](const httplib::Request& req, httplib::Response& res) {
-            std::string token = ExtractBearerToken(req);
-            if (!token.empty()) g_auth.InvalidateSession(token);
-            res.set_content(json{{"success", true}}.dump(), "application/json");
+        srv.Post("/api/logout", [&](const httplib::Request& req, httplib::Response& res) {
+            if (auto t = ExtractBearerToken(req); !t.empty()) {
+                g_auth.InvalidateSession(t);
+            }
+            res.set_content(R"({"success":true})", "application/json");
         });
 
         // Session validation endpoint
-        httpServer.Get("/api/session", AuthRequired([&](const httplib::Request&, httplib::Response& res, const std::string& token) {
-            res.set_content(json{{"valid", true}, {"username", g_auth.GetUsername(token)}}.dump(), "application/json");
+        srv.Get("/api/session", AuthRequired([&](auto&, httplib::Response& res, const std::string& t) {
+            res.set_content(json{
+                {"valid", true},
+                {"username", g_auth.GetUsername(t)}
+            }.dump(), "application/json");
         }));
 
         // WebRTC offer endpoint
-        httpServer.Post("/api/offer", AuthRequired([&](const httplib::Request& req, httplib::Response& res, const std::string& token) {
+        srv.Post("/api/offer", AuthRequired([&](const httplib::Request& req, httplib::Response& res, const std::string& t) {
+            // Security: Limit SDP size to prevent DoS attacks
+            constexpr size_t MAX_SDP_SIZE = 65536;  // 64KB max for SDP
+
+            if (req.body.size() > MAX_SDP_SIZE) {
+                JsonError(res, 413, "Payload too large");
+                WARN("Rejected oversized offer: %zu bytes from %s", req.body.size(), GetClientIP(req).c_str());
+                return;
+            }
+
             try {
                 auto body = json::parse(req.body);
-                std::string offer = body["sdp"].get<std::string>();
-                std::string username = g_auth.GetUsername(token);
 
-                LOG("Received offer from authenticated user '%s' (%s)", username.c_str(), GetClientIP(req).c_str());
+                if (!body.contains("sdp") || !body["sdp"].is_string()) {
+                    JsonError(res, 400, "Missing or invalid SDP");
+                    return;
+                }
 
-                rtcServer->SetRemote(offer, "offer");
-                std::string answer = rtcServer->GetLocal();
+                std::string offer = body["sdp"];
 
-                if (answer.empty()) {
+                if (offer.empty() || offer.size() > MAX_SDP_SIZE) {
+                    JsonError(res, 400, "Invalid SDP size");
+                    return;
+                }
+
+                std::string user = g_auth.GetUsername(t);
+                LOG("Offer from %s (%s)", user.c_str(), GetClientIP(req).c_str());
+
+                rtc->SetRemote(offer, "offer");
+                std::string ans = rtc->GetLocal();
+
+                if (ans.empty()) {
                     JsonError(res, 500, "Failed to generate answer");
                     return;
                 }
 
-                if (size_t p = answer.find("a=setup:actpass"); p != std::string::npos)
-                    answer.replace(p, 15, "a=setup:active");
+                // Fix setup attribute
+                if (size_t p = ans.find("a=setup:actpass"); p != std::string::npos) {
+                    ans.replace(p, 15, "a=setup:active");
+                }
 
-                res.set_content(json{{"sdp", answer}, {"type", "answer"}}.dump(), "application/json");
-                LOG("Sent answer to user '%s'", username.c_str());
+                res.set_content(json{
+                    {"sdp", ans},
+                    {"type", "answer"}
+                }.dump(), "application/json");
 
+                LOG("Answer to %s", user.c_str());
             } catch (const std::exception& e) {
-                ERR("Offer error: %s", e.what());
+                ERR("Offer: %s", e.what());
                 JsonError(res, 400, "Invalid offer");
             }
         }));
 
-        std::thread serverThread([&] { httpServer.listen("0.0.0.0", PORT); });
+        // Start server thread
+        std::thread srvThread([&] {
+            srv.listen("0.0.0.0", PORT);
+        });
         std::this_thread::sleep_for(100ms);
 
-        std::thread cleanupThread([&] {
+        // Cleanup thread
+        std::thread cleanThread([&] {
             while (running) {
                 std::this_thread::sleep_for(std::chrono::minutes(5));
                 g_auth.Cleanup();
             }
         });
 
-        printf("\n\033[1;36m==========================================\033[0m\n");
-        printf("\033[1;36m            SLIPSTREAM SERVER             \033[0m\n");
-        printf("\033[1;36m==========================================\033[0m\n\n");
-        printf("  \033[1mLocal:\033[0m  http://localhost:%d\n\n", PORT);
-        printf("  User: %s | Display: %dHz\n", g_config.username.c_str(), capture.GetHostFPS());
-        printf("  Auth: HTTP-based with hashed passwords\n");
-        printf("\033[1;36m==========================================\033[0m\n\n");
+        // Print server info
+        printf("\n\033[1;36m========================================\033[0m\n");
+        printf("\033[1;36m          SLIPSTREAM SERVER           \033[0m\n");
+        printf("\033[1;36m========================================\033[0m\n");
+        printf("  Local: http://localhost:%d\n", PORT);
+        printf("  User: %s | %dHz | Mode: no-vsync\n", g_config.username.c_str(), capture.GetHostFPS());
+        printf("\033[1;36m========================================\033[0m\n\n");
 
-        if (audioCapture) audioCapture->Start();
+        // Start audio
+        if (audio) {
+            audio->Start();
+        }
 
+        // Audio thread
         std::thread audioThread([&] {
-            if (!audioCapture) return;
+            if (!audio) return;
+
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             AudioPacket pkt;
+
             while (running) {
-                if (!rtcServer->IsStreaming()) { std::this_thread::sleep_for(10ms); continue; }
-                if (audioCapture->PopPacket(pkt, 5))
-                    rtcServer->SendAudio(pkt.data, pkt.ts, pkt.samples);
+                if (!rtc->IsStreaming()) {
+                    std::this_thread::sleep_for(10ms);
+                    continue;
+                }
+
+                if (audio->PopPacket(pkt, 5)) {
+                    rtc->SendAudio(pkt.data, pkt.ts, pkt.samples);
+                }
             }
         });
 
+        // Stats thread
         std::thread statsThread([&] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-            uint64_t hist[10] = {};
-            int idx = 0;
+
+            uint64_t uptime = 0;
+            uint64_t sesFrames = 0;
+            uint64_t sesBytes = 0;
+            uint64_t sesDrops = 0;
+
             while (running) {
                 std::this_thread::sleep_for(1s);
-                auto stats = rtcServer->GetStats();
+                uptime++;
+
+                auto st = rtc->GetStats();
                 uint64_t enc = 0;
+                uint64_t encFailed = 0;
+                EncoderGPUMetrics::Snapshot encGpu = {};
+                int encW = 0;
+                int encH = 0;
+
                 {
-                    std::lock_guard<std::mutex> lock(encoderMutex);
-                    if (encoder) enc = encoder->GetEncoded();
+                    std::lock_guard<std::mutex> lk(encMtx);
+                    if (encoder) {
+                        enc = encoder->GetEncoded();
+                        encFailed = encoder->GetFailed();
+                        encGpu = encoder->GetGPUMetrics();
+                        encW = encoder->GetWidth();
+                        encH = encoder->GetHeight();
+                    }
                 }
-                hist[idx++ % 10] = enc;
-                int cnt = std::min(idx, 10);
-                uint64_t sum = 0;
-                for (int i = 0; i < cnt; i++) sum += hist[i];
 
-                const char* st = stats.connected
-                    ? (rtcServer->IsStreaming() ? "\033[32m[LIVE]\033[0m" : "\033[33m[WAIT]\033[0m")
-                    : "\033[33m[WAIT]\033[0m";
+                CaptureMetrics::Snapshot cap = capture.GetMetrics();
+                GPUWaitMetrics::Snapshot capGpu = capture.GetGPUWaitMetrics();
+                EncoderThreadMetrics::Snapshot encTh = encMetrics.GetAndReset();
+                PacedSendMetrics::Snapshot paced = rtc->GetPacedMetrics();
 
-                printf("%s FPS: %3llu @ %d | %5.2f Mbps | V:%4llu A:%3llu | Avg: %.1f\n",
-                       st, enc, capture.GetCurrentFPS(),
-                       stats.bytes * 8.0 / 1048576.0,
-                       stats.sent, rtcServer->GetAudioSent(),
-                       cnt > 0 ? static_cast<double>(sum) / cnt : 0.0);
+                size_t qDepth = rtc->GetSendQueueDepth();
+                uint64_t dropped = frameSlot.GetDropped();
+                uint64_t texConflicts = capture.GetTexConflicts();
+                auto inputStats = input.GetStats();
+                uint64_t audioSent = rtc->GetAudioSent();
+
+                sesFrames += enc;
+                sesBytes += st.bytes;
+                sesDrops += dropped + st.dropped;
+
+                double mbps = st.bytes * 8.0 / 1048576.0;
+                int targetFps = capture.GetCurrentFPS();
+                double fpsEff = targetFps > 0 ? (enc * 100.0 / targetFps) : 0;
+
+                double capMs = cap.avgUs / 1000.0;
+                double handMs = encTh.handoffCount > 0 ? encTh.handoffAvgUs / 1000.0 : 0;
+                double encMs = encTh.encodeCount > 0 ? encTh.encodeAvgUs / 1000.0 : 0;
+                double gpuMs = (encGpu.count > 0 ? encGpu.avgUs : 0) / 1000.0;
+                double netMs = paced.avgFrameSendTimeUs / 1000.0;
+                double totalMs = capMs + handMs + encMs + gpuMs + netMs;
+
+                const char* status = st.connected
+                    ? (rtc->IsStreaming() ? "\033[32m[LIVE]\033[0m" : "\033[33m[WAIT]\033[0m")
+                    : "\033[33m[IDLE]\033[0m";
+
+                if (!st.connected) {
+                    printf("%s Waiting for connection... (%llus)\n", status, uptime);
+                    continue;
+                }
+
+                printf("\n\033[1;36m━━━ [%llus] %s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n",
+                       uptime, status);
+
+                printf("\033[1;33m[THROUGHPUT]\033[0m FPS: %llu/%d (%.1f%%) | Bitrate: %.2f Mbps | V:%llu A:%llu | Res: %dx%d\n",
+                       enc, targetFps, fpsEff, mbps, st.sent, audioSent, encW, encH);
+
+                printf("\033[1;33m[PIPELINE]\033[0m Total: %.2fms | Cap:%.2f + Hand:%.2f + Enc:%.2f + GPU:%.2f + Net:%.2fms\n",
+                       totalMs, capMs, handMs, encMs, gpuMs, netMs);
+
+                if (cap.captured > 0 || cap.frames > 0) {
+                    printf("\033[1;33m[CAPTURE]\033[0m Captured: %llu/%llu arrived | Interval: %.2f/%.2f/%.2fms (min/avg/max) | Miss:%llu Skip:%llu\n",
+                           cap.captured, cap.frames,
+                           cap.minUs / 1000.0, cap.avgUs / 1000.0, cap.maxUs / 1000.0,
+                           cap.missed, cap.skipped);
+
+                    if (capGpu.count + capGpu.noWaitCount > 0 || capGpu.timeouts > 0) {
+                        printf("         GPU Wait: %.2f/%.2f/%.2fms (min/avg/max) | n:%llu noWait:%llu timeout:%llu\n",
+                               capGpu.minUs / 1000.0, capGpu.avgUs / 1000.0, capGpu.maxUs / 1000.0,
+                               capGpu.count, capGpu.noWaitCount, capGpu.timeouts);
+                    }
+                }
+
+                if (encTh.handoffCount > 0 || encTh.encodeCount > 0) {
+                    printf("\033[1;33m[ENCODER]\033[0m Handoff: %.2f/%.2f/%.2fms (n:%llu) | Encode: %.2f/%.2f/%.2fms (n:%llu)\n",
+                           encTh.handoffMinUs / 1000.0, encTh.handoffAvgUs / 1000.0, encTh.handoffMaxUs / 1000.0, encTh.handoffCount,
+                           encTh.encodeMinUs / 1000.0, encTh.encodeAvgUs / 1000.0, encTh.encodeMaxUs / 1000.0, encTh.encodeCount);
+
+                    if (encGpu.count + encGpu.noWait > 0 || encGpu.timeouts > 0) {
+                        printf("         GPU Sync: %.2f/%.2f/%.2fms (n:%llu noWait:%llu timeout:%llu)\n",
+                               encGpu.minUs / 1000.0, encGpu.avgUs / 1000.0, encGpu.maxUs / 1000.0,
+                               encGpu.count, encGpu.noWait, encGpu.timeouts);
+                    }
+                }
+
+                if (st.sent > 0 || paced.drainEvents > 0) {
+                    printf("\033[1;33m[NETWORK]\033[0m Queue: avg:%llu max:%llu depth:%zu | Burst: %llu/%llu avg/max | Drains:%llu\n",
+                           paced.avgQueueDepth, paced.maxQueueDepth, qDepth,
+                           paced.avgBurst, paced.maxBurst, paced.drainEvents);
+
+                    if (paced.avgFrameSendTimeUs > 0 || paced.maxFrameSendTimeUs > 0) {
+                        printf("         Send Time: %.2f/%.2fms (avg/max)\n",
+                               paced.avgFrameSendTimeUs / 1000.0, paced.maxFrameSendTimeUs / 1000.0);
+                    }
+                }
+
+                uint64_t totalDrops = dropped + st.dropped + encTh.deadlineMisses + encTh.stateDrops + encFailed;
+                if (totalDrops > 0 || texConflicts > 0) {
+                    printf("\033[1;31m[DROPS]\033[0m Slot:%llu Net:%llu Deadline:%llu State:%llu EncFail:%llu TexConflict:%llu\n",
+                           dropped, st.dropped, encTh.deadlineMisses, encTh.stateDrops, encFailed, texConflicts);
+
+                    if (encTh.worstLatenessUs > 0) {
+                        printf("         Worst deadline miss: %.2fms\n", encTh.worstLatenessUs / 1000.0);
+                    }
+                }
+
+                if (inputStats.moves > 0 || inputStats.clicks > 0 || inputStats.keys > 0 ||
+                    inputStats.blocked > 0 || inputStats.rateLimited > 0) {
+                    printf("\033[1;33m[INPUT]\033[0m Mouse: %llu moves, %llu clicks | Keys: %llu",
+                           inputStats.moves, inputStats.clicks, inputStats.keys);
+
+                    if (inputStats.blocked > 0 || inputStats.rateLimited > 0) {
+                        printf(" | \033[33mBlocked:%llu RateLim:%llu\033[0m", inputStats.blocked, inputStats.rateLimited);
+                    }
+                    printf("\n");
+                }
+
+                if (uptime % 10 == 0) {
+                    double avgFps = (double)sesFrames / uptime;
+                    double avgMbps = (sesBytes * 8.0 / 1048576.0) / uptime;
+                    printf("\033[1;35m[SESSION]\033[0m Uptime: %llus | Frames: %llu (%.1f avg) | Data: %.2fMB (%.2f Mbps avg) | Drops: %llu\n",
+                           uptime, sesFrames, avgFps, sesBytes / 1048576.0, avgMbps, sesDrops);
+                }
             }
         });
 
-        std::thread encodeThread([&] {
+        // Encoder thread
+        std::thread encThread([&] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
             FrameData fd;
-            bool was = false;
+            bool wasStreaming = false;
+            int64_t period = 16667;
+
             while (running) {
-                if (!rtcServer->IsStreaming() || !encoderReady) {
-                    std::this_thread::sleep_for(10ms);
-                    was = false;
+                if (!frameSlot.Pop(fd)) {
                     continue;
                 }
-                if (!frameSlot.Pop(fd)) continue;
 
-                bool streaming = rtcServer->IsStreaming() && encoderReady;
-                if (streaming && !was) {
-                    LOG("Streaming at %d FPS", rtcServer->GetCurrentFps());
-                    std::lock_guard<std::mutex> lock(encoderMutex);
-                    if (encoder) encoder->Flush();
+                int64_t popTime = GetTimestamp();
+                int64_t handoff = popTime - fd.ts;
+                bool isStreaming = rtc->IsStreaming() && encReady.load();
+
+                // Streaming state changed
+                if (isStreaming && !wasStreaming) {
+                    LOG("Streaming at %d FPS", rtc->GetCurrentFps());
+                    std::lock_guard<std::mutex> lk(encMtx);
+                    if (encoder) {
+                        encoder->Flush();
+                    }
+                    int fps = rtc->GetCurrentFps();
+                    period = fps > 0 ? 1000000 / fps : 16667;
                 }
-                was = streaming;
+                wasStreaming = isStreaming;
 
-                if (!streaming || !fd.tex) {
+                // Not streaming or no texture
+                if (!isStreaming || !fd.tex) {
+                    encMetrics.stateDropCount++;
                     frameSlot.MarkReleased(fd.poolIdx);
                     fd.Release();
                     continue;
                 }
 
-                // Wait for GPU sync if needed (handles both fence and query modes)
-                if (fd.needsSync && !capture.IsReady(fd.fence) && !capture.WaitReady(fd.fence)) {
+                // Update period based on current FPS
+                if (int fps = rtc->GetCurrentFps(); fps > 0) {
+                    period = 1000000 / fps;
+                }
+
+                // Check deadline
+                int64_t deadline = (period * 3) / 2;
+                int64_t late = handoff - deadline;
+
+                if (late > 0) {
+                    encMetrics.RecordDeadlineMiss(late);
+                    WARN("Frame late %.2fms", late / 1000.0);
                     frameSlot.MarkReleased(fd.poolIdx);
                     fd.Release();
                     continue;
                 }
+
+                encMetrics.RecordHandoff(handoff);
+
+                // Wait for GPU fence if needed
+                if (fd.needsSync && !capture.WaitReady(fd.fence)) {
+                    WARN("Capture fence timeout ts=%lld", fd.ts);
+                    encMetrics.stateDropCount++;
+                    frameSlot.MarkReleased(fd.poolIdx);
+                    fd.Release();
+                    continue;
+                }
+
+                // Encode frame
+                int64_t encodeStart = GetTimestamp();
+                bool encoded = false;
 
                 {
-                    std::lock_guard<std::mutex> lock(encoderMutex);
-                    if (encoder)
-                        if (auto* out = encoder->Encode(fd.tex, fd.ts, rtcServer->NeedsKey()))
-                            rtcServer->Send(*out);
+                    std::lock_guard<std::mutex> lk(encMtx);
+                    if (encoder) {
+                        if (auto* out = encoder->Encode(fd.tex, fd.ts, rtc->NeedsKey())) {
+                            rtc->Send(*out);
+                            encoded = true;
+                        }
+                    }
                 }
+
+                encMetrics.RecordEncode(GetTimestamp() - encodeStart);
+
+                // Wait for encoder GPU work to complete
+                if (encoded) {
+                    std::lock_guard<std::mutex> lk(encMtx);
+                    if (encoder && !encoder->IsEncodeComplete()) {
+                        int retries = 0;
+                        while (!encoder->IsEncodeComplete() && retries++ < 8) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(500));
+                        }
+                        if (retries >= 8) {
+                            WARN("Encoder GPU work incomplete");
+                        }
+                    }
+                }
+
                 frameSlot.MarkReleased(fd.poolIdx);
                 fd.Release();
             }
         });
 
-        serverThread.join();
+        // Wait for server thread
+        srvThread.join();
+
+        // Cleanup
         running = false;
-        SetEvent(frameSlot.GetEvent());
-        encodeThread.join();
+        frameSlot.Wake();
+
+        encThread.join();
         audioThread.join();
         statsThread.join();
-        cleanupThread.join();
-        if (audioCapture) audioCapture->Stop();
+        cleanThread.join();
+
+        if (audio) {
+            audio->Stop();
+        }
+
         LOG("Shutdown complete");
 
     } catch (const std::exception& e) {
@@ -560,5 +874,6 @@ int main() {
         getchar();
         return 1;
     }
+
     return 0;
 }

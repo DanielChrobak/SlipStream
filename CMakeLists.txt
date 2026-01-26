@@ -1,34 +1,36 @@
-# SlipStream - CMake Build Configuration
-# Copyright 2025-2026 Daniel Chrobak
-
 cmake_minimum_required(VERSION 3.20)
 project(SlipStream LANGUAGES CXX)
 
+# C++ Standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# vcpkg toolchain
 set(CMAKE_TOOLCHAIN_FILE "C:/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
 
-# MSVC Optimization Flags
+# MSVC optimizations
 if(MSVC)
     string(REPLACE "/Ob2" "/Ob3" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL /GS- /fp:fast")
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /OPT:REF /OPT:ICF")
 endif()
 
-# Required Dependencies
+# Find packages
 find_package(LibDataChannel REQUIRED)
 find_package(httplib REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(Opus REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# Find FFmpeg components
 find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h)
 find_library(AVCODEC_LIBRARY avcodec)
 find_path(AVUTIL_INCLUDE_DIR libavutil/avutil.h)
 find_library(AVUTIL_LIBRARY avutil)
 
-# Source Files
-set(HEADERS
+# Executable
+add_executable(SlipStream
+    main.cpp
     hpp/common.hpp
     hpp/capture.hpp
     hpp/encoder.hpp
@@ -37,35 +39,19 @@ set(HEADERS
     hpp/input.hpp
 )
 
-set(SOURCES main.cpp)
-
-# Web Client Files
-set(WEB_FILES
-    index.html
-    styles.css
+# Compile definitions
+target_compile_definitions(SlipStream PRIVATE
+    CPPHTTPLIB_OPENSSL_SUPPORT
 )
 
-set(JS_FILES
-    js/input.js
-    js/media.js
-    js/network.js
-    js/renderer.js
-    js/state.js
-    js/ui.js
-)
-
-# Executable Target
-add_executable(SlipStream ${SOURCES} ${HEADERS})
-
-# Enable OpenSSL support for cpp-httplib
-target_compile_definitions(SlipStream PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-
+# Include directories
 target_include_directories(SlipStream PRIVATE
     ${AVCODEC_INCLUDE_DIR}
     ${AVUTIL_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/hpp
 )
 
+# Link libraries
 target_link_libraries(SlipStream PRIVATE
     LibDataChannel::LibDataChannel
     httplib::httplib
@@ -77,7 +63,7 @@ target_link_libraries(SlipStream PRIVATE
     ${AVUTIL_LIBRARY}
 )
 
-# Windows-specific Configuration
+# Windows-specific settings
 if(WIN32)
     target_link_libraries(SlipStream PRIVATE
         ws2_32
@@ -107,67 +93,53 @@ if(WIN32)
     )
 endif()
 
-# Output Directory
+# Output directories
 set_target_properties(SlipStream PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/bin/Debug
     RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin/Release
 )
 
-# Copy Web Files to Output Directory
-foreach(WEB_FILE ${WEB_FILES})
+# Copy web files to output directory
+foreach(F index.html styles.css)
     add_custom_command(TARGET SlipStream POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${CMAKE_SOURCE_DIR}/${WEB_FILE}
-            $<TARGET_FILE_DIR:SlipStream>/${WEB_FILE}
+            ${CMAKE_SOURCE_DIR}/${F}
+            $<TARGET_FILE_DIR:SlipStream>/${F}
     )
 endforeach()
 
+# Copy JavaScript files
 add_custom_command(TARGET SlipStream POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:SlipStream>/js
 )
 
-foreach(JS_FILE ${JS_FILES})
+foreach(F input media network renderer state ui)
     add_custom_command(TARGET SlipStream POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${CMAKE_SOURCE_DIR}/${JS_FILE}
-            $<TARGET_FILE_DIR:SlipStream>/${JS_FILE}
+            ${CMAKE_SOURCE_DIR}/js/${F}.js
+            $<TARGET_FILE_DIR:SlipStream>/js/${F}.js
     )
 endforeach()
 
-foreach(CONFIG_FILE ${CONFIG_FILES})
-    add_custom_command(TARGET SlipStream POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${CMAKE_SOURCE_DIR}/${CONFIG_FILE}
-            $<TARGET_FILE_DIR:SlipStream>/${CONFIG_FILE}
-    )
-endforeach()
-
-# Installation Configuration
+# Installation
 install(TARGETS SlipStream RUNTIME DESTINATION .)
-install(FILES ${CMAKE_SOURCE_DIR}/index.html DESTINATION .)
-install(FILES ${CMAKE_SOURCE_DIR}/styles.css DESTINATION .)
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/js DESTINATION .)
-
-# Install Runtime DLLs
+install(FILES index.html styles.css DESTINATION .)
+install(DIRECTORY js DESTINATION .)
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/Release/
     DESTINATION .
     FILES_MATCHING PATTERN "*.dll"
 )
 
-# CPack Configuration
+# CPack configuration
 set(CPACK_PACKAGE_NAME "SlipStream")
 set(CPACK_PACKAGE_VENDOR "SlipStream")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Low-latency remote desktop streaming with AV1 encoding")
 set(CPACK_PACKAGE_VERSION "1.0.0")
-set(CPACK_PACKAGE_VERSION_MAJOR "1")
-set(CPACK_PACKAGE_VERSION_MINOR "0")
-set(CPACK_PACKAGE_VERSION_PATCH "0")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "SlipStream")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE.txt")
 
-# NSIS Installer Settings
+# NSIS installer settings
 set(CPACK_NSIS_DISPLAY_NAME "SlipStream")
-set(CPACK_NSIS_PACKAGE_NAME "SlipStream")
 set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/icon.ico")
@@ -178,11 +150,9 @@ endif()
 set(CPACK_NSIS_CREATE_ICONS_EXTRA
     "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\SlipStream.lnk' '$INSTDIR\\\\SlipStream.exe'"
 )
-
 set(CPACK_NSIS_DELETE_ICONS_EXTRA
     "Delete '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\SlipStream.lnk'"
 )
 
 set(CPACK_GENERATOR "ZIP")
-
 include(CPack)
