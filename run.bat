@@ -2,7 +2,5 @@
 net session >nul 2>&1 || (powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs" & exit /b)
 cd /d "%~dp0"
 if not exist "build\bin\Release\SlipStream.exe" (echo Run build.bat first & pause & exit /b 1)
-cd build\bin\Release
-SlipStream.exe
-cd ..\..\..
-pause
+cd build\bin\Release && SlipStream.exe
+if errorlevel 1 (cd ..\..\.. & echo [ERROR] SlipStream exited with error %errorlevel% & pause)

@@ -4,19 +4,10 @@
     "description": "Low-latency remote desktop streaming with AV1 encoding",
     "dependencies": [
         "libdatachannel",
-        {
-            "name": "cpp-httplib",
-            "features": ["openssl"]
-        },
+        {"name": "cpp-httplib", "features": ["openssl"]},
         "nlohmann-json",
         "opus",
         "openssl",
-        {
-            "name": "ffmpeg",
-            "features": [
-                "nvcodec",
-                "avcodec"
-            ]
-        }
+        {"name": "ffmpeg", "features": ["nvcodec", "avcodec"]}
     ]
 }

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
     <title>SlipStream</title>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -10,9 +10,7 @@
     <canvas id="c"></canvas>
 
     <div class="tab-strip" id="tabStrip">
-        <button class="tab-back" id="tabBack">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
-        </button>
+        <button class="tab-back" id="tabBack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
         <div class="tab-container" id="tabContainer"></div>
     </div>
 
@@ -26,11 +24,7 @@
 
     <div class="auth-overlay" id="authOverlay">
         <div class="auth-container">
-            <div class="auth-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-                </svg>
-            </div>
+            <div class="auth-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
             <h2 class="auth-title">Authentication</h2>
             <p class="auth-subtitle">Enter credentials to connect</p>
             <div class="auth-field">
@@ -57,40 +51,23 @@
         <div class="pc">
             <div class="sec">
                 <div class="btn-row">
-                    <button class="btn" id="disconnectBtn">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg>
-                        <span>Logout</span>
-                    </button>
-                    <button class="btn" id="fs">
-                        <svg id="fsi" viewBox="0 0 24 24"><path id="fsp"/></svg>
-                        <span id="fst">Fullscreen</span>
-                    </button>
+                    <button class="btn" id="disconnectBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg><span>Logout</span></button>
+                    <button class="btn" id="fs"><svg id="fsi" viewBox="0 0 24 24"><path id="fsp"/></svg><span id="fst">Fullscreen</span></button>
                 </div>
             </div>
             <div class="sec">
                 <div class="sl">Audio</div>
-                <button class="btn bf" id="aBtn">
-                    <svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-                    <span id="aTxt">Enable</span>
-                </button>
+                <button class="btn bf" id="aBtn"><svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span id="aTxt">Enable</span></button>
             </div>
             <div class="sec">
                 <div class="sl">Capture</div>
-                <div class="sw">
-                    <span class="sla">Monitor</span>
-                    <select class="sel" id="monSel"><option value="0">Waiting...</option></select>
-                </div>
-                <div class="sw">
-                    <span class="sla">Frame Rate</span>
-                    <select class="sel" id="fpsSel"><option value="15">15 FPS</option><option value="30">30 FPS</option><option value="60">60 FPS</option></select>
-                </div>
+                <div class="sw"><span class="sla">Monitor</span><select class="sel" id="monSel"><option value="0">Waiting...</option></select></div>
+                <div class="sw"><span class="sla">Frame Rate</span><select class="sel" id="fpsSel"><option value="15">15 FPS</option><option value="30">30 FPS</option><option value="60">60 FPS</option></select></div>
+                <div class="sw"><span class="sla">Codec</span><select class="sel" id="codecSel"><option value="0">H.264</option><option value="1">AV1</option></select></div>
             </div>
             <div class="sec">
                 <div class="sl">Display</div>
-                <div class="sw">
-                    <span class="sla">Tabbed mode</span>
-                    <button class="tog" id="tabbedModeBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button>
-                </div>
+                <div class="sw"><span class="sla">Tabbed mode</span><button class="tog" id="tabbedModeBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
             </div>
         </div>
     </div>
