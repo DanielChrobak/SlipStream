@@ -3,9 +3,6 @@
 #include "common.hpp"
 #include "encoder.hpp"
 #include "input.hpp"
-#include <chrono>
-
-using namespace std::chrono;
 
 #pragma pack(push, 1)
 struct PacketHeader { int64_t timestamp; uint32_t encodeTimeUs, frameId; uint16_t chunkIndex, totalChunks; uint8_t frameType; };
@@ -20,37 +17,8 @@ struct WebRTCCallbacks {
     std::function<int()> getCurrentMonitor;
     std::function<void()> onDisconnect;
     std::function<void()> onConnected;
-};
-
-struct PacedSendMetrics {
-    std::atomic<uint64_t> queueDepthSum{0}, queueDepthSamples{0}, maxQueueDepth{0};
-    std::atomic<int64_t> frameSendTimeSum{0}, frameSendTimeSamples{0}, maxFrameSendTime{0};
-    std::atomic<uint64_t> burstSum{0}, burstSamples{0}, maxBurst{0}, pacedDrainCount{0};
-
-    void RecordQueueDepth(uint64_t depth) {
-        queueDepthSum += depth; queueDepthSamples++;
-        for (uint64_t m = maxQueueDepth.load(); depth > m && !maxQueueDepth.compare_exchange_weak(m, depth););
-    }
-
-    void RecordFrameSendTime(int64_t us) {
-        frameSendTimeSum += us; frameSendTimeSamples++;
-        for (int64_t m = maxFrameSendTime.load(); us > m && !maxFrameSendTime.compare_exchange_weak(m, us););
-    }
-
-    void RecordBurst(uint64_t size) {
-        burstSum += size; burstSamples++;
-        for (uint64_t m = maxBurst.load(); size > m && !maxBurst.compare_exchange_weak(m, size););
-    }
-
-    struct Snapshot { uint64_t avgQueueDepth, maxQueueDepth; int64_t avgFrameSendTimeUs, maxFrameSendTimeUs; uint64_t avgBurst, maxBurst, drainEvents; };
-
-    Snapshot GetAndReset() {
-        uint64_t qds = queueDepthSamples.exchange(0), qdsum = queueDepthSum.exchange(0);
-        int64_t fss = frameSendTimeSamples.exchange(0), fssum = frameSendTimeSum.exchange(0);
-        uint64_t bs = burstSamples.exchange(0), bsum = burstSum.exchange(0);
-        return {qds > 0 ? qdsum / qds : 0, maxQueueDepth.exchange(0), fss > 0 ? fssum / fss : 0,
-                maxFrameSendTime.exchange(0), bs > 0 ? bsum / bs : 0, maxBurst.exchange(0), pacedDrainCount.exchange(0)};
-    }
+    std::function<bool(CodecType)> onCodecChange;
+    std::function<CodecType()> getCodec;
 };
 
 class WebRTCServer {
@@ -69,32 +37,28 @@ class WebRTCServer {
     static constexpr size_t HEADER_SIZE = sizeof(PacketHeader), DATA_CHUNK_SIZE = CHUNK_SIZE - HEADER_SIZE;
     static constexpr size_t BUFFER_LOW_THRESHOLD = CHUNK_SIZE * 16, MAX_QUEUE_FRAMES = 3;
 
-    std::vector<uint8_t> packetBuffer, audioBuffer;
+    std::vector<uint8_t> audioBuffer;
 
     std::atomic<uint64_t> sentCount{0}, byteCount{0}, dropCount{0}, audioSentCount{0};
     std::atomic<uint32_t> frameId{0};
     std::atomic<int> currentFps{60}, overflowCount{0};
-    std::atomic<uint8_t> currentFpsMode{0};
     std::atomic<int64_t> lastPingTime{0};
     std::atomic<bool> pingTimeout{false};
     std::atomic<int> candidateCount{0};
 
-    struct QueuedPacket { std::vector<uint8_t> data; uint32_t frameId; bool isLastChunk; int64_t queuedAt; };
+    struct QueuedPacket { std::vector<uint8_t> data; uint32_t frameId; bool isLastChunk; };
     std::queue<QueuedPacket> sendQueue;
     std::mutex sendQueueMutex;
-    std::atomic<bool> drainScheduled{false};
 
-    struct FrameSendState { int64_t startTime{0}; uint32_t frameId{0}; bool active{false}; };
-    FrameSendState currentFrameSend;
-    std::mutex frameSendMutex;
-    PacedSendMetrics pacedMetrics;
+    std::atomic<CodecType> currentCodec{CODEC_H264};
     WebRTCCallbacks cb;
+    PacedSendMetrics pacedMetrics;
 
     bool SafeSend(const void* data, size_t len) {
         auto ch = dataChannel;
         if (!ch || !ch->isOpen()) return false;
         try { ch->send(reinterpret_cast<const std::byte*>(data), len); return true; }
-        catch (const std::exception& e) { LOG("[WebRTC] SafeSend exception: %s", e.what()); return false; }
+        catch (...) { return false; }
     }
 
     void DrainSendQueue() {
@@ -102,27 +66,18 @@ class WebRTCServer {
         auto ch = dataChannel;
         if (!ch || !ch->isOpen() || sendQueue.empty()) return;
 
-        size_t packetsSent = 0, bytesSent = 0;
+        size_t bytesSent = 0, packetsSent = 0;
+        size_t startQueueSize = sendQueue.size();
         while (!sendQueue.empty()) {
             if (ch->bufferedAmount() > BUFFER_THRESHOLD) break;
             QueuedPacket& pkt = sendQueue.front();
-            if (!SafeSend(pkt.data.data(), pkt.data.size())) {
-                overflowCount++; dropCount++; needsKeyframe = true; sendQueue.pop(); continue;
-            }
-            bytesSent += pkt.data.size(); packetsSent++;
-            bool wasLastChunk = pkt.isLastChunk;
-            uint32_t pktFrameId = pkt.frameId;
+            if (!SafeSend(pkt.data.data(), pkt.data.size())) { overflowCount++; dropCount++; needsKeyframe = true; sendQueue.pop(); continue; }
+            bytesSent += pkt.data.size();
+            packetsSent++;
             sendQueue.pop();
-            if (wasLastChunk) {
-                std::lock_guard<std::mutex> flock(frameSendMutex);
-                if (currentFrameSend.active && currentFrameSend.frameId == pktFrameId) {
-                    pacedMetrics.RecordFrameSendTime(GetTimestamp() - currentFrameSend.startTime);
-                    currentFrameSend.active = false;
-                }
-            }
         }
-        if (packetsSent > 0) { byteCount += bytesSent; pacedMetrics.RecordBurst(packetsSent); pacedMetrics.pacedDrainCount++; }
-        pacedMetrics.RecordQueueDepth(sendQueue.size());
+        if (bytesSent > 0) byteCount += bytesSent;
+        if (packetsSent > 0) pacedMetrics.RecordDrain(startQueueSize, packetsSent);
     }
 
     void SendHostInfo() {
@@ -148,12 +103,10 @@ class WebRTCServer {
             *reinterpret_cast<uint16_t*>(&buf[off]) = static_cast<uint16_t>(m.width);
             *reinterpret_cast<uint16_t*>(&buf[off + 2]) = static_cast<uint16_t>(m.height);
             *reinterpret_cast<uint16_t*>(&buf[off + 4]) = static_cast<uint16_t>(m.refreshRate);
-            off += 6;
-            buf[off++] = m.isPrimary ? 1 : 0;
+            off += 6; buf[off++] = m.isPrimary ? 1 : 0;
             size_t nl = std::min(m.name.size(), size_t(63));
             buf[off++] = static_cast<uint8_t>(nl);
-            memcpy(&buf[off], m.name.c_str(), nl);
-            off += nl;
+            memcpy(&buf[off], m.name.c_str(), nl); off += nl;
         }
         SafeSend(buf.data(), off);
     }
@@ -161,8 +114,7 @@ class WebRTCServer {
     void ForceDisconnect(const char* reason) {
         if (!connected) return;
         WARN("Disconnect: %s", reason);
-        connected = fpsReceived = authenticated = false;
-        overflowCount = 0; pingTimeout = false;
+        connected = fpsReceived = authenticated = false; overflowCount = 0; pingTimeout = false;
         { std::lock_guard<std::mutex> lock(sendQueueMutex); while (!sendQueue.empty()) sendQueue.pop(); }
         try { if (dataChannel) dataChannel->close(); } catch (...) {}
         try { if (peerConnection) peerConnection->close(); } catch (...) {}
@@ -182,8 +134,7 @@ class WebRTCServer {
             case MSG_PING:
                 if (msg.size() == 16) {
                     lastPingTime = GetTimestamp() / 1000; overflowCount = 0; pingTimeout = false;
-                    uint8_t resp[24];
-                    memcpy(resp, msg.data(), 16);
+                    uint8_t resp[24]; memcpy(resp, msg.data(), 16);
                     *reinterpret_cast<uint64_t*>(resp + 16) = GetTimestamp();
                     SafeSend(resp, sizeof(resp));
                 }
@@ -194,22 +145,31 @@ class WebRTCServer {
                     uint8_t mode = static_cast<uint8_t>(msg[6]);
                     if (fps >= 1 && fps <= 240 && mode <= 2) {
                         int actual = (mode == 1 && cb.getHostFps) ? cb.getHostFps() : fps;
-                        currentFps = actual; currentFpsMode = mode; fpsReceived = true;
+                        currentFps = actual; fpsReceived = true;
                         if (cb.onFpsChange) cb.onFpsChange(actual, mode);
-                        uint8_t ack[7];
-                        *reinterpret_cast<uint32_t*>(ack) = MSG_FPS_ACK;
-                        *reinterpret_cast<uint16_t*>(ack + 4) = static_cast<uint16_t>(actual);
-                        ack[6] = mode;
+                        uint8_t ack[7]; *reinterpret_cast<uint32_t*>(ack) = MSG_FPS_ACK;
+                        *reinterpret_cast<uint16_t*>(ack + 4) = static_cast<uint16_t>(actual); ack[6] = mode;
+                        SafeSend(ack, sizeof(ack));
+                    }
+                }
+                break;
+            case MSG_CODEC_SET:
+                if (msg.size() == 5) {
+                    uint8_t codecId = static_cast<uint8_t>(msg[4]);
+                    if (codecId <= 1) {
+                        CodecType newCodec = static_cast<CodecType>(codecId);
+                        bool success = !cb.onCodecChange || cb.onCodecChange(newCodec);
+                        if (success) { currentCodec = newCodec; needsKeyframe = true; }
+                        uint8_t ack[5]; *reinterpret_cast<uint32_t*>(ack) = MSG_CODEC_ACK;
+                        ack[4] = static_cast<uint8_t>(currentCodec.load());
                         SafeSend(ack, sizeof(ack));
                     }
                 }
                 break;
             case MSG_REQUEST_KEY: needsKeyframe = true; break;
             case MSG_MONITOR_SET:
-                if (msg.size() == 5 && cb.onMonitorChange) {
-                    if (cb.onMonitorChange(static_cast<int>(static_cast<uint8_t>(msg[4])))) {
-                        needsKeyframe = true; SendMonitorList(); SendHostInfo();
-                    }
+                if (msg.size() == 5 && cb.onMonitorChange && cb.onMonitorChange(static_cast<int>(static_cast<uint8_t>(msg[4])))) {
+                    needsKeyframe = true; SendMonitorList(); SendHostInfo();
                 }
                 break;
         }
@@ -237,8 +197,7 @@ class WebRTCServer {
     void SetupPeerConnection() {
         if (peerConnection) {
             if (dataChannel && dataChannel->isOpen()) dataChannel->close();
-            dataChannel.reset();
-            peerConnection->close();
+            dataChannel.reset(); peerConnection->close();
         }
         connected = needsKeyframe = true;
         fpsReceived = gatheringComplete = authenticated = hasLocalDescription = false;
@@ -250,10 +209,7 @@ class WebRTCServer {
 
         peerConnection->onLocalDescription([this](rtc::Description d) {
             std::lock_guard<std::mutex> lock(descMutex);
-            localDescription = std::string(d);
-            hasLocalDescription = true;
-            descCondition.notify_all();
-            LOG("Local description ready");
+            localDescription = std::string(d); hasLocalDescription = true; descCondition.notify_all();
         });
 
         peerConnection->onLocalCandidate([this](rtc::Candidate) { if (++candidateCount >= 2) descCondition.notify_all(); });
@@ -266,10 +222,7 @@ class WebRTCServer {
         });
 
         peerConnection->onGatheringStateChange([this](auto state) {
-            if (state == rtc::PeerConnection::GatheringState::Complete) {
-                gatheringComplete = true; descCondition.notify_all();
-                LOG("ICE gathering complete (%d candidates)", candidateCount.load());
-            }
+            if (state == rtc::PeerConnection::GatheringState::Complete) { gatheringComplete = true; descCondition.notify_all(); }
         });
 
         peerConnection->onDataChannel([this](auto ch) { if (ch->label() != "screen") return; dataChannel = ch; SetupDataChannelCallbacks(); });
@@ -286,7 +239,7 @@ public:
     WebRTCServer() {
         rtcConfig.iceServers.push_back(rtc::IceServer("stun:stun.l.google.com:19302"));
         rtcConfig.portRangeBegin = 50000; rtcConfig.portRangeEnd = 50020; rtcConfig.enableIceTcp = false;
-        packetBuffer.resize(CHUNK_SIZE); audioBuffer.resize(4096);
+        audioBuffer.resize(4096);
         SetupPeerConnection();
         LOG("WebRTC initialized");
     }
@@ -295,12 +248,8 @@ public:
 
     std::string GetLocal() {
         std::unique_lock<std::mutex> lock(descMutex);
-        if (!descCondition.wait_for(lock, 200ms, [this] { return hasLocalDescription.load(); })) {
-            WARN("Timeout waiting for description");
-            return localDescription;
-        }
+        if (!descCondition.wait_for(lock, 200ms, [this] { return hasLocalDescription.load(); })) return localDescription;
         descCondition.wait_for(lock, 150ms, [this] { return gatheringComplete.load() || candidateCount.load() >= 2; });
-        LOG("Returning answer with %d candidates (gathering %s)", candidateCount.load(), gatheringComplete.load() ? "complete" : "partial");
         return localDescription;
     }
 
@@ -311,11 +260,11 @@ public:
     }
 
     bool IsConnected() const { return connected; }
-    bool IsAuthenticated() const { return authenticated; }
-    bool IsFpsReceived() const { return fpsReceived; }
     bool IsStreaming() const { return connected && authenticated && fpsReceived; }
     int GetCurrentFps() const { return currentFps; }
     bool NeedsKey() { return needsKeyframe.exchange(false); }
+    CodecType GetCurrentCodec() const { return currentCodec.load(); }
+    void SetCodec(CodecType codec) { currentCodec = codec; }
 
     void Send(const EncodedFrame& frame) {
         if (!IsStreaming()) return;
@@ -327,9 +276,10 @@ public:
         size_t numChunks = (dataSize + DATA_CHUNK_SIZE - 1) / DATA_CHUNK_SIZE;
         if (numChunks > 65535 || !dataSize) return;
 
-        int64_t now = GetTimestamp();
         uint32_t currentFrameId = frameId++;
         size_t maxQueueSize = numChunks * MAX_QUEUE_FRAMES;
+
+        LARGE_INTEGER sendStart; QueryPerformanceCounter(&sendStart);
 
         {
             std::lock_guard<std::mutex> lock(sendQueueMutex);
@@ -340,29 +290,27 @@ public:
             }
         }
 
-        { std::lock_guard<std::mutex> flock(frameSendMutex); currentFrameSend = {now, currentFrameId, true}; }
-
-        PacketHeader hdr = {frame.ts, static_cast<uint32_t>(frame.encUs), currentFrameId, 0,
-                           static_cast<uint16_t>(numChunks), frame.isKey ? uint8_t(1) : uint8_t(0)};
+        PacketHeader hdr = {frame.ts, static_cast<uint32_t>(frame.encUs), currentFrameId, 0, static_cast<uint16_t>(numChunks), frame.isKey ? uint8_t(1) : uint8_t(0)};
 
         {
             std::lock_guard<std::mutex> lock(sendQueueMutex);
             for (size_t i = 0; i < numChunks; i++) {
                 hdr.chunkIndex = static_cast<uint16_t>(i);
-                size_t off = i * DATA_CHUNK_SIZE;
-                size_t len = std::min(DATA_CHUNK_SIZE, dataSize - off);
+                size_t off = i * DATA_CHUNK_SIZE, len = std::min(DATA_CHUNK_SIZE, dataSize - off);
                 QueuedPacket pkt;
                 pkt.data.resize(HEADER_SIZE + len);
                 memcpy(pkt.data.data(), &hdr, HEADER_SIZE);
                 memcpy(pkt.data.data() + HEADER_SIZE, frame.data.data() + off, len);
-                pkt.frameId = currentFrameId;
-                pkt.isLastChunk = (i == numChunks - 1);
-                pkt.queuedAt = now;
+                pkt.frameId = currentFrameId; pkt.isLastChunk = (i == numChunks - 1);
                 sendQueue.push(std::move(pkt));
             }
         }
         sentCount++;
         DrainSendQueue();
+
+        LARGE_INTEGER sendEnd; QueryPerformanceCounter(&sendEnd);
+        static const int64_t qpcFreq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+        pacedMetrics.RecordFrameSend((sendEnd.QuadPart - sendStart.QuadPart) * 1000000 / qpcFreq);
     }
 
     void SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples) {
@@ -373,10 +321,7 @@ public:
             size_t total = sizeof(AudioPacketHeader) + data.size();
             if (audioBuffer.size() < total) audioBuffer.resize(total);
             auto* hdr = reinterpret_cast<AudioPacketHeader*>(audioBuffer.data());
-            hdr->magic = MSG_AUDIO_DATA;
-            hdr->timestamp = ts;
-            hdr->samples = static_cast<uint16_t>(samples);
-            hdr->dataLength = static_cast<uint16_t>(data.size());
+            hdr->magic = MSG_AUDIO_DATA; hdr->timestamp = ts; hdr->samples = static_cast<uint16_t>(samples); hdr->dataLength = static_cast<uint16_t>(data.size());
             memcpy(audioBuffer.data() + sizeof(AudioPacketHeader), data.data(), data.size());
             if (SafeSend(audioBuffer.data(), total)) { byteCount += total; audioSentCount++; }
         } catch (...) {}

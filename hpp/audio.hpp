@@ -8,11 +8,7 @@ extern "C" {
 #include <opus/opus.h>
 }
 
-struct AudioPacket {
-    std::vector<uint8_t> data;
-    int64_t ts = 0;
-    int samples = 0;
-};
+struct AudioPacket { std::vector<uint8_t> data; int64_t ts = 0; int samples = 0; };
 
 class AudioCapture {
     IMMDeviceEnumerator* enumerator = nullptr;
@@ -41,15 +37,11 @@ class AudioCapture {
 
             UINT32 packetLength = 0;
             if (FAILED(captureClient->GetNextPacketSize(&packetLength))) {
-                std::this_thread::sleep_for(100ms);
-                continue;
+                std::this_thread::sleep_for(100ms); continue;
             }
 
             while (packetLength > 0 && running && capturing) {
-                BYTE* data = nullptr;
-                UINT32 numFrames = 0;
-                DWORD flags = 0;
-
+                BYTE* data = nullptr; UINT32 numFrames = 0; DWORD flags = 0;
                 if (FAILED(captureClient->GetBuffer(&data, &numFrames, &flags, nullptr, nullptr))) break;
                 if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data && numFrames > 0)
                     ProcessAudio(data, numFrames, GetTimestamp());
@@ -91,34 +83,27 @@ public:
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         auto check = [](HRESULT hr, const char* msg) { if (FAILED(hr)) throw std::runtime_error(msg); };
-
-        check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-            __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator)), "Failed to create device enumerator");
+        check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator)), "Failed to create device enumerator");
         check(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device), "Failed to get default audio endpoint");
-        check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-            reinterpret_cast<void**>(&audioClient)), "Failed to activate audio client");
+        check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audioClient)), "Failed to activate audio client");
         check(audioClient->GetMixFormat(&waveFormat), "Failed to get mix format");
 
         sampleRate = waveFormat->nSamplesPerSec;
         channels = std::min(static_cast<int>(waveFormat->nChannels), 2);
         frameSamples = sampleRate * frameDurationMs / 1000;
 
-        check(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            200000, 0, waveFormat, nullptr), "Failed to initialize audio client");
-        check(audioClient->GetService(__uuidof(IAudioCaptureClient),
-            reinterpret_cast<void**>(&captureClient)), "Failed to get capture client");
+        check(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200000, 0, waveFormat, nullptr), "Failed to initialize audio client");
+        check(audioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&captureClient)), "Failed to get capture client");
 
         int opusError;
         opusEncoder = opus_encoder_create(48000, channels, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &opusError);
         if (opusError != OPUS_OK) throw std::runtime_error("Failed to create Opus encoder");
-
         opus_encoder_ctl(opusEncoder, OPUS_SET_BITRATE(128000));
         opus_encoder_ctl(opusEncoder, OPUS_SET_COMPLEXITY(5));
 
         encodeBuffer.resize(frameSamples * channels);
         outputBuffer.resize(4000);
         resampleBuffer.reserve(frameSamples * channels * 8);
-
         LOG("Audio initialized (%dHz, %d ch)", sampleRate, channels);
         CoUninitialize();
     }
@@ -148,8 +133,8 @@ public:
 
     bool PopPacket(AudioPacket& out, int timeoutMs = 10) {
         std::unique_lock<std::mutex> lock(queueMutex);
-        if (!queueCondition.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-            [this] { return !packetQueue.empty() || !running; })) return false;
+        if (!queueCondition.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return !packetQueue.empty() || !running; }))
+            return false;
         if (packetQueue.empty()) return false;
         out = std::move(packetQueue.front());
         packetQueue.pop();
