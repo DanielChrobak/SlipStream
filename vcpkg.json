@@ -8,6 +8,8 @@
         "nlohmann-json",
         "opus",
         "openssl",
-        {"name": "ffmpeg", "features": ["nvcodec", "avcodec"]}
+        {"name": "ffmpeg", "features": ["nvcodec", "avcodec"]},
+        "jwt-cpp",
+        "picojson"
     ]
 }
