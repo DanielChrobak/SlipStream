@@ -1,5 +1,4 @@
 #pragma once
-
 #include "common.hpp"
 #include "encoder.hpp"
 #include "input.hpp"
@@ -10,324 +9,347 @@ struct AudioPacketHeader { uint32_t magic; int64_t timestamp; uint16_t samples, 
 #pragma pack(pop)
 
 struct WebRTCCallbacks {
-    InputHandler* inputHandler = nullptr;
+    InputHandler* input = nullptr;
     std::function<void(int, uint8_t)> onFpsChange;
     std::function<int()> getHostFps;
     std::function<bool(int)> onMonitorChange;
-    std::function<int()> getCurrentMonitor;
-    std::function<void()> onDisconnect;
-    std::function<void()> onConnected;
+    std::function<int()> getMonitor;
+    std::function<void()> onDisconnect, onConnected;
     std::function<bool(CodecType)> onCodecChange;
     std::function<CodecType()> getCodec;
 };
 
 class WebRTCServer {
-    std::shared_ptr<rtc::PeerConnection> peerConnection;
-    std::shared_ptr<rtc::DataChannel> dataChannel;
+    std::shared_ptr<rtc::PeerConnection> pc;
+    std::shared_ptr<rtc::DataChannel> dcCtrl, dcVid, dcAud, dcIn;
+    std::atomic<bool> connected{false}, needsKey{true}, fpsRecv{false};
+    std::atomic<bool> gathered{false}, authed{false}, hasDesc{false}, disconnecting{false};
+    std::atomic<bool> dcCtrlOpen{false}, dcVidOpen{false}, dcAudOpen{false}, dcInOpen{false};
+    std::atomic<int> chReady{0};
+    std::string localDesc;
+    std::mutex descMtx, vidSendMtx, audSendMtx, ctrlMtx;
+    mutable std::mutex setupMtx;
+    std::condition_variable descCv;
+    rtc::Configuration cfg;
 
-    std::atomic<bool> connected{false}, needsKeyframe{true}, fpsReceived{false};
-    std::atomic<bool> gatheringComplete{false}, authenticated{false}, hasLocalDescription{false};
+    static constexpr size_t VID_BUF = 262144, AUD_BUF = 131072, CHUNK = 1400, HDR_SZ = sizeof(PacketHeader);
+    static constexpr size_t DATA_CHUNK = CHUNK - HDR_SZ, BUF_LOW = CHUNK * 16, MAX_Q = 3, MAX_AUD_Q = 4;
 
-    std::string localDescription;
-    std::mutex descMutex;
-    std::condition_variable descCondition;
-    rtc::Configuration rtcConfig;
+    std::atomic<uint32_t> frmId{0};
+    std::atomic<int> curFps{60}, overflow{0};
+    std::atomic<int64_t> lastPing{0};
+    std::atomic<CodecType> curCodec{CODEC_H264};
 
-    static constexpr size_t BUFFER_THRESHOLD = 262144, CHUNK_SIZE = 1400;
-    static constexpr size_t HEADER_SIZE = sizeof(PacketHeader), DATA_CHUNK_SIZE = CHUNK_SIZE - HEADER_SIZE;
-    static constexpr size_t BUFFER_LOW_THRESHOLD = CHUNK_SIZE * 16, MAX_QUEUE_FRAMES = 3;
-
-    std::vector<uint8_t> audioBuffer;
-
-    std::atomic<uint64_t> sentCount{0}, byteCount{0}, dropCount{0}, audioSentCount{0};
-    std::atomic<uint32_t> frameId{0};
-    std::atomic<int> currentFps{60}, overflowCount{0};
-    std::atomic<int64_t> lastPingTime{0};
-    std::atomic<bool> pingTimeout{false};
-
-    struct QueuedPacket { std::vector<uint8_t> data; uint32_t frameId; bool isLastChunk; };
-    std::queue<QueuedPacket> sendQueue;
-    std::mutex sendQueueMutex;
-
-    std::atomic<CodecType> currentCodec{CODEC_H264};
+    struct QPkt { std::vector<uint8_t> data; };
+    std::queue<QPkt> sendQ;
+    std::queue<std::vector<uint8_t>> audQ;
     WebRTCCallbacks cb;
-    PacedSendMetrics pacedMetrics;
 
-    bool SafeSend(const void* data, size_t len) {
-        auto ch = dataChannel;
-        if (!ch || !ch->isOpen()) return false;
-        try { ch->send(reinterpret_cast<const std::byte*>(data), len); return true; }
-        catch (...) { return false; }
+    bool AllChannelsOpen() const { return dcCtrlOpen && dcVidOpen && dcAudOpen && dcInOpen; }
+
+    bool SafeSendCtrl(const void* d, size_t len) {
+        if (disconnecting) return false;
+        std::lock_guard<std::mutex> lk(ctrlMtx);
+        if (!dcCtrl || !dcCtrlOpen) return false;
+        try { dcCtrl->send((const std::byte*)d, len); return true; } catch (...) { return false; }
     }
 
-    void DrainSendQueue() {
-        std::unique_lock<std::mutex> lock(sendQueueMutex);
-        auto ch = dataChannel;
-        if (!ch || !ch->isOpen() || sendQueue.empty()) return;
-
-        size_t bytesSent = 0, packetsSent = 0, startQueueSize = sendQueue.size();
-        while (!sendQueue.empty()) {
-            if (ch->bufferedAmount() > BUFFER_THRESHOLD) break;
-            QueuedPacket& pkt = sendQueue.front();
-            if (!SafeSend(pkt.data.data(), pkt.data.size())) { overflowCount++; dropCount++; needsKeyframe = true; sendQueue.pop(); continue; }
-            bytesSent += pkt.data.size();
-            packetsSent++;
-            sendQueue.pop();
+    void DrainVideo() {
+        if (disconnecting || !dcVidOpen) return;
+        std::vector<QPkt> toSend;
+        {
+            std::lock_guard<std::mutex> lk(vidSendMtx);
+            while (!sendQ.empty()) {
+                try { if (!dcVid || dcVid->bufferedAmount() > VID_BUF) break; } catch (...) { break; }
+                toSend.push_back(std::move(sendQ.front())); sendQ.pop();
+            }
         }
-        if (bytesSent > 0) byteCount += bytesSent;
-        if (packetsSent > 0) pacedMetrics.RecordDrain(startQueueSize, packetsSent);
+        for (auto& pkt : toSend) {
+            if (!dcVidOpen) { overflow++; needsKey = true; break; }
+            try { dcVid->send((const std::byte*)pkt.data.data(), pkt.data.size()); }
+            catch (...) { overflow++; needsKey = true; }
+        }
+    }
+
+    void DrainAudio() {
+        if (disconnecting || !dcAudOpen) return;
+        std::vector<std::vector<uint8_t>> toSend;
+        {
+            std::lock_guard<std::mutex> lk(audSendMtx);
+            while (!audQ.empty()) {
+                try { if (!dcAud || dcAud->bufferedAmount() > AUD_BUF) break; } catch (...) { break; }
+                toSend.push_back(std::move(audQ.front())); audQ.pop();
+            }
+        }
+        for (auto& pkt : toSend) {
+            if (!dcAudOpen) break;
+            try { dcAud->send((const std::byte*)pkt.data(), pkt.size()); } catch (...) {}
+        }
     }
 
     void SendHostInfo() {
-        auto ch = dataChannel;
-        if (!ch || !ch->isOpen()) return;
-        uint8_t buf[6];
-        *reinterpret_cast<uint32_t*>(buf) = MSG_HOST_INFO;
-        *reinterpret_cast<uint16_t*>(buf + 4) = static_cast<uint16_t>(cb.getHostFps ? cb.getHostFps() : 60);
-        SafeSend(buf, sizeof(buf));
+        if (!dcCtrlOpen) return;
+        uint8_t buf[6]; *(uint32_t*)buf = MSG_HOST_INFO;
+        *(uint16_t*)(buf + 4) = (uint16_t)(cb.getHostFps ? cb.getHostFps() : 60);
+        SafeSendCtrl(buf, sizeof(buf));
     }
 
     void SendMonitorList() {
-        auto ch = dataChannel;
-        if (!ch || !ch->isOpen()) return;
-        std::lock_guard<std::mutex> lock(g_monitorsMutex);
-        std::vector<uint8_t> buf(6 + g_monitors.size() * 74);
-        size_t off = 0;
-        *reinterpret_cast<uint32_t*>(&buf[off]) = MSG_MONITOR_LIST; off += 4;
-        buf[off++] = static_cast<uint8_t>(g_monitors.size());
-        buf[off++] = static_cast<uint8_t>(cb.getCurrentMonitor ? cb.getCurrentMonitor() : 0);
-        for (const auto& m : g_monitors) {
-            buf[off++] = static_cast<uint8_t>(m.index);
-            *reinterpret_cast<uint16_t*>(&buf[off]) = static_cast<uint16_t>(m.width);
-            *reinterpret_cast<uint16_t*>(&buf[off + 2]) = static_cast<uint16_t>(m.height);
-            *reinterpret_cast<uint16_t*>(&buf[off + 4]) = static_cast<uint16_t>(m.refreshRate);
-            off += 6; buf[off++] = m.isPrimary ? 1 : 0;
-            size_t nl = std::min(m.name.size(), size_t(63));
-            buf[off++] = static_cast<uint8_t>(nl);
-            memcpy(&buf[off], m.name.c_str(), nl); off += nl;
+        if (!dcCtrlOpen) return;
+        std::vector<uint8_t> buf;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            buf.resize(6 + g_monitors.size() * 74);
+            size_t o = 0;
+            *(uint32_t*)&buf[o] = MSG_MONITOR_LIST; o += 4;
+            buf[o++] = (uint8_t)g_monitors.size();
+            buf[o++] = (uint8_t)(cb.getMonitor ? cb.getMonitor() : 0);
+            for (const auto& m : g_monitors) {
+                buf[o++] = (uint8_t)m.index;
+                *(uint16_t*)&buf[o] = (uint16_t)m.width;
+                *(uint16_t*)&buf[o + 2] = (uint16_t)m.height;
+                *(uint16_t*)&buf[o + 4] = (uint16_t)m.refreshRate;
+                o += 6; buf[o++] = m.isPrimary ? 1 : 0;
+                size_t nl = std::min(m.name.size(), (size_t)63);
+                buf[o++] = (uint8_t)nl;
+                memcpy(&buf[o], m.name.c_str(), nl); o += nl;
+            }
+            buf.resize(o);
         }
-        SafeSend(buf.data(), off);
+        SafeSendCtrl(buf.data(), buf.size());
     }
 
-    void ForceDisconnect(const char* reason) {
-        if (!connected) return;
-        WARN("Disconnect: %s", reason);
-        connected = fpsReceived = authenticated = false; overflowCount = 0; pingTimeout = false;
-        { std::lock_guard<std::mutex> lock(sendQueueMutex); while (!sendQueue.empty()) sendQueue.pop(); }
-        try { if (dataChannel) dataChannel->close(); } catch (...) {}
-        try { if (peerConnection) peerConnection->close(); } catch (...) {}
-        if (cb.onDisconnect) cb.onDisconnect();
+    void Disconnect(const char*) {
+        if (disconnecting.exchange(true)) return;
+        if (!connected.exchange(false)) { disconnecting = false; return; }
+        fpsRecv = authed = false; overflow = 0; chReady = 0;
+        dcCtrlOpen = dcVidOpen = dcAudOpen = dcInOpen = false;
+        { std::lock_guard<std::mutex> lk(vidSendMtx); while (!sendQ.empty()) sendQ.pop(); }
+        { std::lock_guard<std::mutex> lk(audSendMtx); while (!audQ.empty()) audQ.pop(); }
+        {
+            std::lock_guard<std::mutex> lk(setupMtx);
+            try { if (dcCtrl && dcCtrl->isOpen()) dcCtrl->close(); } catch (...) {}
+            try { if (dcVid && dcVid->isOpen()) dcVid->close(); } catch (...) {}
+            try { if (dcAud && dcAud->isOpen()) dcAud->close(); } catch (...) {}
+            try { if (dcIn && dcIn->isOpen()) dcIn->close(); } catch (...) {}
+            dcCtrl.reset(); dcVid.reset(); dcAud.reset(); dcIn.reset();
+            try { if (pc) pc->close(); } catch (...) {}
+        }
+        if (cb.onDisconnect) try { cb.onDisconnect(); } catch (...) {}
+        disconnecting = false;
     }
 
-    void HandleMessage(const rtc::binary& msg) {
-        if (msg.size() < 4 || !authenticated) return;
-        uint32_t magic = *reinterpret_cast<const uint32_t*>(msg.data());
-
-        if (cb.inputHandler && (magic == MSG_MOUSE_MOVE || magic == MSG_MOUSE_MOVE_REL || magic == MSG_MOUSE_BTN || magic == MSG_MOUSE_WHEEL || magic == MSG_KEY)) {
-            cb.inputHandler->HandleMessage(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
-            return;
-        }
-
+    void HandleCtrl(const rtc::binary& m) {
+        if (m.size() < 4 || !authed || disconnecting) return;
+        uint32_t magic = *(const uint32_t*)m.data();
         switch (magic) {
             case MSG_PING:
-                if (msg.size() == 16) {
-                    lastPingTime = GetTimestamp() / 1000; overflowCount = 0; pingTimeout = false;
-                    uint8_t resp[24]; memcpy(resp, msg.data(), 16);
-                    *reinterpret_cast<uint64_t*>(resp + 16) = GetTimestamp();
-                    SafeSend(resp, sizeof(resp));
+                if (m.size() == 16) {
+                    lastPing = GetTimestamp() / 1000; overflow = 0;
+                    uint8_t r[24]; memcpy(r, m.data(), 16);
+                    *(uint64_t*)(r + 16) = GetTimestamp();
+                    SafeSendCtrl(r, sizeof(r));
                 }
                 break;
             case MSG_FPS_SET:
-                if (msg.size() == 7) {
-                    uint16_t fps = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(msg.data()) + 4);
-                    uint8_t mode = static_cast<uint8_t>(msg[6]);
+                if (m.size() == 7) {
+                    uint16_t fps = *(const uint16_t*)((const uint8_t*)m.data() + 4);
+                    uint8_t mode = (uint8_t)m[6];
                     if (fps >= 1 && fps <= 240 && mode <= 2) {
-                        int actual = (mode == 1 && cb.getHostFps) ? cb.getHostFps() : fps;
-                        currentFps = actual; fpsReceived = true;
-                        if (cb.onFpsChange) cb.onFpsChange(actual, mode);
-                        uint8_t ack[7]; *reinterpret_cast<uint32_t*>(ack) = MSG_FPS_ACK;
-                        *reinterpret_cast<uint16_t*>(ack + 4) = static_cast<uint16_t>(actual); ack[6] = mode;
-                        SafeSend(ack, sizeof(ack));
+                        int act = (mode == 1 && cb.getHostFps) ? cb.getHostFps() : fps;
+                        curFps = act; fpsRecv = true;
+                        if (cb.onFpsChange) cb.onFpsChange(act, mode);
+                        uint8_t a[7]; *(uint32_t*)a = MSG_FPS_ACK;
+                        *(uint16_t*)(a + 4) = (uint16_t)act; a[6] = mode;
+                        SafeSendCtrl(a, sizeof(a));
                     }
                 }
                 break;
             case MSG_CODEC_SET:
-                if (msg.size() == 5) {
-                    uint8_t codecId = static_cast<uint8_t>(msg[4]);
-                    if (codecId <= 1) {
-                        CodecType newCodec = static_cast<CodecType>(codecId);
-                        bool success = !cb.onCodecChange || cb.onCodecChange(newCodec);
-                        if (success) { currentCodec = newCodec; needsKeyframe = true; }
-                        uint8_t ack[5]; *reinterpret_cast<uint32_t*>(ack) = MSG_CODEC_ACK;
-                        ack[4] = static_cast<uint8_t>(currentCodec.load());
-                        SafeSend(ack, sizeof(ack));
+                if (m.size() == 5) {
+                    uint8_t c = (uint8_t)m[4];
+                    if (c <= 1) {
+                        CodecType nc = (CodecType)c;
+                        bool ok = !cb.onCodecChange || cb.onCodecChange(nc);
+                        if (ok) { curCodec = nc; needsKey = true; }
+                        uint8_t a[5]; *(uint32_t*)a = MSG_CODEC_ACK; a[4] = (uint8_t)curCodec.load();
+                        SafeSendCtrl(a, sizeof(a));
                     }
                 }
                 break;
-            case MSG_REQUEST_KEY: needsKeyframe = true; break;
+            case MSG_REQUEST_KEY: needsKey = true; break;
             case MSG_MONITOR_SET:
-                if (msg.size() == 5 && cb.onMonitorChange && cb.onMonitorChange(static_cast<int>(static_cast<uint8_t>(msg[4])))) {
-                    needsKeyframe = true; SendMonitorList(); SendHostInfo();
+                if (m.size() == 5 && cb.onMonitorChange && cb.onMonitorChange((int)(uint8_t)m[4])) {
+                    needsKey = true; SendMonitorList(); SendHostInfo();
                 }
                 break;
         }
     }
 
-    void SetupDataChannelCallbacks() {
-        if (!dataChannel) return;
-        dataChannel->setBufferedAmountLowThreshold(BUFFER_LOW_THRESHOLD);
-        dataChannel->onBufferedAmountLow([this]() { DrainSendQueue(); });
-        dataChannel->onOpen([this] {
-            connected = needsKeyframe = authenticated = true;
-            lastPingTime = GetTimestamp() / 1000; overflowCount = 0;
-            LOG("Data channel opened");
-            SendHostInfo(); SendMonitorList();
-            if (cb.onConnected) cb.onConnected();
-        });
-        dataChannel->onClosed([this] {
-            connected = fpsReceived = authenticated = false; overflowCount = 0;
-            std::lock_guard<std::mutex> lock(sendQueueMutex);
-            while (!sendQueue.empty()) sendQueue.pop();
-        });
-        dataChannel->onMessage([this](auto data) { if (auto* b = std::get_if<rtc::binary>(&data)) HandleMessage(*b); });
+    void HandleInput(const rtc::binary& m) {
+        if (m.size() < 4 || !authed || disconnecting || !cb.input) return;
+        cb.input->HandleMessage((const uint8_t*)m.data(), m.size());
     }
 
-    void SetupPeerConnection() {
-        if (peerConnection) {
-            if (dataChannel && dataChannel->isOpen()) dataChannel->close();
-            dataChannel.reset(); peerConnection->close();
+    void OnAllOpen() {
+        if (disconnecting) return;
+        connected = needsKey = authed = true;
+        lastPing = GetTimestamp() / 1000; overflow = 0;
+        SendHostInfo(); SendMonitorList();
+        if (cb.onConnected) cb.onConnected();
+    }
+
+    void OnClose() {
+        connected = fpsRecv = authed = false; overflow = 0; chReady = 0;
+        dcCtrlOpen = dcVidOpen = dcAudOpen = dcInOpen = false;
+        { std::lock_guard<std::mutex> lk(vidSendMtx); while (!sendQ.empty()) sendQ.pop(); }
+        { std::lock_guard<std::mutex> lk(audSendMtx); while (!audQ.empty()) audQ.pop(); }
+    }
+
+    void SetupCtrl() {
+        if (!dcCtrl) return;
+        dcCtrl->setBufferedAmountLowThreshold(BUF_LOW);
+        dcCtrl->onOpen([this] { dcCtrlOpen = true; if (!disconnecting && ++chReady == 4) OnAllOpen(); });
+        dcCtrl->onClosed([this] { dcCtrlOpen = false; OnClose(); });
+        dcCtrl->onMessage([this](auto d) { if (auto* b = std::get_if<rtc::binary>(&d)) HandleCtrl(*b); });
+    }
+
+    void SetupVid() {
+        if (!dcVid) return;
+        dcVid->setBufferedAmountLowThreshold(BUF_LOW);
+        dcVid->onBufferedAmountLow([this] { if (!disconnecting) DrainVideo(); });
+        dcVid->onOpen([this] { dcVidOpen = true; if (!disconnecting && ++chReady == 4) OnAllOpen(); });
+        dcVid->onClosed([this] { dcVidOpen = false; OnClose(); });
+    }
+
+    void SetupAud() {
+        if (!dcAud) return;
+        dcAud->setBufferedAmountLowThreshold(BUF_LOW);
+        dcAud->onBufferedAmountLow([this] { if (!disconnecting) DrainAudio(); });
+        dcAud->onOpen([this] { dcAudOpen = true; if (!disconnecting && ++chReady == 4) OnAllOpen(); });
+        dcAud->onClosed([this] { dcAudOpen = false; OnClose(); });
+    }
+
+    void SetupIn() {
+        if (!dcIn) return;
+        dcIn->onOpen([this] { dcInOpen = true; if (!disconnecting && ++chReady == 4) OnAllOpen(); });
+        dcIn->onClosed([this] { dcInOpen = false; OnClose(); });
+        dcIn->onMessage([this](auto d) { if (auto* b = std::get_if<rtc::binary>(&d)) HandleInput(*b); });
+    }
+
+    void SetupPC() {
+        std::lock_guard<std::mutex> lk(setupMtx);
+        if (pc) {
+            dcCtrlOpen = dcVidOpen = dcAudOpen = dcInOpen = false;
+            try { if (dcCtrl && dcCtrl->isOpen()) dcCtrl->close(); } catch (...) {}
+            try { if (dcVid && dcVid->isOpen()) dcVid->close(); } catch (...) {}
+            try { if (dcAud && dcAud->isOpen()) dcAud->close(); } catch (...) {}
+            try { if (dcIn && dcIn->isOpen()) dcIn->close(); } catch (...) {}
+            dcCtrl.reset(); dcVid.reset(); dcAud.reset(); dcIn.reset();
+            try { pc->close(); } catch (...) {}
         }
-        connected = needsKeyframe = true;
-        fpsReceived = gatheringComplete = authenticated = hasLocalDescription = false;
-        overflowCount = 0; lastPingTime = 0; pingTimeout = false;
-        { std::lock_guard<std::mutex> lock(descMutex); localDescription.clear(); }
-        { std::lock_guard<std::mutex> lock(sendQueueMutex); while (!sendQueue.empty()) sendQueue.pop(); }
+        connected = needsKey = true; fpsRecv = gathered = authed = hasDesc = false;
+        overflow = 0; lastPing = 0; chReady = 0; disconnecting = false;
+        { std::lock_guard<std::mutex> lk2(descMtx); localDesc.clear(); }
+        { std::lock_guard<std::mutex> lk2(vidSendMtx); while (!sendQ.empty()) sendQ.pop(); }
+        { std::lock_guard<std::mutex> lk2(audSendMtx); while (!audQ.empty()) audQ.pop(); }
 
-        peerConnection = std::make_shared<rtc::PeerConnection>(rtcConfig);
-
-        peerConnection->onLocalDescription([this](rtc::Description d) {
-            std::lock_guard<std::mutex> lock(descMutex);
-            localDescription = std::string(d); hasLocalDescription = true; descCondition.notify_all();
+        pc = std::make_shared<rtc::PeerConnection>(cfg);
+        pc->onLocalDescription([this](rtc::Description d) {
+            std::lock_guard<std::mutex> lk(descMtx);
+            localDesc = std::string(d); hasDesc = true; descCv.notify_all();
         });
-
-        peerConnection->onLocalCandidate([this](rtc::Candidate) { descCondition.notify_all(); });
-
-        peerConnection->onStateChange([this](auto state) {
+        pc->onLocalCandidate([this](rtc::Candidate) { descCv.notify_all(); });
+        pc->onStateChange([this](auto s) {
+            if (disconnecting) return;
             bool was = connected.load();
-            connected = (state == rtc::PeerConnection::State::Connected);
-            if (connected && !was) { needsKeyframe = true; lastPingTime = GetTimestamp() / 1000; LOG("Peer connected"); }
-            if (!connected && was) { fpsReceived = authenticated = false; overflowCount = 0; if (cb.onDisconnect) cb.onDisconnect(); }
+            connected = (s == rtc::PeerConnection::State::Connected);
+            if (connected && !was) { needsKey = true; lastPing = GetTimestamp() / 1000; }
+            if (!connected && was) { fpsRecv = authed = false; overflow = 0; chReady = 0; if (cb.onDisconnect) cb.onDisconnect(); }
         });
-
-        peerConnection->onGatheringStateChange([this](auto state) {
-            if (state == rtc::PeerConnection::GatheringState::Complete) { gatheringComplete = true; descCondition.notify_all(); }
+        pc->onGatheringStateChange([this](auto s) {
+            if (s == rtc::PeerConnection::GatheringState::Complete) { gathered = true; descCv.notify_all(); }
         });
-
-        peerConnection->onDataChannel([this](auto ch) { if (ch->label() != "screen") return; dataChannel = ch; SetupDataChannelCallbacks(); });
+        pc->onDataChannel([this](auto ch) {
+            if (disconnecting) return;
+            std::string l = ch->label();
+            std::lock_guard<std::mutex> lk(setupMtx);
+            if (l == "control") { dcCtrl = ch; SetupCtrl(); }
+            else if (l == "video") { dcVid = ch; SetupVid(); }
+            else if (l == "audio") { dcAud = ch; SetupAud(); }
+            else if (l == "input") { dcIn = ch; SetupIn(); }
+        });
     }
 
-    bool IsConnectionStale() {
-        if (!connected) return false;
-        int64_t lastPing = lastPingTime.load(), now = GetTimestamp() / 1000;
-        if (lastPing > 0 && (now - lastPing) > 3000) { if (!pingTimeout.exchange(true)) WARN("Ping timeout"); return true; }
-        return overflowCount >= 10;
+    bool IsStale() {
+        if (!connected || disconnecting) return false;
+        int64_t lp = lastPing, now = GetTimestamp() / 1000;
+        return (lp > 0 && (now - lp) > 3000) || overflow >= 10;
     }
 
 public:
     WebRTCServer() {
-        rtcConfig.iceServers.push_back(rtc::IceServer("stun:stun.l.google.com:19302"));
-        rtcConfig.portRangeBegin = 50000; rtcConfig.portRangeEnd = 50020; rtcConfig.enableIceTcp = false;
-        audioBuffer.resize(4096);
-        SetupPeerConnection();
-        LOG("WebRTC initialized");
+        cfg.iceServers.push_back(rtc::IceServer("stun:stun.l.google.com:19302"));
+        cfg.portRangeBegin = 50000; cfg.portRangeEnd = 50020; cfg.enableIceTcp = false;
+        SetupPC();
     }
 
-    void Init(WebRTCCallbacks callbacks) { cb = std::move(callbacks); }
+    void Init(WebRTCCallbacks c) { cb = std::move(c); }
 
     std::string GetLocal() {
-        std::unique_lock<std::mutex> lock(descMutex);
-        if (!descCondition.wait_for(lock, 200ms, [this] { return hasLocalDescription.load(); })) return localDescription;
-        descCondition.wait_for(lock, 150ms, [this] { return gatheringComplete.load(); });
-        return localDescription;
+        std::unique_lock<std::mutex> lk(descMtx);
+        if (!descCv.wait_for(lk, 200ms, [this] { return hasDesc.load(); })) return localDesc;
+        descCv.wait_for(lk, 150ms, [this] { return gathered.load(); });
+        return localDesc;
     }
 
     void SetRemote(const std::string& sdp, const std::string& type) {
-        if (type == "offer") SetupPeerConnection();
-        peerConnection->setRemoteDescription(rtc::Description(sdp, type));
-        if (type == "offer") peerConnection->setLocalDescription();
+        if (type == "offer") SetupPC();
+        pc->setRemoteDescription(rtc::Description(sdp, type));
+        if (type == "offer") pc->setLocalDescription();
     }
 
-    bool IsConnected() const { return connected; }
-    bool IsStreaming() const { return connected && authenticated && fpsReceived; }
-    int GetCurrentFps() const { return currentFps; }
-    bool NeedsKey() { return needsKeyframe.exchange(false); }
-    CodecType GetCurrentCodec() const { return currentCodec.load(); }
-    void SetCodec(CodecType codec) { currentCodec = codec; }
+    bool IsStreaming() const { return connected && authed && fpsRecv && !disconnecting && AllChannelsOpen(); }
+    int GetCurrentFps() const { return curFps; }
+    bool NeedsKey() { return needsKey.exchange(false); }
 
-    void Send(const EncodedFrame& frame) {
+    void Send(const EncodedFrame& f) {
         if (!IsStreaming()) return;
-        auto ch = dataChannel;
-        if (!ch || !ch->isOpen()) { if (connected) ForceDisconnect("Channel closed"); return; }
-        if (IsConnectionStale()) { ForceDisconnect("Stale connection"); return; }
-
-        size_t dataSize = frame.data.size();
-        size_t numChunks = (dataSize + DATA_CHUNK_SIZE - 1) / DATA_CHUNK_SIZE;
-        if (numChunks > 65535 || !dataSize) return;
-
-        uint32_t currentFrameId = frameId++;
-        size_t maxQueueSize = numChunks * MAX_QUEUE_FRAMES;
-
-        LARGE_INTEGER sendStart; QueryPerformanceCounter(&sendStart);
-
+        if (IsStale()) { Disconnect("stale"); return; }
+        size_t sz = f.data.size(), nch = (sz + DATA_CHUNK - 1) / DATA_CHUNK;
+        if (nch > 65535 || !sz) return;
+        uint32_t fid = frmId++;
+        PacketHeader h = {f.ts, (uint32_t)f.encUs, fid, 0, (uint16_t)nch, f.isKey ? (uint8_t)1 : (uint8_t)0};
         {
-            std::lock_guard<std::mutex> lock(sendQueueMutex);
-            if (sendQueue.size() > maxQueueSize) {
-                size_t toDrop = sendQueue.size() - numChunks;
-                while (toDrop > 0 && !sendQueue.empty()) { sendQueue.pop(); toDrop--; }
-                dropCount++; needsKeyframe = true;
+            std::lock_guard<std::mutex> lk(vidSendMtx);
+            if (sendQ.size() > nch * MAX_Q) {
+                size_t drop = sendQ.size() - nch;
+                while (drop-- > 0 && !sendQ.empty()) sendQ.pop();
+                needsKey = true;
+            }
+            for (size_t i = 0; i < nch; i++) {
+                h.chunkIndex = (uint16_t)i;
+                size_t off = i * DATA_CHUNK, len = std::min(DATA_CHUNK, sz - off);
+                QPkt p; p.data.resize(HDR_SZ + len);
+                memcpy(p.data.data(), &h, HDR_SZ);
+                memcpy(p.data.data() + HDR_SZ, f.data.data() + off, len);
+                sendQ.push(std::move(p));
             }
         }
-
-        PacketHeader hdr = {frame.ts, static_cast<uint32_t>(frame.encUs), currentFrameId, 0, static_cast<uint16_t>(numChunks), frame.isKey ? uint8_t(1) : uint8_t(0)};
-
-        {
-            std::lock_guard<std::mutex> lock(sendQueueMutex);
-            for (size_t i = 0; i < numChunks; i++) {
-                hdr.chunkIndex = static_cast<uint16_t>(i);
-                size_t off = i * DATA_CHUNK_SIZE, len = std::min(DATA_CHUNK_SIZE, dataSize - off);
-                QueuedPacket pkt;
-                pkt.data.resize(HEADER_SIZE + len);
-                memcpy(pkt.data.data(), &hdr, HEADER_SIZE);
-                memcpy(pkt.data.data() + HEADER_SIZE, frame.data.data() + off, len);
-                pkt.frameId = currentFrameId; pkt.isLastChunk = (i == numChunks - 1);
-                sendQueue.push(std::move(pkt));
-            }
-        }
-        sentCount++;
-        DrainSendQueue();
-
-        LARGE_INTEGER sendEnd; QueryPerformanceCounter(&sendEnd);
-        static const int64_t qpcFreq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
-        pacedMetrics.RecordFrameSend((sendEnd.QuadPart - sendStart.QuadPart) * 1000000 / qpcFreq);
+        DrainVideo();
     }
 
     void SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples) {
-        if (!IsStreaming() || data.empty() || data.size() > 4000 || overflowCount >= 5) return;
-        auto ch = dataChannel;
-        if (!ch || !ch->isOpen() || ch->bufferedAmount() > BUFFER_THRESHOLD / 2) return;
-        try {
-            size_t total = sizeof(AudioPacketHeader) + data.size();
-            if (audioBuffer.size() < total) audioBuffer.resize(total);
-            auto* hdr = reinterpret_cast<AudioPacketHeader*>(audioBuffer.data());
-            hdr->magic = MSG_AUDIO_DATA; hdr->timestamp = ts; hdr->samples = static_cast<uint16_t>(samples); hdr->dataLength = static_cast<uint16_t>(data.size());
-            memcpy(audioBuffer.data() + sizeof(AudioPacketHeader), data.data(), data.size());
-            if (SafeSend(audioBuffer.data(), total)) { byteCount += total; audioSentCount++; }
-        } catch (...) {}
+        if (!connected || !authed || !fpsRecv || disconnecting || !dcAudOpen || data.empty() || data.size() > 4000) return;
+        size_t total = sizeof(AudioPacketHeader) + data.size();
+        std::vector<uint8_t> pkt(total);
+        auto* h = (AudioPacketHeader*)pkt.data();
+        h->magic = MSG_AUDIO_DATA; h->timestamp = ts; h->samples = (uint16_t)samples; h->dataLength = (uint16_t)data.size();
+        memcpy(pkt.data() + sizeof(AudioPacketHeader), data.data(), data.size());
+        bool sentDirect = false;
+        try { if (dcAud && dcAud->bufferedAmount() <= AUD_BUF / 2) { dcAud->send((const std::byte*)pkt.data(), total); sentDirect = true; } } catch (...) {}
+        if (sentDirect) return;
+        { std::lock_guard<std::mutex> lk(audSendMtx); while (audQ.size() >= MAX_AUD_Q) audQ.pop(); audQ.push(std::move(pkt)); }
+        DrainAudio();
     }
-
-    struct Stats { uint64_t sent, bytes, dropped; bool connected; };
-    Stats GetStats() { return {sentCount.exchange(0), byteCount.exchange(0), dropCount.exchange(0), connected.load()}; }
-    uint64_t GetAudioSent() { return audioSentCount.exchange(0); }
-    PacedSendMetrics::Snapshot GetPacedMetrics() { return pacedMetrics.GetAndReset(); }
-    size_t GetSendQueueDepth() { std::lock_guard<std::mutex> lock(sendQueueMutex); return sendQueue.size(); }
 };

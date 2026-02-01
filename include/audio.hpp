@@ -4,8 +4,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 
-extern "C" {
-#include <opus/opus.h>
+extern "C" { 
+    #include <opus/opus.h>
 }
 
 struct AudioPacket { std::vector<uint8_t> data; int64_t ts = 0; int samples = 0; };
@@ -18,91 +18,101 @@ class AudioCapture {
     OpusEncoder* opusEncoder = nullptr;
     WAVEFORMATEX* waveFormat = nullptr;
 
-    int sampleRate = 48000, channels = 2, frameDurationMs = 20, frameSamples = 0;
-    std::atomic<bool> running{false}, capturing{false};
-    std::thread captureThread;
-    std::queue<AudioPacket> packetQueue;
-    std::mutex queueMutex;
-    std::condition_variable queueCondition;
-    std::vector<float> resampleBuffer;
-    std::vector<int16_t> encodeBuffer;
-    std::vector<uint8_t> outputBuffer;
+    static constexpr int OPUS_RATE = 48000, OPUS_FRAME_MS = 10, FRAME_SAMPLES = OPUS_RATE * OPUS_FRAME_MS / 1000;
+    static constexpr size_t MAX_QUEUE_SIZE = 4;
 
-    void CaptureLoop() {
+    int sysRate = 48000, channels = 2;
+    double ratio = 1.0, accum = 0.0;
+    std::vector<float> resBuf, prev;
+    std::vector<int16_t> encBuf;
+    std::vector<uint8_t> outBuf;
+
+    std::atomic<bool> running{false}, capturing{false};
+    std::thread thread;
+    std::queue<AudioPacket> queue;
+    std::mutex qMtx;
+    std::condition_variable qCond;
+
+    void Loop() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
         while (running) {
-            if (!capturing) { std::this_thread::sleep_for(10ms); continue; }
-
-            UINT32 packetLength = 0;
-            if (FAILED(captureClient->GetNextPacketSize(&packetLength))) { std::this_thread::sleep_for(100ms); continue; }
-
-            while (packetLength > 0 && running && capturing) {
-                BYTE* data = nullptr; UINT32 numFrames = 0; DWORD flags = 0;
-                if (FAILED(captureClient->GetBuffer(&data, &numFrames, &flags, nullptr, nullptr))) break;
-                if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data && numFrames > 0)
-                    ProcessAudio(data, numFrames, GetTimestamp());
-                captureClient->ReleaseBuffer(numFrames);
-                if (FAILED(captureClient->GetNextPacketSize(&packetLength))) break;
+            if (!capturing) { std::this_thread::sleep_for(5ms); continue; }
+            UINT32 pktLen = 0;
+            if (FAILED(captureClient->GetNextPacketSize(&pktLen))) { std::this_thread::sleep_for(50ms); continue; }
+            while (pktLen > 0 && running && capturing) {
+                BYTE* data = nullptr; UINT32 frames = 0; DWORD flags = 0;
+                if (FAILED(captureClient->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+                if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data && frames > 0) Process(data, frames, GetTimestamp());
+                captureClient->ReleaseBuffer(frames);
+                if (FAILED(captureClient->GetNextPacketSize(&pktLen))) break;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(frameDurationMs / 2));
+            std::this_thread::sleep_for(2ms);
         }
         CoUninitialize();
     }
 
-    void ProcessAudio(BYTE* data, UINT32 numFrames, int64_t timestamp) {
-        auto* floatData = reinterpret_cast<float*>(data);
-        resampleBuffer.insert(resampleBuffer.end(), floatData, floatData + numFrames * channels);
+    void Resample(const float* in, size_t frames) {
+        if (!frames) return;
+        if (sysRate == OPUS_RATE) {
+            resBuf.insert(resBuf.end(), in, in + frames * channels);
+            for (int c = 0; c < channels; c++) prev[c] = in[(frames - 1) * channels + c];
+            return;
+        }
+        while (accum < frames) {
+            size_t i0 = (size_t)accum, i1 = i0 + 1;
+            double f = accum - i0;
+            for (int c = 0; c < channels; c++) {
+                float s0 = (i0 == 0 && accum < 1.0) ? prev[c] : in[i0 * channels + c];
+                float s1 = (i1 < frames) ? in[i1 * channels + c] : s0;
+                resBuf.push_back((float)(s0 + (s1 - s0) * f));
+            }
+            accum += ratio;
+        }
+        accum -= frames;
+        for (int c = 0; c < channels; c++) prev[c] = in[(frames - 1) * channels + c];
+    }
 
-        size_t consumed = 0;
-        while (resampleBuffer.size() - consumed >= static_cast<size_t>(frameSamples * channels)) {
-            const float* src = resampleBuffer.data() + consumed;
-            for (int i = 0; i < frameSamples * channels; i++)
-                encodeBuffer[i] = static_cast<int16_t>(std::clamp(src[i], -1.0f, 1.0f) * 32767.0f);
-            consumed += frameSamples * channels;
-
-            int encodedBytes = opus_encode(opusEncoder, encodeBuffer.data(), frameSamples,
-                outputBuffer.data(), static_cast<opus_int32>(outputBuffer.size()));
-
-            if (encodedBytes > 0) {
-                std::lock_guard<std::mutex> lock(queueMutex);
-                if (packetQueue.size() < 50)
-                    packetQueue.push({std::vector<uint8_t>(outputBuffer.begin(), outputBuffer.begin() + encodedBytes), timestamp, frameSamples});
-                queueCondition.notify_one();
+    void Process(BYTE* data, UINT32 frames, int64_t ts) {
+        Resample((float*)data, frames);
+        while (resBuf.size() >= (size_t)(FRAME_SAMPLES * channels)) {
+            for (int i = 0; i < FRAME_SAMPLES * channels; i++)
+                encBuf[i] = (int16_t)(std::clamp(resBuf[i], -1.0f, 1.0f) * 32767.0f);
+            resBuf.erase(resBuf.begin(), resBuf.begin() + FRAME_SAMPLES * channels);
+            int bytes = opus_encode(opusEncoder, encBuf.data(), FRAME_SAMPLES, outBuf.data(), (opus_int32)outBuf.size());
+            if (bytes > 0) {
+                std::lock_guard<std::mutex> lk(qMtx);
+                while (queue.size() >= MAX_QUEUE_SIZE) queue.pop();
+                queue.push({{outBuf.begin(), outBuf.begin() + bytes}, ts, FRAME_SAMPLES});
+                qCond.notify_one();
             }
         }
-        if (consumed > 0) resampleBuffer.erase(resampleBuffer.begin(), resampleBuffer.begin() + consumed);
     }
 
 public:
     AudioCapture() {
-        LOG("Initializing audio capture...");
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-        auto check = [](HRESULT hr, const char* msg) { if (FAILED(hr)) throw std::runtime_error(msg); };
-        check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator)), "Failed to create device enumerator");
-        check(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device), "Failed to get default audio endpoint");
-        check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audioClient)), "Failed to activate audio client");
-        check(audioClient->GetMixFormat(&waveFormat), "Failed to get mix format");
-
-        sampleRate = waveFormat->nSamplesPerSec;
-        channels = std::min(static_cast<int>(waveFormat->nChannels), 2);
-        frameSamples = sampleRate * frameDurationMs / 1000;
-
-        check(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200000, 0, waveFormat, nullptr), "Failed to initialize audio client");
-        check(audioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&captureClient)), "Failed to get capture client");
-
-        int opusError;
-        opusEncoder = opus_encoder_create(48000, channels, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &opusError);
-        if (opusError != OPUS_OK) throw std::runtime_error("Failed to create Opus encoder");
-        opus_encoder_ctl(opusEncoder, OPUS_SET_BITRATE(128000));
-        opus_encoder_ctl(opusEncoder, OPUS_SET_COMPLEXITY(5));
-
-        encodeBuffer.resize(frameSamples * channels);
-        outputBuffer.resize(4000);
-        resampleBuffer.reserve(frameSamples * channels * 8);
-        LOG("Audio initialized (%dHz, %d ch)", sampleRate, channels);
+        auto chk = [](HRESULT hr, const char* m) { if (FAILED(hr)) throw std::runtime_error(m); };
+        chk(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator), "Enum");
+        chk(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device), "Endpoint");
+        chk(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient), "Client");
+        chk(audioClient->GetMixFormat(&waveFormat), "Format");
+        sysRate = waveFormat->nSamplesPerSec;
+        channels = std::min((int)waveFormat->nChannels, 2);
+        ratio = (double)sysRate / OPUS_RATE;
+        chk(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 50000, 0, waveFormat, nullptr), "Init");
+        chk(audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient), "Capture");
+        int err; opusEncoder = opus_encoder_create(OPUS_RATE, channels, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+        if (err != OPUS_OK) throw std::runtime_error("Opus");
+        opus_encoder_ctl(opusEncoder, OPUS_SET_BITRATE(96000));
+        opus_encoder_ctl(opusEncoder, OPUS_SET_COMPLEXITY(3));
+        opus_encoder_ctl(opusEncoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
+        opus_encoder_ctl(opusEncoder, OPUS_SET_LSB_DEPTH(16));
+        encBuf.resize(FRAME_SAMPLES * channels);
+        outBuf.resize(4000);
+        resBuf.reserve(FRAME_SAMPLES * channels * 4);
+        prev.resize(channels, 0.0f);
+        LOG("Audio: %dHz -> %dHz, %dch, %dms frames", sysRate, OPUS_RATE, channels, OPUS_FRAME_MS);
         CoUninitialize();
     }
 
@@ -116,29 +126,25 @@ public:
     void Start() {
         if (running) return;
         running = capturing = true;
+        accum = 0.0; resBuf.clear();
+        std::fill(prev.begin(), prev.end(), 0.0f);
         if (FAILED(audioClient->Start())) { running = capturing = false; return; }
-        captureThread = std::thread(&AudioCapture::CaptureLoop, this);
-        LOG("Audio capture started");
+        thread = std::thread(&AudioCapture::Loop, this);
     }
 
     void Stop() {
         if (!running) return;
         running = capturing = false;
-        queueCondition.notify_all();
-        if (captureThread.joinable()) captureThread.join();
+        qCond.notify_all();
+        if (thread.joinable()) thread.join();
         if (audioClient) audioClient->Stop();
     }
 
-    bool PopPacket(AudioPacket& out, int timeoutMs = 10) {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        if (!queueCondition.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] { return !packetQueue.empty() || !running; }))
-            return false;
-        if (packetQueue.empty()) return false;
-        out = std::move(packetQueue.front());
-        packetQueue.pop();
+    bool PopPacket(AudioPacket& out, int ms = 5) {
+        std::unique_lock<std::mutex> lk(qMtx);
+        if (!qCond.wait_for(lk, std::chrono::milliseconds(ms), [this] { return !queue.empty() || !running; })) return false;
+        if (queue.empty()) return false;
+        out = std::move(queue.front()); queue.pop();
         return true;
     }
-
-    int GetSampleRate() const { return 48000; }
-    int GetChannels() const { return channels; }
 };
