@@ -1,35 +1,33 @@
 # SlipStream
 
-Low-latency remote desktop streaming with hardware-accelerated video encoding and WebRTC data channels.
+Low-latency remote desktop streaming with hardware-accelerated encoding and WebRTC data channels.
 
 ## Overview
 
-SlipStream captures the host display using the Windows Graphics Capture API and encodes frames with NVIDIA NVENC (H.264 or AV1). Video streams to modern browsers via WebRTC unreliable data channels for minimal latency. System audio is captured via WASAPI loopback and encoded with Opus. Full mouse and keyboard input is relayed back to the host with rate limiting and security filtering.
+SlipStream captures the host display using Windows Graphics Capture API and encodes frames with NVIDIA NVENC (H.264 or AV1). Video streams to browsers via WebRTC unreliable data channels. System audio is captured via WASAPI loopback and encoded with Opus. Mouse and keyboard input is relayed back to the host.
 
 ## Features
 
-- **Dual Codec Support** — H.264 and AV1 via NVIDIA NVENC hardware encoding
-- **WebRTC Data Channels** — DTLS-encrypted unreliable transport for lowest latency
-- **System Audio** — Opus-encoded WASAPI loopback capture at 48kHz stereo
-- **Multi-Monitor** — Live monitor switching with tabbed browser UI
-- **Full Input Control** — Mouse, scroll wheel, and keyboard with modifier support
-- **Secure Authentication** — PBKDF2-SHA256 (600k iterations) with rate limiting
-- **GPU Synchronization** — D3D11 fence-based sync with flush fallback
-- **Clock Synchronization** — Client-server time sync for accurate latency measurement
-- **Adaptive Frame Pacing** — Queue-based sending with overflow protection
+- **Dual Codec** — H.264 and AV1 via NVIDIA NVENC
+- **WebRTC Transport** — DTLS-encrypted unreliable data channels
+- **System Audio** — Opus-encoded WASAPI loopback at 48kHz stereo
+- **Multi-Monitor** — Live monitor switching with tabbed UI
+- **Input Control** — Mouse, wheel, and keyboard with modifier support
+- **Authentication** — PBKDF2-SHA256 (600k iterations) with rate limiting
+- **GPU Sync** — D3D11 fence-based synchronization
 
 ## Requirements
 
-### Server (Host Machine)
+### Server
 
 | Component | Requirement |
 |-----------|-------------|
 | OS | Windows 10/11 64-bit (build 1903+) |
 | IDE | Visual Studio 2022 with C++20 Desktop workload |
-| GPU | NVIDIA GPU with NVENC support (required) |
+| GPU | NVIDIA GPU with NVENC support |
 | Package Manager | [vcpkg](https://github.com/microsoft/vcpkg) |
 
-### Client (Browser)
+### Client
 
 | Component | Requirement |
 |-----------|-------------|
@@ -65,28 +63,23 @@ First run prompts for credentials:
 - **Username** — 3-32 alphanumeric characters (plus `_` and `-`)
 - **Password** — 8+ characters with at least one letter and one digit
 
-Credentials are hashed with PBKDF2-SHA256 and saved to `auth.json`.
+Credentials are hashed and saved to `auth.json`.
 
 ### 4. Connect
 
-1. Open browser to `http://<HOST_IP>:6060`
-2. Enter username and password
-3. Stream begins automatically after authentication
+Open browser to `http://<HOST_IP>:6060` and enter credentials.
 
 ## Network Configuration
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 6060 | TCP | HTTP server (web client, REST API, WebRTC signaling) |
-| 50000-50020 | UDP | WebRTC media transport (DTLS/SCTP data channels) |
+| 6060 | TCP | HTTP server and WebRTC signaling |
+| 50000-50020 | UDP | WebRTC media transport |
 
-### Firewall Rules
+### Firewall
 
 ```powershell
-# Allow HTTP server
 netsh advfirewall firewall add rule name="SlipStream HTTP" dir=in action=allow protocol=tcp localport=6060
-
-# Allow WebRTC UDP
 netsh advfirewall firewall add rule name="SlipStream WebRTC" dir=in action=allow protocol=udp localport=50000-50020
 ```
 
@@ -94,12 +87,9 @@ netsh advfirewall firewall add rule name="SlipStream WebRTC" dir=in action=allow
 
 ### Password Security
 
-Passwords are hashed using PBKDF2-SHA256 with:
-- **600,000 iterations** — Resistant to brute-force attacks
-- **16-byte random salt** — Prevents rainbow table attacks
-- **32-byte derived key** — Stored as 64-character hex string
-
-The plaintext password is never stored or logged.
+- **600,000 PBKDF2 iterations** with SHA-256
+- **16-byte random salt**
+- **32-byte derived key** stored as hex
 
 ### Rate Limiting
 
@@ -107,108 +97,63 @@ The plaintext password is never stored or logged.
 |-----------|--------|
 | 5 failed attempts in 15 minutes | 30-minute IP lockout |
 | Successful login | Clears attempt counter |
-| Lockout expiry | Automatic after 30 minutes |
 
-### Session Management
+### Session
 
-| Property | Value |
-|----------|-------|
-| Token length | 64 characters (cryptographic random) |
-| Absolute timeout | 24 hours |
-| Inactivity timeout | 4 hours |
-| Storage | Browser localStorage |
+- JWT tokens with HS256 signing
+- 24-hour expiry
+- Stored in browser localStorage
 
-### auth.json Format
+## API Endpoints
 
-```json
-{
-  "username": "admin",
-  "passwordHash": "<64-char hex SHA-256 derived key>",
-  "salt": "<32-char hex random salt>"
-}
-```
-
-## API Reference
-
-| Endpoint | Method | Auth | Request | Response |
-|----------|--------|------|---------|----------|
-| `/` | GET | No | — | Web client HTML |
-| `/styles.css` | GET | No | — | Stylesheet |
-| `/js/*.js` | GET | No | — | JavaScript modules |
-| `/api/auth` | POST | No | `{username, password}` | `{token, expiresIn}` |
-| `/api/session` | GET | Bearer | — | `{valid, username}` |
-| `/api/logout` | POST | Bearer | — | `{success}` |
-| `/api/offer` | POST | Bearer | `{sdp, type}` | `{sdp, type}` |
-
-### Error Responses
-
-```json
-{"error": "Invalid credentials", "remainingAttempts": 3}
-{"error": "Too many attempts", "lockoutSeconds": 1800}
-{"error": "Session expired"}
-{"error": "Authentication required"}
-```
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/` | GET | No | Web client |
+| `/styles.css` | GET | No | Stylesheet |
+| `/js/*.js` | GET | No | JavaScript modules |
+| `/api/auth` | POST | No | Login with `{username, password}` |
+| `/api/session` | GET | Bearer | Validate session |
+| `/api/logout` | POST | No | Logout |
+| `/api/offer` | POST | Bearer | WebRTC offer exchange |
 
 ## Video Pipeline
 
-### Capture Stage
+### Capture
 
-```
-Windows Graphics Capture API
-         │
-         ▼
-┌─────────────────────┐
-│ WGC Frame Pool (4)  │  WinRT Direct3D11CaptureFramePool
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  Texture Pool (6)   │  D3D11 staging textures with fence sync
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│   Frame Slot (4)    │  Lock-free ring buffer for encoder handoff
-└─────────────────────┘
-```
+- Windows Graphics Capture API
+- 6-texture pool with fence sync
+- 4-frame ring buffer for encoder handoff
 
-### Encoding Stage
+### Encoding
 
-| Setting | H.264 (NVENC) | AV1 (NVENC) |
-|---------|---------------|-------------|
-| Preset | P1 (fastest) | P1 (fastest) |
+| Setting | H.264 | AV1 |
+|---------|-------|-----|
+| Preset | P1 | P1 |
 | Tune | Ultra-low latency | Ultra-low latency |
 | Rate Control | VBR | VBR |
 | CQ Level | 23 | 28 |
-| Target Bitrate | 20 Mbps | 20 Mbps |
-| Max Bitrate | 40 Mbps | 40 Mbps |
-| B-Frames | Disabled | Disabled |
-| Lookahead | Disabled | Disabled |
 | Keyframe Interval | 2 seconds | 2 seconds |
+| B-Frames | Disabled | Disabled |
 
-### Transport Stage
+Bitrate formula: `0.18085 × width × height × fps`
 
-```
-┌─────────────────────┐
-│  Encoded Frame      │
-└─────────────────────┘
-         │
-         ▼  Split into 1400-byte chunks (21-byte header)
-┌─────────────────────┐
-│   Packet Header     │  timestamp (8) + encodeTime (4) + frameId (4) +
-│   + Chunk Data      │  chunkIndex (2) + totalChunks (2) + frameType (1)
-└─────────────────────┘
-         │
-         ▼  Queue with overflow protection (max 3 frames)
-┌─────────────────────┐
-│   Send Queue        │  256KB buffer threshold, paced drain
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  WebRTC DataChannel │  Unreliable, unordered (maxRetransmits: 0)
-└─────────────────────┘
-```
+### Transport
+
+- 1400-byte chunks with 21-byte header
+- 256KB buffer threshold
+- Max 3 frames queued
+- Unreliable, unordered delivery
+
+### Packet Header (21 bytes)
+
+| Field | Size | Description |
+|-------|------|-------------|
+| timestamp | 8 | Capture timestamp (µs) |
+| encodeTimeUs | 4 | Encode duration |
+| frameId | 4 | Frame sequence number |
+| chunkIndex | 2 | Chunk index |
+| totalChunks | 2 | Total chunks in frame |
+| frameType | 1 | 1=key, 0=delta |
 
 ## Audio Pipeline
 
@@ -218,8 +163,8 @@ Windows Graphics Capture API
 |----------|-------|
 | API | WASAPI Loopback |
 | Sample Rate | 48,000 Hz |
-| Channels | Stereo (max 2) |
-| Frame Duration | 20 ms (960 samples) |
+| Channels | Stereo |
+| Frame Duration | 10 ms (480 samples) |
 
 ### Encoding
 
@@ -227,82 +172,97 @@ Windows Graphics Capture API
 |----------|-------|
 | Codec | Opus |
 | Application | Restricted Low Delay |
-| Bitrate | 128 kbps |
-| Complexity | 5 |
+| Bitrate | 96 kbps |
+| Complexity | 3 |
 
 ### Transport
 
-```
-┌─────────────────────┐
-│  Audio Packet       │  16-byte header + Opus payload
-│  Header:            │  magic (4) + timestamp (8) +
-│                     │  samples (2) + dataLength (2)
-└─────────────────────┘
-```
+- 16-byte header + Opus payload
+- Max 4 packets queued
+- 128KB buffer threshold
 
-## Input Handling
-
-### Mouse Events
-
-| Event | Protocol Bytes | Description |
-|-------|----------------|-------------|
-| Move | 12 | magic (4) + x (4, float) + y (4, float) |
-| Button | 6 | magic (4) + button (1) + action (1) |
-| Wheel | 8 | magic (4) + deltaX (2) + deltaY (2) |
-
-### Keyboard Events
+### Audio Header (16 bytes)
 
 | Field | Size | Description |
 |-------|------|-------------|
-| magic | 4 | `0x4B455920` ("KEY ") |
+| magic | 4 | `0x41554449` |
+| timestamp | 8 | Capture timestamp |
+| samples | 2 | Sample count |
+| dataLength | 2 | Payload size |
+
+## Input Protocol
+
+### Mouse Move (12 bytes)
+
+| Field | Size | Description |
+|-------|------|-------------|
+| magic | 4 | `0x4D4F5645` |
+| x | 4 | Normalized X (float 0-1) |
+| y | 4 | Normalized Y (float 0-1) |
+
+### Relative Mouse Move (8 bytes)
+
+| Field | Size | Description |
+|-------|------|-------------|
+| magic | 4 | `0x4D4F5652` |
+| dx | 2 | Delta X |
+| dy | 2 | Delta Y |
+
+### Mouse Button (6 bytes)
+
+| Field | Size | Description |
+|-------|------|-------------|
+| magic | 4 | `0x4D42544E` |
+| button | 1 | 0=left, 1=right, 2=middle, 3-4=x |
+| action | 1 | 1=down, 0=up |
+
+### Mouse Wheel (8 bytes)
+
+| Field | Size | Description |
+|-------|------|-------------|
+| magic | 4 | `0x4D57484C` |
+| deltaX | 2 | Horizontal scroll |
+| deltaY | 2 | Vertical scroll |
+
+### Keyboard (10 bytes)
+
+| Field | Size | Description |
+|-------|------|-------------|
+| magic | 4 | `0x4B455920` |
 | keyCode | 2 | JavaScript keyCode |
-| scanCode | 2 | Hardware scan code (reserved) |
-| action | 1 | 1 = down, 0 = up |
-| modifiers | 1 | Ctrl (1) + Alt (2) + Shift (4) + Meta (8) |
+| scanCode | 2 | Hardware scan code |
+| action | 1 | 1=down, 0=up |
+| modifiers | 1 | Ctrl(1) Alt(2) Shift(4) Meta(8) |
 
-### Rate Limiting
+### Rate Limits
 
-| Input Type | Max per Second |
-|------------|----------------|
+| Type | Max per Second |
+|------|----------------|
 | Mouse moves | 500 |
-| Mouse clicks | 50 |
+| Clicks | 50 |
 | Keystrokes | 100 |
 
-### Blocked Combinations
+### Blocked Keys
 
 - Windows key (left/right)
 - Ctrl+Alt+Delete
 
 ## Client Architecture
 
-### Module Structure
-
 | File | Purpose |
 |------|---------|
-| `state.js` | Shared state, constants, clock sync, metrics |
+| `state.js` | Shared state, constants, metrics, clock sync |
 | `network.js` | HTTP auth, WebRTC signaling, message routing |
-| `renderer.js` | WebGL2 video rendering with letterboxing |
-| `media.js` | VideoDecoder/AudioDecoder with keyframe retry |
+| `renderer.js` | WebGL2 rendering with letterboxing |
+| `media.js` | VideoDecoder/AudioDecoder, keyframe retry |
 | `input.js` | Mouse/keyboard capture and transmission |
 | `ui.js` | Settings panel, tabbed mode, fullscreen |
 
-### Clock Synchronization
+### Clock Sync
 
-The client synchronizes time with the server using ping messages:
-
-```
-Client Send Time ─────────────────────▶ Server Time
-       │                                    │
-       │◀────────── RTT / 2 ───────────────│
-       │                                    │
-       ▼                                    ▼
-    Offset = ServerTime - (ClientSend + RTT/2)
-```
-
-- 8 samples maintained with median filtering
-- Drift tracking for long sessions
-- Used for end-to-end latency calculation
-- Ping interval: 200ms
+- Ping messages every 200ms
+- 8-sample median filter for offset calculation
+- RTT-based latency estimation
 
 ### Jitter Buffer
 
@@ -310,218 +270,50 @@ Client Send Time ─────────────────────
 |---------|-------|
 | Max frames | 2 |
 | Max age | 50 ms |
-| Frame timeout | 100 ms |
-
-## Server Metrics
-
-The server logs detailed metrics every second when streaming:
-
-```
-━━━ [42s] [LIVE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[THROUGHPUT] FPS: 60/60 (100.0%) | Bitrate: 18.45 Mbps | V:60 A:50 | Res: 2560x1440 | Codec: H.264
-[PIPELINE] Total: 8.23ms | Cap:1.12 + Hand:0.45 + Enc:4.56 + GPU:1.23 + Net:0.87ms
-[CAPTURE] Captured: 60/60 arrived | Interval: 16.45/16.67/16.89ms | Miss:0 Skip:0
-[ENCODER] Handoff: 0.32/0.45/0.67ms | Encode: 3.45/4.56/5.67ms
-[NETWORK] Queue: avg:2 max:4 depth:1 | Burst: 12/18 avg/max | Drains:60
-[INPUT] Mouse: 245 moves, 3 clicks | Keys: 12
-[SESSION] Uptime: 42s | Frames: 2520 (60.0 avg) | Data: 95.23MB (18.12 Mbps avg)
-```
-
-## Client Metrics
-
-The browser console displays detailed metrics every second:
-
-```
-━━━ [15s] [LIVE] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[THROUGHPUT] FPS: 60/60 (100.0%) | Bitrate: 18.45 Mbps | Frames: 60 recv, 60 dec, 60 rend
-[LATENCY] E2E: 12.5ms | RTT: 8.2ms (6.1/10.3) | FrameAge: 8.3ms (5.2/12.1)
-[JITTER] Queue: 0.85 (max:2) | Interval: 16.7±0.8ms | LocalAge: 2.1ms
-[DECODE] Count: 60 | Time: 1.23ms (0.95/2.10) | Queue: 1 | HW: HW
-[RENDER] Count: 60 | Time: 0.45ms (0.32/0.78) | Resolution: 2560x1440
-[NETWORK] Packets: 1250 (V:1200 A:48 C:2) | Size: 1180B avg (24-1421)
-```
+| Frame timeout | 200 ms |
 
 ## UI Features
 
 ### Settings Panel
 
-Access by clicking the right edge of the screen:
+Click right edge to open:
 
 - **Logout** — Disconnect and clear session
-- **Fullscreen** — Enter fullscreen with keyboard lock (Escape captured)
-- **Audio** — Toggle system audio streaming
-- **Monitor** — Switch between host displays
-- **Frame Rate** — Select 15/30/60/host native/client native FPS
-- **Codec** — Switch between H.264 and AV1 (if supported)
-- **Tabbed Mode** — Show monitor tabs at top of screen
+- **Fullscreen** — Enter fullscreen with keyboard lock
+- **Audio** — Toggle system audio
+- **Monitor** — Switch displays
+- **Frame Rate** — 15/30/60/120/144/custom FPS
+- **Codec** — H.264 or AV1
+- **Tabbed Mode** — Monitor tabs at top
+- **Debug Stats** — Performance overlay
+- **Relative Mouse** — Pointer lock mode
 
-### Tabbed Mode
+### Debug Stats Overlay
 
-When enabled, displays a Chrome-style tab bar showing all available monitors:
-- Click tabs to switch monitors
-- Shows resolution and primary indicator
-- Preference saved to localStorage
+Shows real-time metrics:
+- FPS, bitrate, resolution, codec
+- RTT, frame age, jitter
+- Decode/render times
+- Network packets
+- Audio buffer health
+- Drop counts
 
-### Codec Selection
+## Server Threads
 
-The client automatically detects codec support and prefers:
-1. AV1 with hardware acceleration
-2. AV1 with software decoding
-3. H.264 with hardware acceleration
-4. H.264 with software decoding
+| Thread | Priority | Purpose |
+|--------|----------|---------|
+| Main | Above Normal | HTTP server |
+| Encoder | Time Critical | Frame encoding |
+| Audio | Highest | Audio capture/encode |
 
-User preference is saved to localStorage.
+## Data Channel Configuration
 
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         SERVER (Windows)                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌────────────────┐    ┌────────────────┐    ┌──────────────────┐  │
-│  │  Screen        │───▶│  H.264/AV1     │───▶│    WebRTC        │  │
-│  │  Capture       │    │  Encoder       │    │    Server        │  │
-│  │  (WGC API)     │    │  (NVENC)       │    │  (DataChannel)   │  │
-│  └────────────────┘    └────────────────┘    └────────┬─────────┘  │
-│         │                      │                      │            │
-│  ┌──────┴──────┐        ┌──────┴──────┐               │            │
-│  │  Texture    │        │  D3D11      │               │            │
-│  │  Pool (6)   │        │  Fence Sync │               │            │
-│  └─────────────┘        └─────────────┘               │            │
-│                                                       │            │
-│  ┌────────────────┐    ┌────────────────┐             │            │
-│  │  Audio         │───▶│    Opus        │─────────────┤            │
-│  │  Capture       │    │    Encoder     │             │            │
-│  │  (WASAPI)      │    │  (128kbps)     │             │            │
-│  └────────────────┘    └────────────────┘             │            │
-│                                                       │            │
-│  ┌────────────────┐    ┌────────────────┐             │            │
-│  │  Input         │◀───│  HTTP Server   │◀────────────┘            │
-│  │  Handler       │    │  + Auth API    │                          │
-│  │  (SendInput)   │    │  (Port 6060)   │                          │
-│  └────────────────┘    └────────────────┘                          │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-                               │
-                               │ DTLS + Unreliable DataChannel
-                               │ (UDP 50000-50020)
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         CLIENT (Browser)                            │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌────────────────┐    ┌────────────────┐    ┌──────────────────┐  │
-│  │  WebRTC        │───▶│  H.264/AV1     │───▶│    WebGL2        │  │
-│  │  Receiver      │    │  Decoder       │    │    Renderer      │  │
-│  │  (DataChannel) │    │ (VideoDecoder) │    │                  │  │
-│  └────────────────┘    └────────────────┘    └──────────────────┘  │
-│         │                                                          │
-│         │              ┌────────────────┐    ┌──────────────────┐  │
-│         └─────────────▶│    Opus        │───▶│    Audio         │  │
-│                        │    Decoder     │    │    Playback      │  │
-│                        │ (AudioDecoder) │    │  (AudioContext)  │  │
-│                        └────────────────┘    └──────────────────┘  │
-│                                                                    │
-│  ┌────────────────┐    ┌────────────────┐                          │
-│  │  Mouse +       │───▶│   Clock Sync   │                          │
-│  │  Keyboard      │    │   + Metrics    │                          │
-│  │  (Normalized)  │    │                │                          │
-│  └────────────────┘    └────────────────┘                          │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-## Performance Tuning
-
-### Server Optimizations
-
-| Setting | Location | Effect |
-|---------|----------|--------|
-| Process priority | `main.cpp` | `ABOVE_NORMAL_PRIORITY_CLASS` |
-| Encoder thread | `main.cpp` | `THREAD_PRIORITY_TIME_CRITICAL` |
-| Audio thread | `main.cpp` | `THREAD_PRIORITY_HIGHEST` |
-| D3D11 multithread | `capture.hpp` | Thread-safe context access |
-
-### Recommended Settings
-
-| Scenario | Frame Rate | Expected Bitrate |
-|----------|------------|------------------|
-| LAN (1Gbps) | 60 FPS | 15-25 Mbps |
-| LAN (100Mbps) | 60 FPS | 15-25 Mbps |
-| WAN (50Mbps) | 30 FPS | 8-15 Mbps |
-| WAN (10Mbps) | 15 FPS | 3-8 Mbps |
-
-## Security Considerations
-
-### Server Hardening
-
-- Credentials hashed with PBKDF2 (600k iterations)
-- Rate limiting prevents brute-force attacks
-- Session tokens are cryptographically random
-- CORS restricted to same-origin
-- CSP headers prevent XSS
-- Input validation on all API endpoints
-- SDP size limited to 64KB
-
-### Input Filtering
-
-- Windows key blocked (prevents accidental OS shortcuts)
-- Ctrl+Alt+Delete blocked (security boundary)
-- Rate limiting prevents input flooding
-- Coordinate clamping to monitor bounds
-
-### Network Security
-
-- WebRTC uses DTLS encryption
-- Session tokens required for all streaming operations
-- Automatic session expiry on inactivity
-
-## Troubleshooting
-
-### Build Issues
-
-| Problem | Solution |
-|---------|----------|
-| vcpkg not found | Set `VCPKG_ROOT` environment variable or install to `C:\vcpkg` |
-| CMake configuration failed | Ensure Visual Studio 2022 with C++ Desktop workload is installed |
-| NVENC not available | NVIDIA GPU with NVENC support is required |
-
-### Connection Issues
-
-| Problem | Solution |
-|---------|----------|
-| Connection refused | Check firewall allows TCP 6060 and UDP 50000-50020 |
-| WebRTC timeout | Ensure UDP is not blocked by NAT/firewall |
-| Session expired | Re-authenticate; sessions expire after 24h or 4h inactivity |
-| Rate limited | Wait 30 minutes or use different IP |
-
-### Streaming Issues
-
-| Problem | Solution |
-|---------|----------|
-| Black screen | Wait for keyframe or refresh page |
-| Choppy video | Lower frame rate; check network bandwidth |
-| No audio | Click "Enable" in audio section; browser requires user gesture |
-| High latency | Use wired connection; reduce frame rate; check server CPU usage |
-
-### Client Issues
-
-| Problem | Solution |
-|---------|----------|
-| Codec unsupported | Use Chrome 94+, Edge 94+, or Firefox 98+ |
-| Input not working | Click on video canvas to capture input |
-| Keyboard locked | Press Escape twice or exit fullscreen |
-
-## Building Installer
-
-```batch
-build_installer.bat
-```
-
-Creates:
-- `SlipStream-1.0.0-win64.exe` (NSIS installer, if available)
-- `SlipStream-1.0.0-win64.zip` (fallback)
+| Channel | Ordered | MaxRetransmits |
+|---------|---------|----------------|
+| control | Yes | 3 |
+| video | No | 0 |
+| audio | No | 0 |
+| input | Yes | 3 |
 
 ## Dependencies
 
@@ -529,29 +321,45 @@ Managed via vcpkg:
 
 | Package | Purpose |
 |---------|---------|
-| libdatachannel | WebRTC implementation |
-| cpp-httplib[openssl] | HTTP server with TLS support |
-| nlohmann-json | JSON parsing |
+| libdatachannel | WebRTC |
+| cpp-httplib[openssl] | HTTP server |
+| nlohmann-json | JSON |
 | opus | Audio encoding |
 | openssl | Cryptography |
-| ffmpeg[nvcodec,avcodec] | Video encoding (NVENC) |
+| ffmpeg[nvcodec,avcodec] | Video encoding |
+| jwt-cpp | JWT tokens |
 
-## Known Limitations
+## Building Installer
 
-- Windows only (server requires WGC API and WASAPI)
-- Single client at a time
-- NVIDIA GPU required (no software encoding fallback)
-- No clipboard sync
-- No file transfer
-- Hardware cursor only
+```batch
+build_installer.bat
+```
+
+Creates `SlipStream-1.0.0-win64.exe` (NSIS) or `.zip` (fallback).
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| vcpkg not found | Set `VCPKG_ROOT` or install to `C:\vcpkg` |
+| NVENC unavailable | Requires NVIDIA GPU with NVENC |
+| Connection refused | Check firewall for TCP 6060, UDP 50000-50020 |
+| Black screen | Wait for keyframe or refresh |
+| No audio | Click Enable in settings |
+| Input not working | Click canvas to capture |
+
+## Limitations
+
+- Windows server only
+- Single client
+- NVIDIA GPU required
+- No clipboard/file transfer
 
 ## License
 
 Business Source License (Personal-Online / No-Company) v1.1
 
-Personal use permitted. Commercial and company use requires a separate license.
-
-See [LICENSE.txt](LICENSE.txt) for full terms.
+Personal use permitted. Commercial use requires separate license.
 
 ## Copyright
 

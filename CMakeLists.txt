@@ -29,7 +29,6 @@ add_executable(SlipStream
     include/webrtc.hpp
     include/audio.hpp
     include/input.hpp
-    include/stats.hpp
 )
 
 target_compile_definitions(SlipStream PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
