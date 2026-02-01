@@ -1,23 +1,16 @@
-import { C, S, serverFrameAgeMs, recordRenderTime } from './state.js';
+import { C, S, serverFrameAgeMs, recordRenderTime, logVideoDrop } from './state.js';
 
 export const canvas = document.getElementById('c');
 export let canvasW = 0, canvasH = 0;
 
-const gl = canvas.getContext('webgl2', {
-    alpha: false, depth: false, stencil: false, antialias: false,
-    desynchronized: true, powerPreference: 'high-performance', preserveDrawingBuffer: false
-});
-
+const gl = canvas.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false, desynchronized: true, powerPreference: 'high-performance', preserveDrawingBuffer: false });
 let lastSuccessfulVp = null, hasValidTexture = false;
 
 const updateSize = () => {
-    const dpr = devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
+    const dpr = devicePixelRatio || 1, rect = canvas.getBoundingClientRect();
     const dW = Math.round(rect.width * dpr), dH = Math.round(rect.height * dpr);
     if (dW > 0 && dH > 0 && (canvas.width !== dW || canvas.height !== dH)) {
-        canvas.width = canvasW = dW;
-        canvas.height = canvasH = dH;
-        return true;
+        canvas.width = canvasW = dW; canvas.height = canvasH = dH; return true;
     }
     return false;
 };
@@ -28,12 +21,8 @@ const init = () => {
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
     const vs = gl.createShader(gl.VERTEX_SHADER), fs = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(vs, `#version 300 es
-        in vec2 a_pos, a_tex; out vec2 v;
-        void main() { gl_Position = vec4(a_pos, 0., 1.); v = a_tex; }`);
-    gl.shaderSource(fs, `#version 300 es
-        precision highp float; in vec2 v; uniform sampler2D u; out vec4 o;
-        void main() { o = texture(u, v); }`);
+    gl.shaderSource(vs, `#version 300 es\nin vec2 a_pos, a_tex; out vec2 v;\nvoid main() { gl_Position = vec4(a_pos, 0., 1.); v = a_tex; }`);
+    gl.shaderSource(fs, `#version 300 es\nprecision highp float; in vec2 v; uniform sampler2D u; out vec4 o;\nvoid main() { o = texture(u, v); }`);
     gl.compileShader(vs); gl.compileShader(fs);
 
     const prog = gl.createProgram();
@@ -46,8 +35,7 @@ const init = () => {
 
     [['a_pos', 0], ['a_tex', 8]].forEach(([n, o]) => {
         const loc = gl.getAttribLocation(prog, n);
-        gl.enableVertexAttribArray(loc);
-        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 16, o);
+        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 16, o);
     });
 
     gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
@@ -94,10 +82,7 @@ const renderFrame = (frame, meta) => {
         lastSuccessfulVp = { ...vp };
     } catch {
         S.stats.renderErrors++;
-        if (hasValidTexture && lastSuccessfulVp) {
-            gl.viewport(lastSuccessfulVp.x, lastSuccessfulVp.y, lastSuccessfulVp.w, lastSuccessfulVp.h);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        }
+        if (hasValidTexture && lastSuccessfulVp) { gl.viewport(lastSuccessfulVp.x, lastSuccessfulVp.y, lastSuccessfulVp.w, lastSuccessfulVp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
     }
 
     if (ok) { clearLetterbox(vp); gl.viewport(vp.x, vp.y, vp.w, vp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
@@ -108,14 +93,17 @@ const renderFrame = (frame, meta) => {
 };
 
 export const queueFrameForPresentation = entry => {
+    if (!S.tabVisible) { try { entry.frame.close(); } catch {} return; }
+
     const now = performance.now(), m = S.jitterMetrics, q = S.presentQueue;
-    const maxQ = C.JITTER_MAX_FRAMES || 2, maxAge = C.JITTER_MAX_AGE_MS || 50;
 
     m.queueDepthSum += q.length; m.queueDepthSamples++; m.maxQueueDepth = Math.max(m.maxQueueDepth, q.length);
 
-    while (q.length > 0 && (now - q[0].queuedAt > maxAge || q.length >= maxQ)) {
-        m[now - q[0].queuedAt > maxAge ? 'framesDroppedLate' : 'framesDroppedOverflow']++;
-        try { q.shift().frame.close(); } catch {}
+    while (q.length > 0 && (now - q[0].queuedAt > C.JITTER_MAX_AGE_MS || q.length >= C.JITTER_MAX_FRAMES)) {
+        const dropped = q.shift(), age = now - dropped.queuedAt;
+        if (age > C.JITTER_MAX_AGE_MS) { m.framesDroppedLate++; logVideoDrop('Frame too old'); }
+        else { m.framesDroppedOverflow++; logVideoDrop('Queue overflow'); }
+        try { dropped.frame.close(); } catch {}
     }
 
     const localAge = now - entry.queuedAt;
@@ -152,55 +140,39 @@ export const stopPresentLoop = () => {
     lastSuccessfulVp = null;
 };
 
-let resizeTimeout, resizeRAF;
+let resizeTimeout, resizeRAF, classChangeTimeout;
+
 const handleResize = () => {
     cancelAnimationFrame(resizeRAF);
     clearTimeout(resizeTimeout);
-
     resizeTimeout = setTimeout(() => {
         resizeRAF = requestAnimationFrame(() => {
-            const sizeChanged = updateSize();
+            updateSize();
             if (canvasW > 0 && canvasH > 0 && gl) {
                 gl.viewport(0, 0, canvasW, canvasH);
                 gl.clearColor(0.039, 0.039, 0.043, 1);
                 gl.clear(gl.COLOR_BUFFER_BIT);
-
                 if (S.W > 0 && S.H > 0 && hasValidTexture) {
                     const vp = S.lastVp = calcVp(S.W, S.H, canvasW, canvasH);
-                    clearLetterbox(vp);
-                    gl.viewport(vp.x, vp.y, vp.w, vp.h);
-                    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                    clearLetterbox(vp); gl.viewport(vp.x, vp.y, vp.w, vp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
                 }
             }
         });
     }, 50);
 };
 
-// Handle class changes on body (for tabbed mode) - wait for CSS transition to complete
-let classChangeTimeout;
 const handleClassChange = () => {
     clearTimeout(classChangeTimeout);
-    // Immediate resize to start updating
     handleResize();
-    // Wait for CSS transition to complete (300ms) plus buffer, then resize again
-    classChangeTimeout = setTimeout(() => {
-        handleResize();
-        // Final resize after transitions fully settle
-        setTimeout(handleResize, 150);
-    }, 350);
+    classChangeTimeout = setTimeout(() => { handleResize(); setTimeout(handleResize, 150); }, 350);
 };
 
 window.addEventListener('resize', handleResize);
 new MutationObserver(handleClassChange).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
-// Initial size update
 requestAnimationFrame(() => {
     updateSize();
-    if (gl) {
-        gl.viewport(0, 0, canvasW, canvasH);
-        gl.clearColor(0.039, 0.039, 0.043, 1);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-    }
+    if (gl) { gl.viewport(0, 0, canvasW, canvasH); gl.clearColor(0.039, 0.039, 0.043, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
 });
 
 init();
