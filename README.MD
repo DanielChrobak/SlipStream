@@ -1,20 +1,57 @@
 # SlipStream
 
-Low-latency remote desktop streaming with hardware-accelerated encoding and WebRTC data channels.
+Low-latency remote desktop streaming over WebRTC with hardware-accelerated video encoding.
 
 ## Overview
 
-SlipStream captures the host display using Windows Graphics Capture API and encodes frames with NVIDIA NVENC (H.264 or AV1). Video streams to browsers via WebRTC unreliable data channels. System audio is captured via WASAPI loopback and encoded with Opus. Mouse and keyboard input is relayed back to the host.
+SlipStream captures the Windows desktop using the Windows Graphics Capture API and encodes frames in real-time using NVIDIA NVENC. Video and audio are streamed to web browsers via WebRTC data channels with DTLS encryption. The client renders frames using WebGL2 and decodes video/audio using the WebCodecs API.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              SERVER (Windows)                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Screen Capture          Encoder              WebRTC              Audio     │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────┐  │
+│  │ WGC API      │───▶│ NVENC        │───▶│ Data Channel │◀──▶│ WASAPI   │  │
+│  │ D3D11 Fence  │    │ H.264 / AV1  │    │ libdatachan  │    │ Opus     │  │
+│  │ 6-tex pool   │    │ FFmpeg       │    │              │    │ 96 kbps  │  │
+│  └──────────────┘    └──────────────┘    └──────────────┘    └──────────┘  │
+│                                                │                            │
+│                            ┌───────────────────┼───────────────────┐        │
+│                            │      HTTPS Server (port 443)         │        │
+│                            │   cpp-httplib + OpenSSL              │        │
+│                            │   JWT Auth + Rate Limiting           │        │
+│                            └───────────────────┼───────────────────┘        │
+└────────────────────────────────────────────────┼────────────────────────────┘
+                                                 │
+                            WebRTC (UDP 50000-50020)
+                                                 │
+┌────────────────────────────────────────────────┼────────────────────────────┐
+│                              CLIENT (Browser)                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────┐  │
+│  │ VideoDecoder │───▶│ WebGL2       │    │ AudioDecoder │───▶│ Worklet  │  │
+│  │ HW or SW     │    │ Letterbox    │    │ Opus         │    │ RingBuf  │  │
+│  └──────────────┘    └──────────────┘    └──────────────┘    └──────────┘  │
+│                                                                             │
+│  Input Handler ──────▶ Mouse/Keyboard ──────▶ Data Channel ──────▶ Server  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Features
 
-- **Dual Codec** — H.264 and AV1 via NVIDIA NVENC
-- **WebRTC Transport** — DTLS-encrypted unreliable data channels
-- **System Audio** — Opus-encoded WASAPI loopback at 48kHz stereo
-- **Multi-Monitor** — Live monitor switching with tabbed UI
-- **Input Control** — Mouse, wheel, and keyboard with modifier support
-- **Authentication** — PBKDF2-SHA256 (600k iterations) with rate limiting
-- **GPU Sync** — D3D11 fence-based synchronization
+- **Dual Codec Support** - H.264 and AV1 via NVIDIA NVENC
+- **Hardware Decoding** - WebCodecs API with automatic HW/SW fallback
+- **System Audio** - WASAPI loopback capture with Opus encoding
+- **Multi-Monitor** - Live monitor switching with optional tabbed UI
+- **Clipboard Sync** - Bidirectional text clipboard (Ctrl+C/V)
+- **Relative Mouse** - Pointer lock mode for games and full-screen apps
+- **Session Auth** - PBKDF2-SHA256 password hashing with JWT tokens
+- **Rate Limiting** - Protection against brute-force attacks
+- **Auto SSL** - Self-signed certificate generation on first run
+- **Debug Stats** - Real-time performance overlay
 
 ## Requirements
 
@@ -23,8 +60,8 @@ SlipStream captures the host display using Windows Graphics Capture API and enco
 | Component | Requirement |
 |-----------|-------------|
 | OS | Windows 10/11 64-bit (build 1903+) |
-| IDE | Visual Studio 2022 with C++20 Desktop workload |
 | GPU | NVIDIA GPU with NVENC support |
+| IDE | Visual Studio 2022 with C++20 Desktop workload |
 | Package Manager | [vcpkg](https://github.com/microsoft/vcpkg) |
 
 ### Client
@@ -59,180 +96,237 @@ Output: `build\bin\Release\SlipStream.exe`
 run.bat
 ```
 
-First run prompts for credentials:
-- **Username** — 3-32 alphanumeric characters (plus `_` and `-`)
-- **Password** — 8+ characters with at least one letter and one digit
-
-Credentials are hashed and saved to `auth.json`.
+On first run:
+- Prompts for username (3-32 alphanumeric characters)
+- Prompts for password (8+ characters with at least one letter and digit)
+- Generates self-signed SSL certificate (`server.crt`, `server.key`)
+- Saves hashed credentials to `auth.json`
 
 ### 4. Connect
 
-Open browser to `http://<HOST_IP>:6060` and enter credentials.
+Open browser to `https://<HOST_IP>:443` and log in with your credentials.
+
+> **Note:** Self-signed certificate will trigger a browser warning. Click through to proceed.
 
 ## Network Configuration
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 6060 | TCP | HTTP server and WebRTC signaling |
+| 443 | TCP | HTTPS server and WebRTC signaling |
 | 50000-50020 | UDP | WebRTC media transport |
 
 ### Firewall
 
 ```powershell
-netsh advfirewall firewall add rule name="SlipStream HTTP" dir=in action=allow protocol=tcp localport=6060
+netsh advfirewall firewall add rule name="SlipStream HTTPS" dir=in action=allow protocol=tcp localport=443
 netsh advfirewall firewall add rule name="SlipStream WebRTC" dir=in action=allow protocol=udp localport=50000-50020
 ```
 
-## Authentication
+## Security
 
-### Password Security
+### Password Storage
 
-- **600,000 PBKDF2 iterations** with SHA-256
-- **16-byte random salt**
-- **32-byte derived key** stored as hex
+| Parameter | Value |
+|-----------|-------|
+| Algorithm | PBKDF2-HMAC-SHA256 |
+| Iterations | 600,000 |
+| Salt | 16 bytes (random) |
+| Key Length | 32 bytes |
+
+Passwords are never stored in plain text. Only the salt and derived hash are saved in `auth.json`.
 
 ### Rate Limiting
 
 | Threshold | Action |
 |-----------|--------|
-| 5 failed attempts in 15 minutes | 30-minute IP lockout |
+| 5 failed attempts in 15 min | 30-minute IP lockout |
 | Successful login | Clears attempt counter |
 
-### Session
+### JWT Sessions
 
-- JWT tokens with HS256 signing
-- 24-hour expiry
-- Stored in browser localStorage
+| Parameter | Value |
+|-----------|-------|
+| Algorithm | HS256 |
+| Issuer | slipstream |
+| Expiry | 24 hours |
+| Storage | HttpOnly cookie |
+
+### SSL Certificates
+
+Auto-generated on first run:
+- 2048-bit RSA key
+- 10-year validity
+- Subject Alt Names: localhost, 127.0.0.1, 0.0.0.0
+
+To use custom certificates, replace `server.crt` and `server.key` before starting.
 
 ## API Endpoints
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/` | GET | No | Web client |
+| `/` | GET | No | Web client HTML |
 | `/styles.css` | GET | No | Stylesheet |
 | `/js/*.js` | GET | No | JavaScript modules |
 | `/api/auth` | POST | No | Login with `{username, password}` |
-| `/api/session` | GET | Bearer | Validate session |
-| `/api/logout` | POST | No | Logout |
-| `/api/offer` | POST | Bearer | WebRTC offer exchange |
+| `/api/session` | GET | Cookie | Validate current session |
+| `/api/logout` | POST | No | Clear session cookie |
+| `/api/offer` | POST | Cookie | WebRTC SDP offer exchange |
 
 ## Video Pipeline
 
 ### Capture
 
-- Windows Graphics Capture API
-- 6-texture pool with fence sync
-- 4-frame ring buffer for encoder handoff
+| Component | Detail |
+|-----------|--------|
+| API | Windows Graphics Capture |
+| Texture Pool | 6 textures with D3D11 fence sync |
+| Frame Buffer | 4-frame ring buffer |
+| Cursor | Captured in stream |
+| Border | Disabled (if supported) |
 
 ### Encoding
 
 | Setting | H.264 | AV1 |
 |---------|-------|-----|
-| Preset | P1 | P1 |
+| Encoder | h264_nvenc | av1_nvenc |
+| Preset | P1 (fastest) | P1 (fastest) |
 | Tune | Ultra-low latency | Ultra-low latency |
 | Rate Control | VBR | VBR |
 | CQ Level | 23 | 28 |
 | Keyframe Interval | 2 seconds | 2 seconds |
-| B-Frames | Disabled | Disabled |
+| B-Frames | 0 | 0 |
+| Color Space | BT.709 | BT.709 |
+| Color Range | Full (JPEG) | Full (PC) |
 
-Bitrate formula: `0.18085 × width × height × fps`
+**Bitrate Formula:** `0.18085 × width × height × fps` bps
+
+Example: 1920×1080 @ 60fps = ~22.5 Mbps
 
 ### Transport
 
-- 1400-byte chunks with 21-byte header
-- 256KB buffer threshold
-- Max 3 frames queued
-- Unreliable, unordered delivery
+| Parameter | Value |
+|-----------|-------|
+| Chunk Size | 1400 bytes max |
+| Header Size | 21 bytes |
+| Video Buffer | 256 KB threshold |
+| Max Queue | 3 frames worth |
+| Delivery | Unreliable, unordered |
 
-### Packet Header (21 bytes)
+### Video Packet Header (21 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| timestamp | 8 | Capture timestamp (µs) |
-| encodeTimeUs | 4 | Encode duration |
-| frameId | 4 | Frame sequence number |
-| chunkIndex | 2 | Chunk index |
-| totalChunks | 2 | Total chunks in frame |
-| frameType | 1 | 1=key, 0=delta |
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 8 | timestamp | Capture timestamp (microseconds) |
+| 8 | 4 | encodeTimeUs | Encode duration |
+| 12 | 4 | frameId | Frame sequence number |
+| 16 | 2 | chunkIndex | Current chunk index |
+| 18 | 2 | totalChunks | Total chunks in frame |
+| 20 | 1 | frameType | 1=keyframe, 0=delta |
 
 ## Audio Pipeline
 
 ### Capture
 
-| Property | Value |
-|----------|-------|
+| Parameter | Value |
+|-----------|-------|
 | API | WASAPI Loopback |
-| Sample Rate | 48,000 Hz |
-| Channels | Stereo |
+| Mode | Shared |
+| Sample Rate | 48,000 Hz (resampled if needed) |
+| Channels | Stereo (max 2) |
 | Frame Duration | 10 ms (480 samples) |
 
 ### Encoding
 
-| Property | Value |
-|----------|-------|
+| Parameter | Value |
+|-----------|-------|
 | Codec | Opus |
 | Application | Restricted Low Delay |
 | Bitrate | 96 kbps |
 | Complexity | 3 |
+| Signal Type | Music |
 
 ### Transport
 
-- 16-byte header + Opus payload
-- Max 4 packets queued
-- 128KB buffer threshold
+| Parameter | Value |
+|-----------|-------|
+| Audio Buffer | 128 KB threshold |
+| Max Queue | 4 packets |
+| Delivery | Unreliable, unordered |
 
-### Audio Header (16 bytes)
+### Audio Packet Header (16 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| magic | 4 | `0x41554449` |
-| timestamp | 8 | Capture timestamp |
-| samples | 2 | Sample count |
-| dataLength | 2 | Payload size |
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4 | magic | 0x41554449 ("AUDI") |
+| 4 | 8 | timestamp | Capture timestamp |
+| 12 | 2 | samples | Sample count |
+| 14 | 2 | dataLength | Opus payload size |
+
+### Client Playback
+
+| Component | Detail |
+|-----------|--------|
+| Decoder | AudioDecoder (WebCodecs) |
+| Processor | AudioWorklet |
+| Buffer | Ring buffer (2400 samples) |
+| Target Latency | 480 samples (~10ms) |
+| Max Buffer | 1200 samples (~25ms) |
 
 ## Input Protocol
 
-### Mouse Move (12 bytes)
+### Mouse Move Absolute (12 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| magic | 4 | `0x4D4F5645` |
-| x | 4 | Normalized X (float 0-1) |
-| y | 4 | Normalized Y (float 0-1) |
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | magic (0x4D4F5645) |
+| 4 | 4 | x (float 0-1) |
+| 8 | 4 | y (float 0-1) |
 
-### Relative Mouse Move (8 bytes)
+### Mouse Move Relative (8 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| magic | 4 | `0x4D4F5652` |
-| dx | 2 | Delta X |
-| dy | 2 | Delta Y |
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | magic (0x4D4F5652) |
+| 4 | 2 | dx (int16) |
+| 6 | 2 | dy (int16) |
 
 ### Mouse Button (6 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| magic | 4 | `0x4D42544E` |
-| button | 1 | 0=left, 1=right, 2=middle, 3-4=x |
-| action | 1 | 1=down, 0=up |
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | magic (0x4D42544E) |
+| 4 | 1 | button (0-4) |
+| 5 | 1 | action (1=down, 0=up) |
+
+Button mapping: 0=left, 1=right, 2=middle, 3=X1, 4=X2
 
 ### Mouse Wheel (8 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| magic | 4 | `0x4D57484C` |
-| deltaX | 2 | Horizontal scroll |
-| deltaY | 2 | Vertical scroll |
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | magic (0x4D57484C) |
+| 4 | 2 | deltaX (int16) |
+| 6 | 2 | deltaY (int16) |
 
 ### Keyboard (10 bytes)
 
-| Field | Size | Description |
-|-------|------|-------------|
-| magic | 4 | `0x4B455920` |
-| keyCode | 2 | JavaScript keyCode |
-| scanCode | 2 | Hardware scan code |
-| action | 1 | 1=down, 0=up |
-| modifiers | 1 | Ctrl(1) Alt(2) Shift(4) Meta(8) |
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | magic (0x4B455920) |
+| 4 | 2 | keyCode (JS keyCode) |
+| 6 | 2 | scanCode |
+| 8 | 1 | action (1=down, 0=up) |
+| 9 | 1 | modifiers |
+
+Modifiers: Ctrl=1, Alt=2, Shift=4, Meta=8
+
+### Clipboard Data (8 + N bytes)
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | magic (0x434C4950) |
+| 4 | 4 | length |
+| 8 | N | UTF-8 text (max 1MB) |
 
 ### Rate Limits
 
@@ -242,94 +336,119 @@ Bitrate formula: `0.18085 × width × height × fps`
 | Clicks | 50 |
 | Keystrokes | 100 |
 
-### Blocked Keys
+### Blocked Inputs
 
 - Windows key (left/right)
 - Ctrl+Alt+Delete
 
-## Client Architecture
+## WebRTC Data Channels
+
+| Channel | Ordered | MaxRetransmits | Purpose |
+|---------|---------|----------------|---------|
+| control | Yes | 3 | Commands, ping, monitor list |
+| video | No | 0 | Video frames |
+| audio | No | 0 | Audio packets |
+| input | Yes | 3 | Mouse/keyboard events |
+
+## Client Modules
 
 | File | Purpose |
 |------|---------|
 | `state.js` | Shared state, constants, metrics, clock sync |
-| `network.js` | HTTP auth, WebRTC signaling, message routing |
-| `renderer.js` | WebGL2 rendering with letterboxing |
-| `media.js` | VideoDecoder/AudioDecoder, keyframe retry |
-| `input.js` | Mouse/keyboard capture and transmission |
-| `ui.js` | Settings panel, tabbed mode, fullscreen |
+| `network.js` | HTTP auth, WebRTC signaling, data channels |
+| `renderer.js` | WebGL2 rendering with aspect ratio letterboxing |
+| `media.js` | VideoDecoder, AudioDecoder, AudioWorklet |
+| `input.js` | Mouse/keyboard capture, batching, pointer lock |
+| `ui.js` | Settings panel, fullscreen, tabbed mode, stats |
 
-### Clock Sync
+### Clock Synchronization
 
-- Ping messages every 200ms
-- 8-sample median filter for offset calculation
-- RTT-based latency estimation
+- Ping interval: 200ms
+- Sample count: 8
+- Offset calculation: Median filter
+- RTT estimation: Median of samples
 
-### Jitter Buffer
+### Frame Handling
 
-| Setting | Value |
-|---------|-------|
-| Max frames | 2 |
-| Max age | 50 ms |
-| Frame timeout | 200 ms |
+| Parameter | Value |
+|-----------|-------|
+| Max buffered frames | 8 |
+| Frame timeout | 200ms |
+| Max frame age | 50ms |
+| Decode queue limit | 6 |
 
 ## UI Features
 
 ### Settings Panel
 
-Click right edge to open:
+Access by clicking the right edge of the screen:
 
-- **Logout** — Disconnect and clear session
-- **Fullscreen** — Enter fullscreen with keyboard lock
-- **Audio** — Toggle system audio
-- **Monitor** — Switch displays
-- **Frame Rate** — 15/30/60/120/144/custom FPS
-- **Codec** — H.264 or AV1
-- **Tabbed Mode** — Monitor tabs at top
-- **Debug Stats** — Performance overlay
-- **Relative Mouse** — Pointer lock mode
+- **Logout** - Disconnect and clear session
+- **Fullscreen** - Enter fullscreen with keyboard lock (Escape captured)
+- **Audio** - Toggle system audio playback
+- **Monitor** - Switch between displays
+- **Frame Rate** - 15/30/60/120/144 or custom (1-240)
+- **Codec** - H.264 or AV1 (shows HW/SW status)
+- **Tabbed Mode** - Monitor tabs at top of screen
+- **Debug Stats** - Real-time performance overlay
+- **Relative Mouse** - Pointer lock mode for gaming
+- **Clipboard Sync** - Enable Ctrl+C/V synchronization
+
+### Tabbed Mode
+
+When enabled, displays a tab strip showing all monitors with:
+- Monitor name (friendly name from EDID)
+- Resolution
+- Primary indicator (star icon)
 
 ### Debug Stats Overlay
 
-Shows real-time metrics:
-- FPS, bitrate, resolution, codec
-- RTT, frame age, jitter
-- Decode/render times
-- Network packets
-- Audio buffer health
-- Drop counts
+Real-time metrics display:
+
+| Section | Metrics |
+|---------|---------|
+| Throughput | FPS (actual/target), bitrate, resolution, codec |
+| Latency | RTT, frame age |
+| Jitter | Frame interval mean, std dev |
+| Decode | Time, queue size, HW acceleration status |
+| Render | Time, frame count |
+| Network | Packet count, average size |
+| Drops | Dropped, timeout, late, decode errors |
+| Audio | Packets, decoded, buffer health, underruns, overflows |
+| Input | Mouse moves, clicks, keystrokes |
+| Session | Uptime, total frames, total data |
 
 ## Server Threads
 
 | Thread | Priority | Purpose |
 |--------|----------|---------|
-| Main | Above Normal | HTTP server |
-| Encoder | Time Critical | Frame encoding |
-| Audio | Highest | Audio capture/encode |
-
-## Data Channel Configuration
-
-| Channel | Ordered | MaxRetransmits |
-|---------|---------|----------------|
-| control | Yes | 3 |
-| video | No | 0 |
-| audio | No | 0 |
-| input | Yes | 3 |
+| Main | Above Normal | HTTPS server |
+| Encoder | Time Critical | Frame encoding loop |
+| Audio | Highest | Audio capture and encoding |
 
 ## Dependencies
 
-Managed via vcpkg:
+Managed via vcpkg (`vcpkg.json`):
 
 | Package | Purpose |
 |---------|---------|
-| libdatachannel | WebRTC |
-| cpp-httplib[openssl] | HTTP server |
-| nlohmann-json | JSON |
+| libdatachannel | WebRTC implementation |
+| cpp-httplib[openssl] | HTTPS server |
+| nlohmann-json | JSON parsing |
 | opus | Audio encoding |
-| openssl | Cryptography |
+| openssl | Cryptography, SSL/TLS |
 | ffmpeg[nvcodec,avcodec] | Video encoding |
-| jwt-cpp | JWT tokens |
+| jwt-cpp | JWT token handling |
 
-## Building Installer
+## Building
+
+### Standard Build
+
+```batch
+build.bat
+```
+
+### Installer Build
 
 ```batch
 build_installer.bat
@@ -342,24 +461,27 @@ Creates `SlipStream-1.0.0-win64.exe` (NSIS) or `.zip` (fallback).
 | Problem | Solution |
 |---------|----------|
 | vcpkg not found | Set `VCPKG_ROOT` or install to `C:\vcpkg` |
-| NVENC unavailable | Requires NVIDIA GPU with NVENC |
-| Connection refused | Check firewall for TCP 6060, UDP 50000-50020 |
-| Black screen | Wait for keyframe or refresh |
-| No audio | Click Enable in settings |
-| Input not working | Click canvas to capture |
+| NVENC unavailable | Requires NVIDIA GPU with NVENC support |
+| Connection refused | Check firewall for TCP 443, UDP 50000-50020 |
+| Black screen | Wait for keyframe or click to focus |
+| No audio | Click "Enable" in settings panel |
+| Input not working | Click the video canvas to capture focus |
+| Certificate warning | Expected with self-signed cert |
 
-## Limitations
+## Known Limitations
 
 - Windows server only
-- Single client
-- NVIDIA GPU required
-- No clipboard/file transfer
+- Single client connection (new client kicks existing)
+- NVIDIA GPU required for encoding
+- No file transfer
 
 ## License
 
 Business Source License (Personal-Online / No-Company) v1.1
 
 Personal use permitted. Commercial use requires separate license.
+
+See LICENSE.txt for full terms.
 
 ## Copyright
 
