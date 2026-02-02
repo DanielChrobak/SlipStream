@@ -26,7 +26,7 @@
             </div>
             <div class="stats-section">
                 <div class="stats-label">JITTER</div>
-                <div class="stats-row"><span>Queue</span><span id="statsQueue">--</span></div>
+
                 <div class="stats-row"><span>Interval</span><span id="statsInterval">-- ms</span></div>
                 <div class="stats-row"><span>Std Dev</span><span id="statsStdDev">-- ms</span></div>
             </div>
@@ -51,7 +51,7 @@
                 <div class="stats-row"><span>Dropped</span><span id="statsDropsDropped">0</span></div>
                 <div class="stats-row"><span>Timeout</span><span id="statsDropsTimeout">0</span></div>
                 <div class="stats-row"><span>Late</span><span id="statsDropsLate">0</span></div>
-                <div class="stats-row"><span>Overflow</span><span id="statsDropsOverflow">0</span></div>
+
                 <div class="stats-row"><span>Decode Err</span><span id="statsDecodeErrors">0</span></div>
             </div>
             <div class="stats-section">
@@ -59,7 +59,6 @@
                 <div class="stats-row"><span>Packets</span><span id="statsAudioPackets">--</span></div>
                 <div class="stats-row"><span>Decoded</span><span id="statsAudioDecoded">--</span></div>
                 <div class="stats-row"><span>Buffer</span><span id="statsAudioBuffer">-- ms</span></div>
-                <div class="stats-row"><span>Playback Rate</span><span id="statsAudioRate">--x</span></div>
             </div>
             <div class="stats-section" id="statsAudioDropsSection">
                 <div class="stats-label stats-label-warn">AUDIO DROPS</div>
@@ -147,6 +146,8 @@
                 <div class="sl">Input</div>
                 <div class="sw"><span class="sla">Relative mouse</span><button class="tog" id="relativeMouseBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
                 <p class="input-hint" id="relativeMouseHint">Click canvas to lock cursor</p>
+                <div class="sw"><span class="sla">Clipboard sync</span><button class="tog" id="clipboardSyncBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+                <p class="input-hint" id="clipboardSyncHint">Ctrl+C/V syncs clipboard</p>
             </div>
         </div>
     </div>
