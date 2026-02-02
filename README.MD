@@ -20,9 +20,9 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 │  └──────────────┘     └──────────────┘    └──────────────┘     └──────────┘  │
 │                                                │                             │
 │                            ┌───────────────────┼───────────────────┐         │
-│                            │      HTTPS Server (port 443)         │          │
-│                            │   cpp-httplib + OpenSSL              │          │
-│                            │   JWT Auth + Rate Limiting           │          │
+│                            │      HTTPS Server (port 443)          │         │
+│                            │   cpp-httplib + OpenSSL               │         │
+│                            │   JWT Auth + Rate Limiting            │         │
 │                            └───────────────────┼───────────────────┘         │
 └────────────────────────────────────────────────┼─────────────────────────────┘
                                                  │
@@ -486,4 +486,5 @@ See LICENSE.txt for full terms.
 ## Copyright
 
 (c) 2025-2026 Daniel Chrobak. All rights reserved.
+
 
