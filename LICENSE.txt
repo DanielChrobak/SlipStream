@@ -13,8 +13,8 @@ Copyright:              (c) 2025-2026 Daniel Chrobak
 Additional Use Grant:   Personal Online Use is permitted as defined in Section 2
                         and Section 3
 Change Date:            2029-01-01
-Change License:         Noncommercial Share-Alike License (Software) v1.0
-                        ("NCSL-SA"), text in Section 10
+Change License:         GNU Affero General Public License v3.0 or later
+                        ("AGPL-3.0-or-later")
 
 ================================================================================
 
@@ -188,11 +188,11 @@ THIS LICENSE OR THE WORK.
 Effective on the Change Date, or the fourth anniversary of the first publicly
 available distribution of a specific version of the Work under this License,
 whichever comes first, the Work (that specific version) becomes available under
-the Noncommercial Share-Alike License (Software) v1.0 (NCSL-SA).
+the Change License named in the PARAMETERS section above.
 
-NCSL-SA permits copying, modifying, and distributing the Work and Derivative
-Works only for noncommercial purposes, under the same license terms
-(share-alike). Commercial Use remains prohibited.
+On and after that effective date, the rights and obligations for that specific
+version are governed by the Change License (AGPL-3.0-or-later), and the rights
+granted in Sections 3-5 of this License terminate for that specific version.
 
 --------------------------------------------------------------------------------
 11. GOVERNING LAW; VENUE
