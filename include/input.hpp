@@ -1,12 +1,11 @@
 #pragma once
-
 #include "common.hpp"
 
 #pragma pack(push, 1)
 struct MouseMoveMsg { uint32_t magic; float x, y; };
 struct MouseMoveRelMsg { uint32_t magic; int16_t dx, dy; };
 struct MouseBtnMsg { uint32_t magic; uint8_t button, action; };
-struct MouseWheelMsg { uint32_t magic; int16_t deltaX, deltaY; float x, y; };
+struct MouseWheelMsg { uint32_t magic; int16_t deltaX, deltaY; };
 struct KeyMsg { uint32_t magic; uint16_t keyCode, scanCode; uint8_t action; };
 #pragma pack(pop)
 
@@ -132,9 +131,40 @@ public:
             case MSG_MOUSE_MOVE: if (len >= sizeof(MouseMoveMsg)) { auto* m = (const MouseMoveMsg*)data; MouseMove(m->x, m->y); return true; } break;
             case MSG_MOUSE_MOVE_REL: if (len >= sizeof(MouseMoveRelMsg)) { auto* m = (const MouseMoveRelMsg*)data; MouseMoveRel(m->dx, m->dy); return true; } break;
             case MSG_MOUSE_BTN: if (len >= sizeof(MouseBtnMsg)) { auto* m = (const MouseBtnMsg*)data; MouseButton(m->button, m->action != 0); return true; } break;
-            case MSG_MOUSE_WHEEL: if (len >= 8) { auto* m = (const MouseWheelMsg*)data; MouseWheel(m->deltaX, m->deltaY); return true; } break;
+            case MSG_MOUSE_WHEEL: if (len >= sizeof(MouseWheelMsg)) { auto* m = (const MouseWheelMsg*)data; MouseWheel(m->deltaX, m->deltaY); return true; } break;
             case MSG_KEY: if (len >= sizeof(KeyMsg)) { auto* m = (const KeyMsg*)data; Key(m->keyCode, m->scanCode, m->action != 0); return true; } break;
         }
         return false;
+    }
+
+    bool SetClipboardText(const std::string& text) {
+        if (!OpenClipboard(nullptr)) return false;
+        EmptyClipboard();
+        int wideLen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+        if (wideLen <= 0) { CloseClipboard(); return false; }
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, wideLen * sizeof(wchar_t));
+        if (!hMem) { CloseClipboard(); return false; }
+        wchar_t* pMem = (wchar_t*)GlobalLock(hMem);
+        if (!pMem) { GlobalFree(hMem); CloseClipboard(); return false; }
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, pMem, wideLen);
+        GlobalUnlock(hMem);
+        if (!SetClipboardData(CF_UNICODETEXT, hMem)) { GlobalFree(hMem); CloseClipboard(); return false; }
+        CloseClipboard();
+        return true;
+    }
+
+    std::string GetClipboardText() {
+        if (!OpenClipboard(nullptr)) return "";
+        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+        if (!hData) { CloseClipboard(); return ""; }
+        wchar_t* pWide = (wchar_t*)GlobalLock(hData);
+        if (!pWide) { CloseClipboard(); return ""; }
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pWide, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Len <= 0) { GlobalUnlock(hData); CloseClipboard(); return ""; }
+        std::string result(utf8Len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, pWide, -1, result.data(), utf8Len, nullptr, nullptr);
+        GlobalUnlock(hData);
+        CloseClipboard();
+        return result;
     }
 };

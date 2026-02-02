@@ -111,7 +111,6 @@ class ScreenCapture {
     HMONITOR curMon = nullptr;
     std::mutex mtx;
     std::function<void(int, int, int)> onResChange;
-    int64_t lastTs = 0, minInterval = 0;
 
     int FindTex() {
         for (int i = 0; i < POOL; i++) { int idx = (texIdx + i) % POOL; if (!slot->IsInFlight(idx) && sync.Complete(texFences[idx])) { texIdx = idx + 1; return idx; } }
@@ -123,8 +122,6 @@ class ScreenCapture {
         auto f = s.TryGetNextFrame();
         if (!f || !running || !capturing) return;
         int64_t ts = GetTimestamp();
-        if (minInterval > 0 && lastTs > 0 && (ts - lastTs) < minInterval) return;
-        lastTs = ts;
         auto surf = f.Surface(); if (!surf) return;
         winrt::com_ptr<ID3D11Texture2D> src;
         auto acc = surf.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
@@ -136,11 +133,17 @@ class ScreenCapture {
         slot->Push(texPool[ti], ts, fv, ns, ti);
     }
 
+    void UpdateSessionInterval() {
+        if (!session) return;
+        int fps = targetFps.load(); if (fps <= 0) fps = 60;
+        try { session.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(10000000 / fps)); }
+        catch (...) { LOG("MinUpdateInterval not supported"); }
+    }
+
     void InitMon(HMONITOR mon, bool keepFps = false) {
         MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize = sizeof(dm)};
         if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hostFps = dm.dmDisplayFrequency;
         if (!keepFps) targetFps = hostFps;
-        UpdateInterval();
         auto interop = winrt::get_activation_factory<WGC::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
         if (FAILED(interop->CreateForMonitor(mon, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(), winrt::put_abi(item))))
             throw std::runtime_error("Capture item failed");
@@ -153,12 +156,10 @@ class ScreenCapture {
         pool.FrameArrived({this, &ScreenCapture::OnFrame});
         session = pool.CreateCaptureSession(item);
         session.IsCursorCaptureEnabled(true);
-        try { session.IsBorderRequired(false); } catch (...) {}
-        try { session.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(0)); } catch (...) {}
+        try { session.IsBorderRequired(false); } catch (...) { LOG("IsBorderRequired not supported"); }
+        UpdateSessionInterval();
         started = false; curMon = mon;
     }
-
-    void UpdateInterval() { int f = targetFps.load(); minInterval = f > 0 ? 800000 / f : 0; }
 
 public:
     explicit ScreenCapture(FrameSlot* s) : slot(s) {
@@ -180,8 +181,8 @@ public:
 
     ~ScreenCapture() {
         running = capturing = false;
-        try { if (session) session.Close(); } catch (...) {}
-        try { if (pool) pool.Close(); } catch (...) {}
+        try { if (session) session.Close(); } catch (...) { ERR("Session close failed"); }
+        try { if (pool) pool.Close(); } catch (...) { ERR("Pool close failed"); }
         for (auto& t : texPool) SafeRelease(t);
         SafeRelease(mt, ctx, dev);
         winrt::uninit_apartment();
@@ -192,7 +193,7 @@ public:
     void StartCapture() {
         std::lock_guard<std::mutex> lk(mtx);
         if (capturing) return;
-        slot->Reset(); texIdx = 0; lastTs = 0;
+        slot->Reset(); texIdx = 0;
         for (auto& f : texFences) f = 0;
         if (!started.exchange(true)) session.StartCapture();
         capturing = true;
@@ -207,8 +208,8 @@ public:
         if (monIdx == i && curMon == g_monitors[i].hMon) return true;
         bool was = capturing.load();
         capturing = false;
-        try { if (session) session.Close(); } catch (...) {}
-        try { if (pool) pool.Close(); } catch (...) {}
+        try { if (session) session.Close(); } catch (...) { ERR("Session close failed during switch"); }
+        try { if (pool) pool.Close(); } catch (...) { ERR("Pool close failed during switch"); }
         session = nullptr; pool = nullptr; item = nullptr;
         slot->Reset(); texIdx = 0;
         try {
@@ -217,10 +218,16 @@ public:
             if (onResChange) onResChange(w, h, targetFps.load());
             if (was) { session.StartCapture(); started = true; capturing = true; }
             return true;
-        } catch (...) { return false; }
+        } catch (const std::exception& e) { ERR("SwitchMonitor failed: %s", e.what()); return false; }
+        catch (...) { ERR("SwitchMonitor failed: unknown error"); return false; }
     }
 
-    bool SetFPS(int fps) { if (fps < 1 || fps > 240) return false; int old = targetFps.exchange(fps); if (old != fps) UpdateInterval(); return true; }
+    bool SetFPS(int fps) {
+        if (fps < 1 || fps > 240) return false;
+        int old = targetFps.exchange(fps);
+        if (old != fps) UpdateSessionInterval();
+        return true;
+    }
 
     int RefreshHostFPS() {
         if (curMon) { MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize = sizeof(dm)}; if (GetMonitorInfoW(curMon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hostFps = dm.dmDisplayFrequency; }

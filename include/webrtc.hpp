@@ -17,6 +17,8 @@ struct WebRTCCallbacks {
     std::function<void()> onDisconnect, onConnected;
     std::function<bool(CodecType)> onCodecChange;
     std::function<CodecType()> getCodec;
+    std::function<std::string()> getClipboard;
+    std::function<bool(const std::string&)> setClipboard;
 };
 
 class WebRTCServer {
@@ -27,8 +29,7 @@ class WebRTCServer {
     std::atomic<bool> dcCtrlOpen{false}, dcVidOpen{false}, dcAudOpen{false}, dcInOpen{false};
     std::atomic<int> chReady{0};
     std::string localDesc;
-    std::mutex descMtx, vidSendMtx, audSendMtx, ctrlMtx;
-    mutable std::mutex setupMtx;
+    std::mutex descMtx, vidSendMtx, audSendMtx, ctrlMtx, setupMtx;
     std::condition_variable descCv;
     rtc::Configuration cfg;
 
@@ -51,7 +52,8 @@ class WebRTCServer {
         if (disconnecting) return false;
         std::lock_guard<std::mutex> lk(ctrlMtx);
         if (!dcCtrl || !dcCtrlOpen) return false;
-        try { dcCtrl->send((const std::byte*)d, len); return true; } catch (...) { return false; }
+        try { dcCtrl->send((const std::byte*)d, len); return true; }
+        catch (...) { ERR("Control send failed"); return false; }
     }
 
     void DrainVideo() {
@@ -60,14 +62,15 @@ class WebRTCServer {
         {
             std::lock_guard<std::mutex> lk(vidSendMtx);
             while (!sendQ.empty()) {
-                try { if (!dcVid || dcVid->bufferedAmount() > VID_BUF) break; } catch (...) { break; }
+                try { if (!dcVid || dcVid->bufferedAmount() > VID_BUF) break; }
+                catch (...) { ERR("Video buffer check failed"); break; }
                 toSend.push_back(std::move(sendQ.front())); sendQ.pop();
             }
         }
         for (auto& pkt : toSend) {
             if (!dcVidOpen) { overflow++; needsKey = true; break; }
             try { dcVid->send((const std::byte*)pkt.data.data(), pkt.data.size()); }
-            catch (...) { overflow++; needsKey = true; }
+            catch (...) { ERR("Video send failed"); overflow++; needsKey = true; }
         }
     }
 
@@ -77,13 +80,15 @@ class WebRTCServer {
         {
             std::lock_guard<std::mutex> lk(audSendMtx);
             while (!audQ.empty()) {
-                try { if (!dcAud || dcAud->bufferedAmount() > AUD_BUF) break; } catch (...) { break; }
+                try { if (!dcAud || dcAud->bufferedAmount() > AUD_BUF) break; }
+                catch (...) { ERR("Audio buffer check failed"); break; }
                 toSend.push_back(std::move(audQ.front())); audQ.pop();
             }
         }
         for (auto& pkt : toSend) {
             if (!dcAudOpen) break;
-            try { dcAud->send((const std::byte*)pkt.data(), pkt.size()); } catch (...) {}
+            try { dcAud->send((const std::byte*)pkt.data(), pkt.size()); }
+            catch (...) { ERR("Audio send failed"); }
         }
     }
 
@@ -97,45 +102,37 @@ class WebRTCServer {
     void SendMonitorList() {
         if (!dcCtrlOpen) return;
         std::vector<uint8_t> buf;
-        {
-            std::lock_guard<std::mutex> lk(g_monitorsMutex);
-            buf.resize(6 + g_monitors.size() * 74);
-            size_t o = 0;
-            *(uint32_t*)&buf[o] = MSG_MONITOR_LIST; o += 4;
-            buf[o++] = (uint8_t)g_monitors.size();
-            buf[o++] = (uint8_t)(cb.getMonitor ? cb.getMonitor() : 0);
-            for (const auto& m : g_monitors) {
-                buf[o++] = (uint8_t)m.index;
-                *(uint16_t*)&buf[o] = (uint16_t)m.width;
-                *(uint16_t*)&buf[o + 2] = (uint16_t)m.height;
-                *(uint16_t*)&buf[o + 4] = (uint16_t)m.refreshRate;
-                o += 6; buf[o++] = m.isPrimary ? 1 : 0;
-                size_t nl = std::min(m.name.size(), (size_t)63);
-                buf[o++] = (uint8_t)nl;
-                memcpy(&buf[o], m.name.c_str(), nl); o += nl;
-            }
-            buf.resize(o);
-        }
+        { std::lock_guard<std::mutex> lk(g_monitorsMutex);
+          buf.resize(6 + g_monitors.size() * 74);
+          size_t o = 0;
+          *(uint32_t*)&buf[o] = MSG_MONITOR_LIST; o += 4;
+          buf[o++] = (uint8_t)g_monitors.size();
+          buf[o++] = (uint8_t)(cb.getMonitor ? cb.getMonitor() : 0);
+          for (const auto& m : g_monitors) {
+              buf[o++] = (uint8_t)m.index;
+              *(uint16_t*)&buf[o] = (uint16_t)m.width; *(uint16_t*)&buf[o + 2] = (uint16_t)m.height; *(uint16_t*)&buf[o + 4] = (uint16_t)m.refreshRate; o += 6;
+              buf[o++] = m.isPrimary ? 1 : 0;
+              size_t nl = std::min(m.name.size(), (size_t)63);
+              buf[o++] = (uint8_t)nl; memcpy(&buf[o], m.name.c_str(), nl); o += nl;
+          }
+          buf.resize(o); }
         SafeSendCtrl(buf.data(), buf.size());
     }
 
-    void Disconnect(const char*) {
+    void Disconnect(const char* reason) {
         if (disconnecting.exchange(true)) return;
         if (!connected.exchange(false)) { disconnecting = false; return; }
+        LOG("Disconnect: %s", reason ? reason : "unknown");
         fpsRecv = authed = false; overflow = 0; chReady = 0;
         dcCtrlOpen = dcVidOpen = dcAudOpen = dcInOpen = false;
         { std::lock_guard<std::mutex> lk(vidSendMtx); while (!sendQ.empty()) sendQ.pop(); }
         { std::lock_guard<std::mutex> lk(audSendMtx); while (!audQ.empty()) audQ.pop(); }
-        {
-            std::lock_guard<std::mutex> lk(setupMtx);
-            try { if (dcCtrl && dcCtrl->isOpen()) dcCtrl->close(); } catch (...) {}
-            try { if (dcVid && dcVid->isOpen()) dcVid->close(); } catch (...) {}
-            try { if (dcAud && dcAud->isOpen()) dcAud->close(); } catch (...) {}
-            try { if (dcIn && dcIn->isOpen()) dcIn->close(); } catch (...) {}
-            dcCtrl.reset(); dcVid.reset(); dcAud.reset(); dcIn.reset();
-            try { if (pc) pc->close(); } catch (...) {}
-        }
-        if (cb.onDisconnect) try { cb.onDisconnect(); } catch (...) {}
+        { std::lock_guard<std::mutex> lk(setupMtx);
+          auto closeChannel = [](auto& ch, const char* name) { try { if (ch && ch->isOpen()) ch->close(); } catch (...) { ERR("%s channel close failed", name); } };
+          closeChannel(dcCtrl, "Control"); closeChannel(dcVid, "Video"); closeChannel(dcAud, "Audio"); closeChannel(dcIn, "Input");
+          dcCtrl.reset(); dcVid.reset(); dcAud.reset(); dcIn.reset();
+          try { if (pc) pc->close(); } catch (...) { ERR("Peer connection close failed"); } }
+        if (cb.onDisconnect) try { cb.onDisconnect(); } catch (...) { ERR("onDisconnect callback failed"); }
         disconnecting = false;
     }
 
@@ -146,11 +143,9 @@ class WebRTCServer {
             case MSG_PING:
                 if (m.size() == 16) {
                     lastPing = GetTimestamp() / 1000; overflow = 0;
-                    uint8_t r[24]; memcpy(r, m.data(), 16);
-                    *(uint64_t*)(r + 16) = GetTimestamp();
+                    uint8_t r[24]; memcpy(r, m.data(), 16); *(uint64_t*)(r + 16) = GetTimestamp();
                     SafeSendCtrl(r, sizeof(r));
-                }
-                break;
+                } break;
             case MSG_FPS_SET:
                 if (m.size() == 7) {
                     uint16_t fps = *(const uint16_t*)((const uint8_t*)m.data() + 4);
@@ -159,12 +154,10 @@ class WebRTCServer {
                         int act = (mode == 1 && cb.getHostFps) ? cb.getHostFps() : fps;
                         curFps = act; fpsRecv = true;
                         if (cb.onFpsChange) cb.onFpsChange(act, mode);
-                        uint8_t a[7]; *(uint32_t*)a = MSG_FPS_ACK;
-                        *(uint16_t*)(a + 4) = (uint16_t)act; a[6] = mode;
+                        uint8_t a[7]; *(uint32_t*)a = MSG_FPS_ACK; *(uint16_t*)(a + 4) = (uint16_t)act; a[6] = mode;
                         SafeSendCtrl(a, sizeof(a));
                     }
-                }
-                break;
+                } break;
             case MSG_CODEC_SET:
                 if (m.size() == 5) {
                     uint8_t c = (uint8_t)m[4];
@@ -175,14 +168,29 @@ class WebRTCServer {
                         uint8_t a[5]; *(uint32_t*)a = MSG_CODEC_ACK; a[4] = (uint8_t)curCodec.load();
                         SafeSendCtrl(a, sizeof(a));
                     }
-                }
-                break;
+                } break;
             case MSG_REQUEST_KEY: needsKey = true; break;
             case MSG_MONITOR_SET:
                 if (m.size() == 5 && cb.onMonitorChange && cb.onMonitorChange((int)(uint8_t)m[4])) {
                     needsKey = true; SendMonitorList(); SendHostInfo();
-                }
-                break;
+                } break;
+            case MSG_CLIPBOARD_DATA:
+                if (m.size() >= 8 && cb.setClipboard) {
+                    uint32_t len = *(const uint32_t*)((const uint8_t*)m.data() + 4);
+                    if (len > 0 && m.size() >= 8 + len && len <= 1048576)
+                        cb.setClipboard(std::string((const char*)m.data() + 8, len));
+                } break;
+            case MSG_CLIPBOARD_GET:
+                if (cb.getClipboard) {
+                    std::string text = cb.getClipboard();
+                    if (!text.empty() && text.size() <= 1048576) {
+                        std::vector<uint8_t> buf(8 + text.size());
+                        *(uint32_t*)buf.data() = MSG_CLIPBOARD_DATA;
+                        *(uint32_t*)(buf.data() + 4) = (uint32_t)text.size();
+                        memcpy(buf.data() + 8, text.data(), text.size());
+                        SafeSendCtrl(buf.data(), buf.size());
+                    }
+                } break;
         }
     }
 
@@ -240,13 +248,15 @@ class WebRTCServer {
     void SetupPC() {
         std::lock_guard<std::mutex> lk(setupMtx);
         if (pc) {
+            if (dcCtrlOpen && dcCtrl) {
+                try { uint8_t k[4]; *(uint32_t*)k = MSG_KICKED; dcCtrl->send((const std::byte*)k, 4); std::this_thread::sleep_for(50ms); }
+                catch (...) { ERR("Kick message send failed"); }
+            }
             dcCtrlOpen = dcVidOpen = dcAudOpen = dcInOpen = false;
-            try { if (dcCtrl && dcCtrl->isOpen()) dcCtrl->close(); } catch (...) {}
-            try { if (dcVid && dcVid->isOpen()) dcVid->close(); } catch (...) {}
-            try { if (dcAud && dcAud->isOpen()) dcAud->close(); } catch (...) {}
-            try { if (dcIn && dcIn->isOpen()) dcIn->close(); } catch (...) {}
+            auto closeChannel = [](auto& ch, const char* name) { try { if (ch && ch->isOpen()) ch->close(); } catch (...) { ERR("%s channel close failed", name); } };
+            closeChannel(dcCtrl, "Control"); closeChannel(dcVid, "Video"); closeChannel(dcAud, "Audio"); closeChannel(dcIn, "Input");
             dcCtrl.reset(); dcVid.reset(); dcAud.reset(); dcIn.reset();
-            try { pc->close(); } catch (...) {}
+            try { pc->close(); } catch (...) { ERR("Peer connection close failed"); }
         }
         connected = needsKey = true; fpsRecv = gathered = authed = hasDesc = false;
         overflow = 0; lastPing = 0; chReady = 0; disconnecting = false;
@@ -255,10 +265,7 @@ class WebRTCServer {
         { std::lock_guard<std::mutex> lk2(audSendMtx); while (!audQ.empty()) audQ.pop(); }
 
         pc = std::make_shared<rtc::PeerConnection>(cfg);
-        pc->onLocalDescription([this](rtc::Description d) {
-            std::lock_guard<std::mutex> lk(descMtx);
-            localDesc = std::string(d); hasDesc = true; descCv.notify_all();
-        });
+        pc->onLocalDescription([this](rtc::Description d) { std::lock_guard<std::mutex> lk(descMtx); localDesc = std::string(d); hasDesc = true; descCv.notify_all(); });
         pc->onLocalCandidate([this](rtc::Candidate) { descCv.notify_all(); });
         pc->onStateChange([this](auto s) {
             if (disconnecting) return;
@@ -267,9 +274,7 @@ class WebRTCServer {
             if (connected && !was) { needsKey = true; lastPing = GetTimestamp() / 1000; }
             if (!connected && was) { fpsRecv = authed = false; overflow = 0; chReady = 0; if (cb.onDisconnect) cb.onDisconnect(); }
         });
-        pc->onGatheringStateChange([this](auto s) {
-            if (s == rtc::PeerConnection::GatheringState::Complete) { gathered = true; descCv.notify_all(); }
-        });
+        pc->onGatheringStateChange([this](auto s) { if (s == rtc::PeerConnection::GatheringState::Complete) { gathered = true; descCv.notify_all(); } });
         pc->onDataChannel([this](auto ch) {
             if (disconnecting) return;
             std::string l = ch->label();
@@ -320,22 +325,16 @@ public:
         if (nch > 65535 || !sz) return;
         uint32_t fid = frmId++;
         PacketHeader h = {f.ts, (uint32_t)f.encUs, fid, 0, (uint16_t)nch, f.isKey ? (uint8_t)1 : (uint8_t)0};
-        {
-            std::lock_guard<std::mutex> lk(vidSendMtx);
-            if (sendQ.size() > nch * MAX_Q) {
-                size_t drop = sendQ.size() - nch;
-                while (drop-- > 0 && !sendQ.empty()) sendQ.pop();
-                needsKey = true;
-            }
-            for (size_t i = 0; i < nch; i++) {
-                h.chunkIndex = (uint16_t)i;
-                size_t off = i * DATA_CHUNK, len = std::min(DATA_CHUNK, sz - off);
-                QPkt p; p.data.resize(HDR_SZ + len);
-                memcpy(p.data.data(), &h, HDR_SZ);
-                memcpy(p.data.data() + HDR_SZ, f.data.data() + off, len);
-                sendQ.push(std::move(p));
-            }
-        }
+        { std::lock_guard<std::mutex> lk(vidSendMtx);
+          if (sendQ.size() > nch * MAX_Q) { size_t drop = sendQ.size() - nch; while (drop-- > 0 && !sendQ.empty()) sendQ.pop(); needsKey = true; }
+          for (size_t i = 0; i < nch; i++) {
+              h.chunkIndex = (uint16_t)i;
+              size_t off = i * DATA_CHUNK, len = std::min(DATA_CHUNK, sz - off);
+              QPkt p; p.data.resize(HDR_SZ + len);
+              memcpy(p.data.data(), &h, HDR_SZ);
+              memcpy(p.data.data() + HDR_SZ, f.data.data() + off, len);
+              sendQ.push(std::move(p));
+          } }
         DrainVideo();
     }
 
@@ -346,9 +345,8 @@ public:
         auto* h = (AudioPacketHeader*)pkt.data();
         h->magic = MSG_AUDIO_DATA; h->timestamp = ts; h->samples = (uint16_t)samples; h->dataLength = (uint16_t)data.size();
         memcpy(pkt.data() + sizeof(AudioPacketHeader), data.data(), data.size());
-        bool sentDirect = false;
-        try { if (dcAud && dcAud->bufferedAmount() <= AUD_BUF / 2) { dcAud->send((const std::byte*)pkt.data(), total); sentDirect = true; } } catch (...) {}
-        if (sentDirect) return;
+        try { if (dcAud && dcAud->bufferedAmount() <= AUD_BUF / 2) { dcAud->send((const std::byte*)pkt.data(), total); return; } }
+        catch (...) { ERR("Direct audio send failed"); }
         { std::lock_guard<std::mutex> lk(audSendMtx); while (audQ.size() >= MAX_AUD_Q) audQ.pop(); audQ.push(std::move(pkt)); }
         DrainAudio();
     }

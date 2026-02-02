@@ -1,11 +1,9 @@
 #pragma once
-
 #include "common.hpp"
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-
 extern "C" { 
-    #include <opus/opus.h>
+    #include <opus/opus.h> 
 }
 
 struct AudioPacket { std::vector<uint8_t> data; int64_t ts = 0; int samples = 0; };
@@ -107,12 +105,11 @@ public:
         opus_encoder_ctl(opusEncoder, OPUS_SET_BITRATE(96000));
         opus_encoder_ctl(opusEncoder, OPUS_SET_COMPLEXITY(3));
         opus_encoder_ctl(opusEncoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-        opus_encoder_ctl(opusEncoder, OPUS_SET_LSB_DEPTH(16));
         encBuf.resize(FRAME_SAMPLES * channels);
         outBuf.resize(4000);
         resBuf.reserve(FRAME_SAMPLES * channels * 4);
         prev.resize(channels, 0.0f);
-        LOG("Audio: %dHz -> %dHz, %dch, %dms frames", sysRate, OPUS_RATE, channels, OPUS_FRAME_MS);
+        LOG("Audio: %dHz -> %dHz, %dch", sysRate, OPUS_RATE, channels);
         CoUninitialize();
     }
 
