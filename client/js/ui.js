@@ -1,29 +1,22 @@
-import { S, $, Stage, CODECS, detectBestCodec, getCodecSupport, subscribeToMetrics } from './state.js';
+import { S, $, CODECS, detectCodecs, subscribeToMetrics } from './state.js';
 import { toggleAudio } from './media.js';
 import { setRelativeMouseMode } from './input.js';
 
 const loadingEl = $('loadingOverlay'), statusEl = $('loadingStatus'), subEl = $('loadingSubstatus');
 
-const stageMessages = {
-    [Stage.IDLE]: ['Connecting...', 'Initializing'], [Stage.CONNECT]: ['Connecting...', 'Establishing connection'],
-    [Stage.AUTH]: ['Authenticating...', 'Verifying credentials'], [Stage.OK]: ['Connected', ''], [Stage.ERR]: ['Failed', 'Retrying...']
-};
-
-export const updateLoadingStage = (stage, errorMsg = null) => {
-    S.stage = stage;
-    const [status, substatus] = stageMessages[stage] || stageMessages[Stage.IDLE];
+export const updateLoadingStage = (status, substatus = '') => {
     statusEl.textContent = S.isReconnecting ? 'Reconnecting...' : status;
-    subEl.textContent = errorMsg || substatus;
+    subEl.textContent = substatus;
     loadingEl.classList.toggle('reconnecting', S.isReconnecting);
 };
 
 export const showLoading = (isReconnect = false) => {
     S.isReconnecting = isReconnect; S.firstFrameReceived = false;
-    loadingEl.classList.remove('hidden'); updateLoadingStage(Stage.IDLE);
+    loadingEl.classList.remove('hidden'); updateLoadingStage('Connecting...', 'Initializing');
 };
 
 export const hideLoading = () => {
-    S.firstFrameReceived = true; updateLoadingStage(Stage.OK);
+    S.firstFrameReceived = true; updateLoadingStage('Connected');
     setTimeout(() => loadingEl.classList.add('hidden'), 300);
 };
 
@@ -39,8 +32,8 @@ $('pnlX').onclick = $('bk').onclick = () => togglePanel(false);
 document.onkeydown = e => { if (e.key === 'Escape' && $('pnl').classList.contains('on') && !S.controlEnabled) togglePanel(false); };
 
 const FPS_KEY = 'slipstream_fps', CODEC_KEY = 'slipstream_codec', TABBED_KEY = 'slipstream_tabbed_mode', STATS_KEY = 'slipstream_stats_overlay';
-const loadPref = (key, parse = parseInt, validate = () => true, def = null) => { try { const v = parse(localStorage.getItem(key)); return validate(v) ? v : def; } catch { return def; } };
-const savePref = (key, val) => { try { localStorage.setItem(key, val.toString()); } catch {} };
+const loadPref = (key, parse = parseInt, validate = () => true, def = null) => { try { const v = parse(localStorage.getItem(key)); return validate(v) ? v : def; } catch (e) { console.warn(`[UI] Failed to load preference '${key}':`, e.message); return def; } };
+const savePref = (key, val) => { try { localStorage.setItem(key, val.toString()); } catch (e) { console.warn(`[UI] Failed to save preference '${key}':`, e.message); } };
 
 export const getStoredFps = () => loadPref(FPS_KEY, parseInt, v => v >= 1 && v <= 240, null);
 export const getStoredCodec = () => loadPref(CODEC_KEY, parseInt, v => v === 0 || v === 1, null) ?? detectedDefaultCodec ?? 1;
@@ -74,24 +67,24 @@ const updateFullscreenUI = () => {
 };
 updateFullscreenUI();
 
-$('fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.().catch(() => {});
+$('fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.().catch(e => { console.warn('[UI] Fullscreen request failed:', e.message); });
 
 const supportsKeyboardLock = 'keyboard' in navigator && 'lock' in navigator.keyboard;
 document.addEventListener('fullscreenchange', async () => {
     updateFullscreenUI();
     if (!supportsKeyboardLock) return;
-    if (document.fullscreenElement) try { await navigator.keyboard.lock(['Escape']); } catch {} else navigator.keyboard.unlock();
+    if (document.fullscreenElement) try { await navigator.keyboard.lock(['Escape']); } catch (e) { console.warn('[UI] Keyboard lock failed:', e.message); } else navigator.keyboard.unlock();
 });
 
 let detectedDefaultCodec = null;
 
 export const initCodecDetection = async () => {
-    try { const result = await detectBestCodec(); detectedDefaultCodec = result.codecId; return result; }
-    catch { detectedDefaultCodec = 1; return { codecId: 1, hardwareAccel: false, codecName: 'AV1' }; }
+    try { const { best } = await detectCodecs(); detectedDefaultCodec = best.codecId; return best; }
+    catch (e) { console.warn('[UI] Codec detection failed:', e.message); detectedDefaultCodec = 1; return { codecId: 1, hardwareAccel: false, codecName: 'AV1' }; }
 };
 
 export const updateCodecOpts = async () => {
-    const support = await getCodecSupport();
+    const { support } = await detectCodecs();
     codecSel.innerHTML = Object.entries(CODECS).map(([key, c]) => {
         const k = key.toLowerCase(), supported = support[k], hw = support[`${k}Hw`];
         const suffix = !supported ? ' (unsupported)' : hw ? ' (HW)' : ' (SW)';
@@ -163,7 +156,6 @@ const updateStatsDisplay = data => {
     $('statsFrameAge').textContent = jitter.avgServerAgeMs > 0 ? `${jitter.avgServerAgeMs.toFixed(1)} ms` : '-- ms';
     $('statsRtt').parentElement.className = 'stats-row' + (clock.rttMs > 100 ? ' error' : clock.rttMs > 50 ? ' warn' : clock.rttMs > 0 ? ' highlight' : '');
 
-    $('statsQueue').textContent = `${jitter.avgQueueDepth.toFixed(1)} (max:${jitter.maxQueueDepth})`;
     $('statsInterval').textContent = jitter.intervalMean > 0 ? `${jitter.intervalMean.toFixed(1)} ms` : '-- ms';
     $('statsStdDev').textContent = jitter.intervalStdDev > 0 ? `${jitter.intervalStdDev.toFixed(2)} ms` : '-- ms';
     $('statsDecodeTime').textContent = decode.decodeCount > 0 ? `${decode.avgDecodeTimeMs.toFixed(2)} ms` : '-- ms';
@@ -177,7 +169,6 @@ const updateStatsDisplay = data => {
     $('statsAudioPackets').textContent = audio.packetsReceived.toString();
     $('statsAudioDecoded').textContent = audio.packetsDecoded.toString();
     $('statsAudioBuffer').textContent = audio.avgBufferHealth > 0 ? `${audio.avgBufferHealth.toFixed(1)} ms` : '-- ms';
-    $('statsAudioRate').textContent = audio.avgPlaybackRate > 0 ? `${audio.avgPlaybackRate.toFixed(3)}x` : '--x';
 
     const totalAudioDrops = audio.packetsDropped + audio.bufferUnderruns + audio.bufferOverflows;
     const audioDropsSection = $('statsAudioDropsSection');
@@ -190,14 +181,13 @@ const updateStatsDisplay = data => {
         }
     }
 
-    const totalDrops = stats.framesDropped + stats.framesTimeout + jitter.framesDroppedLate + jitter.framesDroppedOverflow + stats.decodeErrors;
+    const totalDrops = stats.framesDropped + stats.framesTimeout + jitter.framesDroppedLate + stats.decodeErrors;
     const dropsSection = $('statsDropsSection');
     dropsSection.classList.toggle('has-drops', totalDrops > 0);
     if (totalDrops > 0) {
         $('statsDropsDropped').textContent = stats.framesDropped.toString();
         $('statsDropsTimeout').textContent = stats.framesTimeout.toString();
         $('statsDropsLate').textContent = jitter.framesDroppedLate.toString();
-        $('statsDropsOverflow').textContent = jitter.framesDroppedOverflow.toString();
         $('statsDecodeErrors').textContent = stats.decodeErrors.toString();
     }
 
@@ -224,3 +214,23 @@ relativeMouseBtn.onclick = () => { relativeMouseEnabled = !relativeMouseEnabled;
 updateRelativeMouseUI();
 
 window.addEventListener('pointerlockchange', e => { if (e.detail?.relativeMouseDisabled) { relativeMouseEnabled = false; updateRelativeMouseUI(); } });
+
+// Clipboard sync toggle
+const CLIPBOARD_KEY = 'slipstream_clipboard_sync';
+const clipboardSyncBtn = $('clipboardSyncBtn');
+const clipboardSyncHint = $('clipboardSyncHint');
+
+const updateClipboardSyncUI = () => {
+    clipboardSyncBtn.classList.toggle('on', S.clipboardSyncEnabled);
+    clipboardSyncHint.classList.toggle('visible', S.clipboardSyncEnabled);
+};
+
+S.clipboardSyncEnabled = localStorage.getItem(CLIPBOARD_KEY) === 'true';
+
+clipboardSyncBtn.onclick = () => {
+    S.clipboardSyncEnabled = !S.clipboardSyncEnabled;
+    savePref(CLIPBOARD_KEY, S.clipboardSyncEnabled);
+    updateClipboardSyncUI();
+};
+
+updateClipboardSyncUI();

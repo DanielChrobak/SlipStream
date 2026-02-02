@@ -80,7 +80,8 @@ const renderFrame = (frame, meta) => {
         gl.flush();
         ok = hasValidTexture = true;
         lastSuccessfulVp = { ...vp };
-    } catch {
+    } catch (e) {
+        console.warn('[Renderer] Texture upload failed:', e.message);
         S.stats.renderErrors++;
         if (hasValidTexture && lastSuccessfulVp) { gl.viewport(lastSuccessfulVp.x, lastSuccessfulVp.y, lastSuccessfulVp.w, lastSuccessfulVp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
     }
@@ -93,82 +94,49 @@ const renderFrame = (frame, meta) => {
 };
 
 export const queueFrameForPresentation = entry => {
-    if (!S.tabVisible) { try { entry.frame.close(); } catch {} return; }
+    if (!S.tabVisible) { try { entry.frame.close(); } catch (e) { console.warn('[Renderer] Failed to close frame:', e.message); } return; }
 
-    const now = performance.now(), m = S.jitterMetrics, q = S.presentQueue;
+    const now = performance.now(), m = S.jitterMetrics, localAge = now - entry.queuedAt;
 
-    m.queueDepthSum += q.length; m.queueDepthSamples++; m.maxQueueDepth = Math.max(m.maxQueueDepth, q.length);
+    if (localAge > C.JITTER_MAX_AGE_MS) { m.framesDroppedLate++; logVideoDrop('Frame too old'); try { entry.frame.close(); } catch (e) { console.warn('[Renderer] Failed to close stale frame:', e.message); } return; }
 
-    while (q.length > 0 && (now - q[0].queuedAt > C.JITTER_MAX_AGE_MS || q.length >= C.JITTER_MAX_FRAMES)) {
-        const dropped = q.shift(), age = now - dropped.queuedAt;
-        if (age > C.JITTER_MAX_AGE_MS) { m.framesDroppedLate++; logVideoDrop('Frame too old'); }
-        else { m.framesDroppedOverflow++; logVideoDrop('Queue overflow'); }
-        try { dropped.frame.close(); } catch {}
-    }
-
-    const localAge = now - entry.queuedAt;
     m.frameAgeSum += localAge; m.frameAgeSamples++;
-    m.minFrameAgeMs = Math.min(m.minFrameAgeMs, localAge);
-    m.maxFrameAgeMs = Math.max(m.maxFrameAgeMs, localAge);
 
     if (S.clockSync.valid && entry.serverCapTs) {
         const serverAge = serverFrameAgeMs(entry.serverCapTs);
         m.serverAgeSum += serverAge; m.serverAgeSamples++;
-        m.minServerAgeMs = Math.min(m.minServerAgeMs, serverAge);
-        m.maxServerAgeMs = Math.max(m.maxServerAgeMs, serverAge);
     }
 
     if (m.lastPresentTs > 0) {
         m.presentIntervals.push(now - m.lastPresentTs);
-        if (m.presentIntervals.length > C.PRESENT_INTERVAL_WINDOW) m.presentIntervals.shift();
+        if (m.presentIntervals.length > C.JITTER_SAMPLES) m.presentIntervals.shift();
     }
     m.lastPresentTs = now;
     renderFrame(entry.frame, entry.meta);
 };
 
-export const startPresentLoop = () => {
-    if (S.presentLoopRunning) return;
-    S.presentLoopRunning = true;
-    S.jitterMetrics.lastPresentTs = 0;
-};
+export const resetRenderer = () => { S.jitterMetrics.lastPresentTs = 0; hasValidTexture = false; lastSuccessfulVp = null; };
 
-export const stopPresentLoop = () => {
-    S.presentLoopRunning = false;
-    S.presentQueue.forEach(e => { try { e.frame.close(); } catch {} });
-    S.presentQueue = [];
-    hasValidTexture = false;
-    lastSuccessfulVp = null;
-};
-
-let resizeTimeout, resizeRAF, classChangeTimeout;
+let resizeTimeout;
 
 const handleResize = () => {
-    cancelAnimationFrame(resizeRAF);
     clearTimeout(resizeTimeout);
-    resizeTimeout = setTimeout(() => {
-        resizeRAF = requestAnimationFrame(() => {
-            updateSize();
-            if (canvasW > 0 && canvasH > 0 && gl) {
-                gl.viewport(0, 0, canvasW, canvasH);
-                gl.clearColor(0.039, 0.039, 0.043, 1);
-                gl.clear(gl.COLOR_BUFFER_BIT);
-                if (S.W > 0 && S.H > 0 && hasValidTexture) {
-                    const vp = S.lastVp = calcVp(S.W, S.H, canvasW, canvasH);
-                    clearLetterbox(vp); gl.viewport(vp.x, vp.y, vp.w, vp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-                }
+    resizeTimeout = setTimeout(() => requestAnimationFrame(() => {
+        updateSize();
+        if (canvasW > 0 && canvasH > 0 && gl) {
+            gl.viewport(0, 0, canvasW, canvasH);
+            gl.clearColor(0.039, 0.039, 0.043, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            if (S.W > 0 && S.H > 0 && hasValidTexture) {
+                const vp = S.lastVp = calcVp(S.W, S.H, canvasW, canvasH);
+                clearLetterbox(vp); gl.viewport(vp.x, vp.y, vp.w, vp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             }
-        });
-    }, 50);
-};
-
-const handleClassChange = () => {
-    clearTimeout(classChangeTimeout);
-    handleResize();
-    classChangeTimeout = setTimeout(() => { handleResize(); setTimeout(handleResize, 150); }, 350);
+        }
+    }), 50);
 };
 
 window.addEventListener('resize', handleResize);
-new MutationObserver(handleClassChange).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+new MutationObserver(() => { handleResize(); setTimeout(handleResize, 350); }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
 requestAnimationFrame(() => {
     updateSize();

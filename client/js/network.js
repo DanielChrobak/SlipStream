@@ -1,22 +1,38 @@
-import { enableControl } from './input.js';
-import { MSG, C, S, $, mkBuf, Stage, updateClockOffset, resetClockSync, startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket, clientTimeUs, allChannelsOpen, logVideoDrop } from './state.js';
+import { enableControl, setClipboardFns } from './input.js';
+import { MSG, C, S, $, mkBuf, updateClockOffset, resetClockSync, startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket, clientTimeUs, allChannelsOpen, logVideoDrop } from './state.js';
 import { handleAudioPkt, closeAudio, initDecoder, decodeFrame, setReqKeyFn, stopKeyframeRetryTimer } from './media.js';
 import { updateMonOpts, updateCodecOpts, setNetCbs, updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection, getStoredFps, updateFpsDropdown } from './ui.js';
-import { stopPresentLoop } from './renderer.js';
+import { resetRenderer } from './renderer.js';
 
 const baseUrl = window.location.origin;
 let hasConnected = false, waitFirstFrame = false, connAttempts = 0, pingInterval = null, channelsReady = 0;
-const AUTH_KEY = 'slipstream_session';
 
-const sendControl = buf => { if (S.dcControl?.readyState !== 'open') return false; try { S.dcControl.send(buf); return true; } catch { return false; } };
+const sendControl = buf => { if (S.dcControl?.readyState !== 'open') return false; try { S.dcControl.send(buf); return true; } catch (e) { console.warn('[Network] Failed to send control message:', e.message); return false; } };
+
+const sendClipboardToHost = async text => {
+    if (!text || S.dcControl?.readyState !== 'open') return false;
+    const encoded = new TextEncoder().encode(text);
+    if (encoded.length > 1048576) return false;
+    const buf = new ArrayBuffer(8 + encoded.length);
+    const view = new DataView(buf);
+    view.setUint32(0, MSG.CLIPBOARD_DATA, true);
+    view.setUint32(4, encoded.length, true);
+    new Uint8Array(buf, 8).set(encoded);
+    return sendControl(buf);
+};
+
+const requestHostClipboard = () => {
+    if (S.dcControl?.readyState !== 'open') return false;
+    return sendControl(mkBuf(4, v => { v.setUint32(0, MSG.CLIPBOARD_GET, true); }));
+};
+
+setClipboardFns(sendClipboardToHost, requestHostClipboard);
 
 const authEl = { overlay: $('authOverlay'), user: $('usernameInput'), pass: $('passwordInput'), err: $('authError'), btn: $('authSubmit') };
 const validUser = u => u?.length >= 3 && u.length <= 32 && /^[a-zA-Z0-9_-]+$/.test(u);
 const validPass = p => p?.length >= 8;
 
-const getStoredSession = () => { try { const d = JSON.parse(localStorage.getItem(AUTH_KEY)); if (d?.token && d?.expiresAt > Date.now()) return d; localStorage.removeItem(AUTH_KEY); } catch {} return null; };
-const storeSession = (token, username, expiresIn) => { try { localStorage.setItem(AUTH_KEY, JSON.stringify({ token, username, expiresAt: Date.now() + expiresIn * 1000 })); } catch {} };
-const clearSession = () => { try { localStorage.removeItem(AUTH_KEY); } catch {} S.sessionToken = S.username = null; S.authenticated = false; };
+const clearSession = () => { S.username = null; S.authenticated = false; };
 const clearPing = () => { clearInterval(pingInterval); pingInterval = null; };
 const setAuthErr = (err, el) => { authEl.err.textContent = err; [authEl.user, authEl.pass].forEach(e => e.classList.toggle('error', e === el)); el?.focus(); };
 
@@ -27,45 +43,50 @@ const showAuthModal = (err = '') => {
     hideLoading(); setTimeout(() => authEl.user.focus(), 100);
 };
 
-const hideAuthModal = () => { authEl.overlay.classList.remove('visible'); setAuthErr('', null); };
+const hideAuthModal = () => { authEl.overlay.classList.remove('visible'); authEl.pass.value = ''; setAuthErr('', null); };
 
 const authenticateHTTP = async (username, password) => {
-    const res = await fetch(`${baseUrl}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+    const res = await fetch(`${baseUrl}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ username, password }) });
     const data = await res.json();
     if (!res.ok) throw new Error(res.status === 429 ? `Too many attempts. Try again in ${Math.ceil(data.lockoutSeconds / 60)} minutes.` : data.error || 'Authentication failed');
-    S.sessionToken = data.token; S.username = username; S.authenticated = true;
-    storeSession(data.token, username, data.expiresIn);
-    return data.token;
+    S.username = username; S.authenticated = true;
+    return true;
 };
 
 const validateSession = async () => {
-    if (!S.sessionToken) return false;
     try {
-        const res = await fetch(`${baseUrl}/api/session`, { headers: { 'Authorization': `Bearer ${S.sessionToken}` } });
+        const res = await fetch(`${baseUrl}/api/session`, { credentials: 'include' });
         if (res.ok) { const data = await res.json(); if (data.valid) { S.authenticated = true; S.username = data.username; return true; } }
-    } catch {}
+    } catch (e) { console.warn('[Network] Session validation failed:', e.message); }
     clearSession();
     return false;
 };
 
 authEl.user.addEventListener('input', e => { e.target.value = e.target.value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32); setAuthErr('', null); });
 authEl.user.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); authEl.pass.focus(); } });
-authEl.pass.addEventListener('keydown', e => { if (e.key === 'Enter' && validUser(authEl.user.value) && validPass(authEl.pass.value)) authEl.btn.click(); });
+authEl.pass.addEventListener('keydown', e => { if (e.key === 'Enter' && validUser(authEl.user.value) && authEl.pass.value.length >= 8) authEl.btn.click(); });
 
 authEl.btn.addEventListener('click', async () => {
-    const { value: username } = authEl.user, { value: password } = authEl.pass;
+    const username = authEl.user.value;
+    let password = authEl.pass.value;
+    authEl.pass.value = '';
     if (!validUser(username)) { setAuthErr('Username must be 3-32 characters', authEl.user); return; }
     if (!validPass(password)) { setAuthErr('Password must be at least 8 characters', authEl.pass); return; }
     authEl.btn.disabled = true; authEl.err.textContent = 'Authenticating...';
     try {
         await authenticateHTTP(username, password);
         hideAuthModal(); showLoading(false);
-        updateLoadingStage(Stage.CONNECT, 'Connecting...');
+        updateLoadingStage('Connecting...');
         await connect();
     } catch (e) { setAuthErr(e.message, authEl.user); authEl.btn.disabled = false; }
+    finally { password = ''; }
 });
 
-$('disconnectBtn')?.addEventListener('click', () => { cleanup(); clearSession(); hasConnected = false; showAuthModal(); });
+$('disconnectBtn')?.addEventListener('click', async () => {
+    cleanup();
+    try { await fetch(`${baseUrl}/api/logout`, { method: 'POST', credentials: 'include' }); } catch (e) { console.warn('[Network] Logout request failed:', e.message); }
+    clearSession(); hasConnected = false; showAuthModal();
+});
 
 const sendMonSel = i => sendControl(mkBuf(5, v => { v.setUint32(0, MSG.MONITOR_SET, true); v.setUint8(4, i); }));
 const sendFps = (fps, mode) => sendControl(mkBuf(7, v => { v.setUint32(0, MSG.FPS_SET, true); v.setUint16(4, fps, true); v.setUint8(6, mode); }));
@@ -129,14 +150,27 @@ const handleControlMsg = e => {
     }
     if (msgType === MSG.HOST_INFO && len === 6) {
         S.hostFps = view.getUint16(4, true);
-        if (!S.fpsSent) { const storedFps = getStoredFps(); setTimeout(() => applyFps(storedFps !== null ? storedFps : S.hostFps), 50); }
+        if (!S.fpsSent) { const storedFps = getStoredFps(); setTimeout(() => applyFps(storedFps !== null ? storedFps : 60), 50); }
         if (!S.codecSent) setTimeout(() => applyCodec(getStoredCodec()), 100);
-        if (!hasConnected) { updateLoadingStage(Stage.OK); waitFirstFrame = true; }
+        if (!hasConnected) { updateLoadingStage('Connected'); waitFirstFrame = true; }
         return recordPacket(len, 'control');
     }
     if (msgType === MSG.CODEC_ACK && len === 5) { S.currentCodec = view.getUint8(4); initDecoder(true); return recordPacket(len, 'control'); }
     if (msgType === MSG.FPS_ACK && len === 7) { S.currentFps = view.getUint16(4, true); S.currentFpsMode = view.getUint8(6); updateFpsDropdown(S.currentFps); return recordPacket(len, 'control'); }
     if (msgType === MSG.MONITOR_LIST && len >= 6 && len < 1000 && view.getUint8(4) >= 1 && view.getUint8(4) <= 16) { recordPacket(len, 'control'); return parseMonList(e.data); }
+    if (msgType === MSG.CLIPBOARD_DATA && len >= 8) {
+        const textLen = view.getUint32(4, true);
+        if (textLen > 0 && len >= 8 + textLen && textLen <= 1048576) {
+            const text = new TextDecoder().decode(new Uint8Array(e.data, 8, textLen));
+            navigator.clipboard.writeText(text).catch(e => { console.warn('[Network] Clipboard write failed:', e.message); });
+        }
+        return recordPacket(len, 'control');
+    }
+    if (msgType === MSG.KICKED && len === 4) {
+        cleanup(); hasConnected = false;
+        showAuthModal('Disconnected: Another client connected');
+        return;
+    }
 };
 
 const handleVideoMsg = e => {
@@ -188,7 +222,7 @@ const handleAudioMsg = e => {
 const onAllChannelsOpen = async () => {
     S.fpsSent = false; S.codecSent = false; S.authenticated = true;
     resetClockSync(); resetSessionStats();
-    updateLoadingStage(Stage.OK, 'Connected');
+    updateLoadingStage('Connected');
     await initDecoder();
     clearPing(); startMetricsLogger();
     pingInterval = setInterval(sendPing, C.PING_MS);
@@ -196,21 +230,21 @@ const onAllChannelsOpen = async () => {
 
 const onChannelClose = () => {
     S.fpsSent = false; S.codecSent = false;
-    clearPing(); stopMetricsLogger(); stopPresentLoop(); stopKeyframeRetryTimer?.();
+    clearPing(); stopMetricsLogger(); resetRenderer(); stopKeyframeRetryTimer?.();
     channelsReady = 0;
 };
 
 const setupDataChannel = (dc, onMessage) => {
     dc.binaryType = 'arraybuffer';
     dc.onopen = async () => { channelsReady++; if (channelsReady === 4) await onAllChannelsOpen(); };
-    dc.onclose = onChannelClose; dc.onerror = () => {}; dc.onmessage = onMessage;
+    dc.onclose = onChannelClose; dc.onerror = e => { console.warn('[Network] DataChannel error:', e.error?.message || 'Unknown error'); }; dc.onmessage = onMessage;
 };
 
 const resetState = () => {
     clearPing(); stopMetricsLogger();
     S.dcControl?.close(); S.dcVideo?.close(); S.dcAudio?.close(); S.dcInput?.close(); S.pc?.close();
-    stopPresentLoop(); stopKeyframeRetryTimer?.(); resetClockSync();
-    try { if (S.decoder?.state !== 'closed') S.decoder?.close(); } catch {}
+    resetRenderer(); stopKeyframeRetryTimer?.(); resetClockSync();
+    try { if (S.decoder?.state !== 'closed') S.decoder?.close(); } catch (e) { console.warn('[Network] Failed to close decoder:', e.message); }
     S.dcControl = S.dcVideo = S.dcAudio = S.dcInput = S.pc = S.decoder = null;
     S.ready = S.fpsSent = S.codecSent = waitFirstFrame = false;
     S.chunks.clear(); S.lastFrameId = 0; S.frameMeta.clear(); S.presentQueue = [];
@@ -218,17 +252,15 @@ const resetState = () => {
 };
 
 const startConnection = async () => {
-    if (S.sessionToken) {
-        updateLoadingStage(Stage.AUTH, 'Validating session...');
-        if (await validateSession()) { updateLoadingStage(Stage.CONNECT, 'Connecting...'); await connect(); return; }
-    }
+    updateLoadingStage('Authenticating...', 'Validating session...');
+    if (await validateSession()) { updateLoadingStage('Connecting...'); await connect(); return; }
     showAuthModal();
 };
 
 const connect = async () => {
-    if (!S.sessionToken) { showAuthModal(); return; }
+    if (!S.authenticated) { showAuthModal(); return; }
 
-    updateLoadingStage(Stage.CONNECT);
+    updateLoadingStage('Connecting...', 'Establishing connection');
     resetState();
 
     const pc = S.pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], iceCandidatePoolSize: 4, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' });
@@ -238,7 +270,7 @@ const connect = async () => {
         if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
             if (authEl.overlay.classList.contains('visible')) return;
             if (++connAttempts >= 3) { clearSession(); showAuthModal('Connection failed. Please login again.'); }
-            else { showLoading(true); updateLoadingStage(Stage.ERR, 'Reconnecting...'); setTimeout(() => startConnection(), Math.min(1000 * connAttempts, 5000)); }
+            else { showLoading(true); updateLoadingStage('Reconnecting...', 'Retrying...'); setTimeout(() => startConnection(), Math.min(1000 * connAttempts, 5000)); }
         }
     };
 
@@ -260,10 +292,10 @@ const connect = async () => {
         pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(timeout); resolve(); } });
     });
 
-    updateLoadingStage(Stage.CONNECT, 'Sending offer...');
+    updateLoadingStage('Connecting...', 'Sending offer...');
 
     const res = await fetch(`${baseUrl}/api/offer`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${S.sessionToken}` },
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
         body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
     });
 
@@ -277,7 +309,7 @@ const connect = async () => {
 };
 
 const cleanup = () => {
-    clearPing(); stopMetricsLogger(); stopPresentLoop(); stopKeyframeRetryTimer?.(); resetClockSync();
+    clearPing(); stopMetricsLogger(); resetRenderer(); stopKeyframeRetryTimer?.(); resetClockSync();
     S.dcControl?.close(); S.dcVideo?.close(); S.dcAudio?.close(); S.dcInput?.close(); S.pc?.close();
     channelsReady = 0;
 };
@@ -287,9 +319,6 @@ const cleanup = () => {
     const codecResult = await initCodecDetection();
     S.currentCodec = codecResult.codecId;
     await updateCodecOpts(); enableControl();
-
-    const stored = getStoredSession();
-    if (stored) { S.sessionToken = stored.token; S.username = stored.username; }
     showLoading(false);
     try { await startConnection(); } catch (e) { showAuthModal('Connection failed: ' + e.message); }
 })();

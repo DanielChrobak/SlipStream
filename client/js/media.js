@@ -1,8 +1,8 @@
 import { C, S, $, CODECS, recordDecodeTime, recordAudioPacket, recordAudioDecoded, recordAudioDrop, recordAudioBufferHealth, recordAudioUnderrun, recordAudioOverflow, logVideoDrop } from './state.js';
-import { queueFrameForPresentation, startPresentLoop } from './renderer.js';
+import { queueFrameForPresentation, resetRenderer } from './renderer.js';
 
 let reqKey = null, keyframeRetryInterval = null, lastCapTs = 0;
-let audioWorkletNode = null, audioWorkletReady = false, audioPacketCount = 0;
+let audioWorkletNode = null, audioWorkletReady = false;
 
 export const setReqKeyFn = fn => { reqKey = fn; };
 const stopKeyframeRetry = () => { clearInterval(keyframeRetryInterval); keyframeRetryInterval = null; };
@@ -27,9 +27,7 @@ export const initDecoder = async (force = false) => {
     S.ready = false; S.needKey = true; lastCapTs = 0;
     if (force) S.W = S.H = 0;
 
-    S.presentQueue.forEach(f => { try { f.frame.close(); } catch {} });
-    S.presentQueue = [];
-    try { if (S.decoder?.state !== 'closed') S.decoder.close(); } catch {}
+    try { if (S.decoder?.state !== 'closed') S.decoder.close(); } catch (e) { console.warn('[Media] Failed to close decoder:', e.message); }
 
     const codecInfo = S.currentCodec === 1 ? CODECS.AV1 : CODECS.H264;
     const decoder = S.decoder = new VideoDecoder({
@@ -39,7 +37,8 @@ export const initDecoder = async (force = false) => {
             queueFrameForPresentation({ frame, meta, queuedAt: now, timestamp: frame.timestamp, serverCapTs: meta?.capTs || frame.timestamp });
             S.stats.dec++;
         },
-        error: () => {
+        error: e => {
+            console.warn('[Media] Decoder error:', e.message);
             S.ready = true; S.needKey = true; S.stats.decodeErrors++;
             logVideoDrop('Decoder error');
             reqKey?.(); startKeyframeRetry();
@@ -53,12 +52,12 @@ export const initDecoder = async (force = false) => {
         try {
             const sup = await VideoDecoder.isConfigSupported(cfg);
             if (sup.supported) { decoder.configure(sup.config); S.hwAccel = label; configured = true; break; }
-        } catch {}
+        } catch (e) { console.warn('[Media] Decoder config check failed:', e.message); }
     }
 
     if (!configured || decoder.state !== 'configured') { S.hwAccel = 'NONE'; return; }
     S.ready = true;
-    reqKey?.(); startKeyframeRetry(); startPresentLoop();
+    reqKey?.(); startKeyframeRetry(); resetRenderer();
 };
 
 export const decodeFrame = data => {
@@ -84,14 +83,15 @@ export const decodeFrame = data => {
 
         S.decoder.decode(new EncodedVideoChunk({ type: data.isKey ? 'key' : 'delta', timestamp: data.capTs, duration: dur, data: data.buf }));
         if (data.isKey) { S.needKey = false; stopKeyframeRetry(); }
-    } catch {
+    } catch (e) {
+        console.warn('[Media] Decode exception:', e.message);
         S.stats.decodeErrors++; S.needKey = true; S.ready = true;
         logVideoDrop('Decode exception');
         reqKey?.(); startKeyframeRetry();
     }
 };
 
-const resetAudioState = () => { audioPacketCount = 0; audioWorkletNode?.port.postMessage({ type: 'clear' }); };
+const resetAudioState = () => { audioWorkletNode?.port.postMessage({ type: 'clear' }); };
 
 const WORKLET_CODE = `
 class RingBuf {
@@ -119,15 +119,15 @@ class StreamAudioProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
         this.rb = new RingBuf(2, 2400); this.targetSamples = 480; this.maxSamples = 1200;
-        this.vol = 1; this.mute = false; this.sp = 0; this.ur = 0; this.of = 0; this.sk = 0; this.lr = 0;
+        this.vol = 1; this.mute = false; this.sp = 0; this.ur = 0; this.of = 0; this.lr = 0;
         this.port.onmessage = e => {
             const { type, data } = e.data;
             if (type === 'audio') {
-                if (this.rb.len > this.maxSamples) { const toSkip = Math.min(this.rb.len - this.targetSamples, 480); if (toSkip > 0) { this.rb.skip(toSkip); this.sk++; } }
+                if (this.rb.len > this.maxSamples) { const toSkip = Math.min(this.rb.len - this.targetSamples, 480); if (toSkip > 0) this.rb.skip(toSkip); }
                 if (this.rb.write(data.channels, data.frames).o > 0) this.of++;
             } else if (type === 'volume') this.vol = Math.max(0, Math.min(1, data));
             else if (type === 'mute') this.mute = data;
-            else if (type === 'clear') { this.rb.clear(); this.ur = 0; this.of = 0; this.sk = 0; }
+            else if (type === 'clear') { this.rb.clear(); this.ur = 0; this.of = 0; }
         };
         this.port.postMessage({ type: 'ready' });
     }
@@ -140,9 +140,9 @@ class StreamAudioProcessor extends AudioWorkletProcessor {
             if (this.vol !== 1) for (let c = 0; c < out.length; c++) for (let i = 0; i < f; i++) out[c][i] *= this.vol;
             if (r < f) this.ur++; this.sp += f;
         }
-        if (this.sp - this.lr >= 2400) {
-            this.port.postMessage({ type: 'stats', bufferMs, underruns: this.ur, overflows: this.of, skips: this.sk });
-            this.lr = this.sp; this.ur = 0; this.of = 0; this.sk = 0;
+        if (this.sp - this.lr >= 4800) {
+            this.port.postMessage({ type: 'stats', bufferMs, underruns: this.ur, overflows: this.of });
+            this.lr = this.sp; this.ur = 0; this.of = 0;
         }
         return true;
     }
@@ -152,7 +152,7 @@ registerProcessor('stream-audio-processor', StreamAudioProcessor);
 
 export const initAudio = async () => {
     if (S.audioCtx && audioWorkletNode) {
-        if (S.audioCtx.state === 'suspended') try { await S.audioCtx.resume(); } catch {}
+        if (S.audioCtx.state === 'suspended') try { await S.audioCtx.resume(); } catch (e) { console.warn('[Audio] Failed to resume audio context:', e.message); }
         return true;
     }
     try {
@@ -172,23 +172,23 @@ export const initAudio = async () => {
                 const { type, bufferMs, underruns, overflows } = e.data;
                 if (type === 'ready') audioWorkletReady = true;
                 else if (type === 'stats') {
-                    recordAudioBufferHealth(bufferMs, 1.0);
+                    recordAudioBufferHealth(bufferMs);
                     for (let i = 0; i < underruns; i++) recordAudioUnderrun();
                     for (let i = 0; i < (overflows || 0); i++) recordAudioOverflow();
                 }
             };
             audioWorkletNode.connect(gain);
-        } catch { return false; }
+        } catch (e) { console.warn('[Audio] Worklet initialization failed:', e.message); return false; }
 
         if (window.AudioDecoder) {
             const dec = S.audioDecoder = new AudioDecoder({
                 output: ad => { if (S.audioEnabled && audioWorkletReady) { recordAudioDecoded(); sendToWorklet(ad); } else ad.close(); },
-                error: () => { recordAudioDrop(); }
+                error: e => { console.warn('[Audio] Audio decoder error:', e.message); recordAudioDrop(); }
             });
             dec.configure({ codec: 'opus', sampleRate: C.AUDIO_RATE, numberOfChannels: C.AUDIO_CH });
         }
         return true;
-    } catch { return false; }
+    } catch (e) { console.warn('[Audio] Audio initialization failed:', e.message); return false; }
 };
 
 const sendToWorklet = ad => {
@@ -222,7 +222,7 @@ const sendToWorklet = ad => {
             }
         }
         audioWorkletNode.port.postMessage({ type: 'audio', data: { channels, frames } }, channels.map(c => c.buffer));
-    } catch { recordAudioDrop(); } finally { ad.close(); }
+    } catch (e) { console.warn('[Audio] Failed to send to worklet:', e.message); recordAudioDrop(); } finally { ad.close(); }
 };
 
 export const handleAudioPkt = data => {
@@ -230,10 +230,11 @@ export const handleAudioPkt = data => {
     S.stats.audio++; recordAudioPacket();
     const view = new DataView(data), len = view.getUint16(14, true);
     if (len > data.byteLength - C.AUDIO_HEADER || S.audioDecoder?.state !== 'configured') { recordAudioDrop(); return; }
+    const timestamp = Number(view.getBigUint64(4, true));
     const samples = view.getUint16(12, true);
     const durationUs = Math.round((samples / C.AUDIO_RATE) * 1000000);
-    try { S.audioDecoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: audioPacketCount++ * 10000, duration: durationUs, data: new Uint8Array(data, C.AUDIO_HEADER, len) })); }
-    catch { recordAudioDrop(); }
+    try { S.audioDecoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: timestamp, duration: durationUs, data: new Uint8Array(data, C.AUDIO_HEADER, len) })); }
+    catch (e) { console.warn('[Audio] Audio decode failed:', e.message); recordAudioDrop(); }
 };
 
 export const toggleAudio = () => {

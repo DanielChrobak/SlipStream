@@ -8,6 +8,21 @@ moveAbsView.setUint32(0, MSG.MOUSE_MOVE, true);
 moveRelView.setUint32(0, MSG.MOUSE_MOVE_REL, true);
 
 let pendingAbsMove = null, pendingRelMove = { dx: 0, dy: 0 }, rafId = null;
+let clipboardSendFn = null, clipboardRequestFn = null;
+
+export const setClipboardFns = (sendFn, requestFn) => { clipboardSendFn = sendFn; clipboardRequestFn = requestFn; };
+
+const CODE_MAP = {
+    Backspace:8,Tab:9,Enter:13,ShiftLeft:16,ShiftRight:16,ControlLeft:17,ControlRight:17,AltLeft:18,AltRight:18,
+    Pause:19,CapsLock:20,Escape:27,Space:32,PageUp:33,PageDown:34,End:35,Home:36,ArrowLeft:37,ArrowUp:38,
+    ArrowRight:39,ArrowDown:40,PrintScreen:44,Insert:45,Delete:46,MetaLeft:91,MetaRight:92,ContextMenu:93,
+    Numpad0:96,Numpad1:97,Numpad2:98,Numpad3:99,Numpad4:100,Numpad5:101,Numpad6:102,Numpad7:103,Numpad8:104,
+    Numpad9:105,NumpadMultiply:106,NumpadAdd:107,NumpadSubtract:109,NumpadDecimal:110,NumpadDivide:111,
+    F1:112,F2:113,F3:114,F4:115,F5:116,F6:117,F7:118,F8:119,F9:120,F10:121,F11:122,F12:123,
+    NumLock:144,ScrollLock:145,Semicolon:186,Equal:187,Comma:188,Minus:189,Period:190,Slash:191,
+    Backquote:192,BracketLeft:219,Backslash:220,BracketRight:221,Quote:222
+};
+const codeToVK = c => c.startsWith('Key') && c.length === 4 ? c.charCodeAt(3) : c.startsWith('Digit') && c.length === 6 ? c.charCodeAt(5) : CODE_MAP[c] || 0;
 
 const sendImmediate = (type, ...a) => {
     if (!S.controlEnabled || S.dcInput?.readyState !== 'open') return;
@@ -17,7 +32,7 @@ const sendImmediate = (type, ...a) => {
         key: () => { S.stats.keys++; return mkBuf(10, v => { v.setUint32(0, MSG.KEY, true); v.setUint16(4, a[0], true); v.setUint16(6, a[1], true); v.setUint8(8, a[2] ? 1 : 0); v.setUint8(9, a[3]); }); }
     };
     const buf = makers[type]?.();
-    if (buf) try { S.dcInput.send(buf); } catch {}
+    if (buf) try { S.dcInput.send(buf); } catch (e) { console.warn('[Input] Failed to send input:', e.message); }
 };
 
 const flushMouseState = () => {
@@ -29,14 +44,14 @@ const flushMouseState = () => {
         S.stats.moves++;
         moveRelView.setInt16(4, pendingRelMove.dx, true);
         moveRelView.setInt16(6, pendingRelMove.dy, true);
-        try { S.dcInput.send(moveRelBuf); } catch {}
+        try { S.dcInput.send(moveRelBuf); } catch (e) { console.warn('[Input] Failed to send relative mouse:', e.message); }
         pendingRelMove.dx = pendingRelMove.dy = 0;
     }
     if (pendingAbsMove !== null) {
         S.stats.moves++;
         moveAbsView.setFloat32(4, pendingAbsMove.x, true);
         moveAbsView.setFloat32(8, pendingAbsMove.y, true);
-        try { S.dcInput.send(moveAbsBuf); } catch {}
+        try { S.dcInput.send(moveAbsBuf); } catch (e) { console.warn('[Input] Failed to send absolute mouse:', e.message); }
         pendingAbsMove = null;
     }
 };
@@ -60,7 +75,31 @@ const toNormalized = (cx, cy) => {
 
 const getMods = e => (e.ctrlKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.shiftKey ? 4 : 0) | (e.metaKey ? 8 : 0);
 const isInputFocused = () => { const el = document.activeElement; return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable); };
-const keyHandler = (e, down) => { if (!S.controlEnabled || isInputFocused()) return; if (!e.metaKey) e.preventDefault(); sendImmediate('key', e.keyCode, 0, down, getMods(e)); };
+
+const handleClipboardPaste = async (e, mods, vk) => {
+    if (S.clipboardSyncEnabled && clipboardSendFn) {
+        try { const text = await navigator.clipboard.readText(); if (text) await clipboardSendFn(text); } catch (e) { console.warn('[Input] Clipboard read failed:', e.message); }
+    }
+    sendImmediate('key', vk, 0, true, mods);
+};
+
+const handleClipboardCopy = (e, mods, vk) => {
+    sendImmediate('key', vk, 0, true, mods);
+    if (S.clipboardSyncEnabled && clipboardRequestFn) setTimeout(() => clipboardRequestFn(), 150);
+};
+
+const keyHandler = (e, down) => {
+    if (!S.controlEnabled || isInputFocused()) return;
+    if (!e.metaKey) e.preventDefault();
+    const mods = getMods(e), vk = codeToVK(e.code);
+    if (!vk) return;
+    if (down && e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+        if (e.code === 'KeyV') { handleClipboardPaste(e, mods, vk); return; }
+        if (e.code === 'KeyC') { handleClipboardCopy(e, mods, vk); return; }
+    }
+    sendImmediate('key', vk, 0, down, mods);
+};
+
 const isPointerLocked = () => document.pointerLockElement === canvas;
 const exitPointerLock = () => { if (isPointerLocked()) document.exitPointerLock?.(); };
 
@@ -85,7 +124,7 @@ const h = {
         if (!S.controlEnabled) return;
         e.preventDefault();
         if (rafId !== null) { cancelAnimationFrame(rafId); flushMouseState(); }
-        if (S.relativeMouseMode && !S.pointerLocked) try { canvas.requestPointerLock?.(); } catch {}
+        if (S.relativeMouseMode && !S.pointerLocked) try { canvas.requestPointerLock?.(); } catch (e) { console.warn('[Input] Pointer lock request failed:', e.message); }
         sendImmediate('btn', BUTTON_MAP[e.button] ?? 0, true);
     },
     up: e => {
