@@ -5,8 +5,16 @@
 #include "audio.hpp"
 #include "input.hpp"
 #include <conio.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 std::atomic<bool> g_running{true};
+
+BOOL WINAPI ConsoleHandler(DWORD sig) {
+    if (sig == CTRL_C_EVENT || sig == CTRL_CLOSE_EVENT || sig == CTRL_BREAK_EVENT) { printf("\n[Shutting down...]\n"); g_running = false; return TRUE; }
+    return FALSE;
+}
+
 std::vector<MonitorInfo> g_monitors;
 std::mutex g_monitorsMutex;
 struct Config { std::string username, passwordHash, salt; } g_config;
@@ -62,13 +70,27 @@ bool LoadConfig() {
             g_config = {c["username"], c["passwordHash"], c["salt"]};
             return g_config.username.size() >= 3 && g_config.passwordHash.size() == 64 && g_config.salt.size() == 32;
         }
-    } catch (...) {}
+    } catch (...) { ERR("LoadConfig failed"); }
     return false;
 }
 
-bool SaveConfig() { try { std::ofstream("auth.json") << json{{"username", g_config.username}, {"passwordHash", g_config.passwordHash}, {"salt", g_config.salt}}.dump(2); return true; } catch (...) { return false; } }
-bool ValidateUsername(const std::string& u) { if (u.length() < 3 || u.length() > 32) return false; for (char c : u) if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false; return true; }
-bool ValidatePassword(const std::string& p) { if (p.length() < 8 || p.length() > 128) return false; bool l = false, d = false; for (char c : p) { if (isalpha((unsigned char)c)) l = true; if (isdigit((unsigned char)c)) d = true; } return l && d; }
+bool SaveConfig() {
+    try { std::ofstream("auth.json") << json{{"username", g_config.username}, {"passwordHash", g_config.passwordHash}, {"salt", g_config.salt}}.dump(2); return true; }
+    catch (...) { ERR("SaveConfig failed"); return false; }
+}
+
+bool ValidateUsername(const std::string& u) {
+    if (u.length() < 3 || u.length() > 32) return false;
+    for (char c : u) if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false;
+    return true;
+}
+
+bool ValidatePassword(const std::string& p) {
+    if (p.length() < 8 || p.length() > 128) return false;
+    bool l = false, d = false;
+    for (char c : p) { if (isalpha((unsigned char)c)) l = true; if (isdigit((unsigned char)c)) d = true; }
+    return l && d;
+}
 
 std::string GetPasswordInput() {
     std::string pw;
@@ -95,20 +117,32 @@ void SetupConfig() {
     if (SaveConfig()) printf("Configuration saved\n\n"); else { printf("Failed to save\n"); SetupConfig(); }
 }
 
-std::string ExtractBearerToken(const httplib::Request& req) { auto it = req.headers.find("Authorization"); return (it != req.headers.end() && it->second.substr(0, 7) == "Bearer ") ? it->second.substr(7) : ""; }
-std::string GetClientIP(const httplib::Request& req) { auto it = req.headers.find("X-Forwarded-For"); if (it != req.headers.end() && !it->second.empty()) { size_t c = it->second.find(','); return c != std::string::npos ? it->second.substr(0, c) : it->second; } return req.remote_addr; }
+std::string ExtractSessionCookie(const httplib::Request& req) {
+    auto it = req.headers.find("Cookie"); if (it == req.headers.end()) return "";
+    const std::string prefix = "session="; size_t pos = it->second.find(prefix);
+    if (pos == std::string::npos) return "";
+    size_t start = pos + prefix.size(), end = it->second.find(';', start);
+    return end != std::string::npos ? it->second.substr(start, end - start) : it->second.substr(start);
+}
+
+std::string GetClientIP(const httplib::Request& req) {
+    auto it = req.headers.find("X-Forwarded-For");
+    if (it != req.headers.end() && !it->second.empty()) { size_t c = it->second.find(','); return c != std::string::npos ? it->second.substr(0, c) : it->second; }
+    return req.remote_addr;
+}
+
 void JsonError(httplib::Response& res, int status, const std::string& err) { res.status = status; res.set_content(json{{"error", err}}.dump(), "application/json"); }
 
 template<typename F> auto AuthRequired(F h) {
     return [h](const httplib::Request& req, httplib::Response& res) {
-        std::string token = ExtractBearerToken(req), user;
+        std::string token = ExtractSessionCookie(req), user;
         if (token.empty() || !g_jwt.ValidateToken(token, user)) { JsonError(res, 401, token.empty() ? "Authentication required" : "Invalid token"); return; }
         h(req, res, user);
     };
 }
 
 void HandleAuth(const httplib::Request& req, httplib::Response& res) {
-    json body; try { body = json::parse(req.body); } catch (...) { JsonError(res, 400, "Invalid JSON"); return; }
+    json body; try { body = json::parse(req.body); } catch (...) { ERR("HandleAuth JSON parse failed"); JsonError(res, 400, "Invalid JSON"); return; }
     std::string ip = GetClientIP(req);
     if (!g_rateLimiter.IsAllowed(ip)) { res.status = 429; res.set_content(json{{"error", "Too many attempts"}, {"lockoutSeconds", g_rateLimiter.LockoutSeconds(ip)}}.dump(), "application/json"); return; }
     std::string u = body.value("username", ""), p = body.value("password", "");
@@ -118,12 +152,15 @@ void HandleAuth(const httplib::Request& req, httplib::Response& res) {
         res.status = 401; res.set_content(json{{"error", "Invalid credentials"}, {"remainingAttempts", g_rateLimiter.RemainingAttempts(ip)}}.dump(), "application/json"); return;
     }
     g_rateLimiter.RecordAttempt(ip, true);
-    res.set_content(json{{"token", g_jwt.CreateToken(u)}, {"expiresIn", 86400}}.dump(), "application/json");
+    res.set_header("Set-Cookie", "session=" + g_jwt.CreateToken(u) + "; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400");
+    res.set_content(json{{"success", true}, {"username", u}}.dump(), "application/json");
 }
 
 void SetupCORS(const httplib::Request& req, httplib::Response& r) {
-    std::string origin = req.get_header_value("Origin");
-    if (origin.empty()) return;
+    r.set_header("X-Content-Type-Options", "nosniff");
+    r.set_header("X-Frame-Options", "DENY");
+    r.set_header("Referrer-Policy", "no-referrer");
+    std::string origin = req.get_header_value("Origin"); if (origin.empty()) return;
     std::string host = req.get_header_value("Host");
     size_t pe = origin.find("://"); std::string oh = (pe != std::string::npos) ? origin.substr(pe + 3) : origin;
     size_t pp = oh.find(':'), hp = host.find(':');
@@ -136,13 +173,38 @@ void SetupCORS(const httplib::Request& req, httplib::Response& r) {
     }
 }
 
+std::string GetLocalIPAddress() {
+    std::string result = "127.0.0.1";
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        addrinfo hints = {}, *info = nullptr;
+        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(hostname, nullptr, &hints, &info) == 0 && info) {
+            for (auto* p = info; p; p = p->ai_next) {
+                if (p->ai_family == AF_INET) {
+                    char ip[INET_ADDRSTRLEN];
+                    sockaddr_in* addr = (sockaddr_in*)p->ai_addr;
+                    if (inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip))) {
+                        std::string ipStr(ip);
+                        if (ipStr != "127.0.0.1" && ipStr.find("127.") != 0) { result = ipStr; break; }
+                    }
+                }
+            }
+            freeaddrinfo(info);
+        }
+    }
+    return result;
+}
+
 int main() {
     try {
         SetConsoleOutputCP(CP_UTF8); SetConsoleCP(CP_UTF8);
+        SetConsoleCtrlHandler(ConsoleHandler, TRUE);
         printf("\n=== SlipStream Server ===\n\n");
         SetupConfig();
-
-        constexpr int PORT = 6060;
+        if (!EnsureSSLCert()) { ERR("Failed to initialize SSL certificates"); getchar(); return 1; }
+        constexpr int PORT = 443;
+        std::string localIP = GetLocalIPAddress();
         SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 
         FrameSlot frameSlot;
@@ -157,27 +219,38 @@ int main() {
         updateBounds(capture.GetCurrentMonitorIndex());
 
         std::unique_ptr<AudioCapture> audio;
-        try { audio = std::make_unique<AudioCapture>(); } catch (...) {}
+        try { audio = std::make_unique<AudioCapture>(); } catch (...) { ERR("AudioCapture init failed"); }
 
         auto mkEncoder = [&](int w, int h, int fps, CodecType cc) {
             std::lock_guard<std::mutex> lk(encMtx); encReady = false; encoder.reset();
-            try { encoder = std::make_unique<VideoEncoder>(w, h, fps, capture.GetDev(), capture.GetCtx(), capture.GetMT(), cc); curCodec = cc; encReady = true; } catch (...) {}
+            try { encoder = std::make_unique<VideoEncoder>(w, h, fps, capture.GetDev(), capture.GetCtx(), capture.GetMT(), cc); curCodec = cc; encReady = true; }
+            catch (...) { ERR("Encoder init failed"); }
         };
 
         capture.SetResolutionChangeCallback([&](int w, int h, int fps) { mkEncoder(w, h, fps, curCodec.load()); });
 
         rtc->Init({&input,
-            [&](int fps, uint8_t) { capture.SetFPS(fps); { std::lock_guard<std::mutex> lk(encMtx); if (encoder) encoder->UpdateFPS(fps); else { encReady = false; try { encoder = std::make_unique<VideoEncoder>(capture.GetW(), capture.GetH(), fps, capture.GetDev(), capture.GetCtx(), capture.GetMT(), curCodec.load()); encReady = true; } catch (...) {} } } if (!capture.IsCapturing()) capture.StartCapture(); frameSlot.Wake(); },
+            [&](int fps, uint8_t) {
+                capture.SetFPS(fps);
+                { std::lock_guard<std::mutex> lk(encMtx);
+                  if (encoder) encoder->UpdateFPS(fps);
+                  else { encReady = false; try { encoder = std::make_unique<VideoEncoder>(capture.GetW(), capture.GetH(), fps, capture.GetDev(), capture.GetCtx(), capture.GetMT(), curCodec.load()); encReady = true; } catch (...) { ERR("Encoder init in FPS callback failed"); } } }
+                if (!capture.IsCapturing()) capture.StartCapture(); frameSlot.Wake();
+            },
             [&] { return capture.RefreshHostFPS(); },
             [&](int i) { bool ok = capture.SwitchMonitor(i); if (ok) { updateBounds(i); std::thread([&] { std::this_thread::sleep_for(100ms); input.WiggleCenter(); }).detach(); } return ok; },
             [&] { return capture.GetCurrentMonitorIndex(); },
             [&] { capture.PauseCapture(); frameSlot.Wake(); },
             [&] { frameSlot.Wake(); std::thread([&] { std::this_thread::sleep_for(100ms); input.WiggleCenter(); }).detach(); },
-            [&](CodecType c) -> bool { if (c == curCodec.load()) return true; try { mkEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), c); return true; } catch (...) { return false; } },
-            [&] { return curCodec.load(); }
+            [&](CodecType c) -> bool { if (c == curCodec.load()) return true; try { mkEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), c); return true; } catch (...) { ERR("Codec change failed"); return false; } },
+            [&] { return curCodec.load(); },
+            [&] { return input.GetClipboardText(); },
+            [&](const std::string& text) { return input.SetClipboardText(text); }
         });
 
-        httplib::Server srv;
+        httplib::SSLServer srv(SSL_CERT_FILE, SSL_KEY_FILE);
+        if (!srv.is_valid()) { ERR("Failed to initialize HTTPS server"); getchar(); return 1; }
+
         srv.set_post_routing_handler(SetupCORS);
         srv.Options(".*", [](auto&, auto& r) { r.status = 204; });
         srv.Get("/", [](auto&, auto& r) { auto c = LoadFile("index.html"); r.set_content(c.empty() ? "<h1>index.html not found</h1>" : c, "text/html"); });
@@ -186,7 +259,7 @@ int main() {
             srv.Get(std::string("/js/") + js + ".js", [js](auto&, auto& r) { r.set_content(LoadFile((std::string("js/") + js + ".js").c_str()), "application/javascript"); });
 
         srv.Post("/api/auth", HandleAuth);
-        srv.Post("/api/logout", [](auto&, auto& res) { res.set_content(R"({"success":true})", "application/json"); });
+        srv.Post("/api/logout", [](auto&, auto& res) { res.set_header("Set-Cookie", "session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"); res.set_content(R"({"success":true})", "application/json"); });
         srv.Get("/api/session", AuthRequired([](auto&, auto& res, const std::string& user) { res.set_content(json{{"valid", true}, {"username", user}}.dump(), "application/json"); }));
         srv.Post("/api/offer", AuthRequired([&](const httplib::Request& req, httplib::Response& res, const std::string&) {
             if (req.body.size() > 65536) { JsonError(res, 413, "Payload too large"); return; }
@@ -200,12 +273,16 @@ int main() {
                 if (ans.empty()) { JsonError(res, 500, "Failed to generate answer"); return; }
                 if (size_t p = ans.find("a=setup:actpass"); p != std::string::npos) ans.replace(p, 15, "a=setup:active");
                 res.set_content(json{{"sdp", ans}, {"type", "answer"}}.dump(), "application/json");
-            } catch (...) { JsonError(res, 400, "Invalid offer"); }
+            } catch (...) { ERR("Offer handler failed"); JsonError(res, 400, "Invalid offer"); }
         }));
 
         std::thread srvThread([&] { srv.listen("0.0.0.0", PORT); });
         std::this_thread::sleep_for(100ms);
-        printf("Server: http://localhost:%d | User: %s | %dHz\n", PORT, g_config.username.c_str(), capture.GetHostFPS());
+        printf("Server running on port %d\n", PORT);
+        printf("  Local:   https://localhost:%d\n", PORT);
+        printf("  Network: https://%s:%d\n", localIP.c_str(), PORT);
+        printf("  User:    %s | Display: %dHz\n", g_config.username.c_str(), capture.GetHostFPS());
+        printf("Note: Self-signed certificate - browser may show security warning.\n");
 
         if (audio) audio->Start();
 
@@ -215,7 +292,7 @@ int main() {
             AudioPacket pkt;
             while (g_running) {
                 if (!rtc->IsStreaming()) { std::this_thread::sleep_for(10ms); continue; }
-                if (audio->PopPacket(pkt, 5)) try { rtc->SendAudio(pkt.data, pkt.ts, pkt.samples); } catch (...) {}
+                if (audio->PopPacket(pkt, 5)) try { rtc->SendAudio(pkt.data, pkt.ts, pkt.samples); } catch (...) { ERR("SendAudio failed"); }
             }
         });
 
@@ -226,19 +303,19 @@ int main() {
                 if (!frameSlot.Pop(fd)) { if (!g_running) break; continue; }
                 int64_t popTime = GetTimestamp(), handoff = popTime - fd.ts;
                 bool isStreaming = false;
-                try { isStreaming = rtc->IsStreaming() && encReady.load(); } catch (...) {}
+                try { isStreaming = rtc->IsStreaming() && encReady.load(); } catch (...) { ERR("IsStreaming check failed"); }
 
                 if (isStreaming && !wasStreaming) {
                     std::lock_guard<std::mutex> lk(encMtx);
                     if (encoder) encoder->Flush();
-                    int fps = 60; try { fps = rtc->GetCurrentFps(); } catch (...) {}
+                    int fps = 60; try { fps = rtc->GetCurrentFps(); } catch (...) { ERR("GetCurrentFps failed"); }
                     period = fps > 0 ? 1000000 / fps : 16667;
                 }
                 wasStreaming = isStreaming;
 
                 if (!isStreaming || !fd.tex) { frameSlot.MarkReleased(fd.poolIdx); fd.Release(); continue; }
 
-                int fps = 60; try { fps = rtc->GetCurrentFps(); } catch (...) {}
+                int fps = 60; try { fps = rtc->GetCurrentFps(); } catch (...) { ERR("GetCurrentFps failed"); }
                 if (fps > 0) period = 1000000 / fps;
 
                 if (handoff > (period * 3) / 2) { frameSlot.MarkReleased(fd.poolIdx); fd.Release(); continue; }
@@ -247,17 +324,16 @@ int main() {
                 try {
                     std::lock_guard<std::mutex> lk(encMtx);
                     if (encoder && rtc->IsStreaming()) {
-                        bool needsKey = false; try { needsKey = rtc->NeedsKey(); } catch (...) { needsKey = true; }
-                        if (auto* out = encoder->Encode(fd.tex, fd.ts, needsKey)) try { rtc->Send(*out); } catch (...) {}
+                        bool needsKey = false; try { needsKey = rtc->NeedsKey(); } catch (...) { ERR("NeedsKey check failed"); needsKey = true; }
+                        if (auto* out = encoder->Encode(fd.tex, fd.ts, needsKey)) try { rtc->Send(*out); } catch (...) { ERR("Send frame failed"); }
                     }
-                } catch (...) {}
+                } catch (...) { ERR("Encode loop failed"); }
 
                 try {
                     std::lock_guard<std::mutex> lk(encMtx);
-                    if (encoder && !encoder->IsEncodeComplete()) {
+                    if (encoder && !encoder->IsEncodeComplete())
                         for (int r = 0; !encoder->IsEncodeComplete() && r < 8; r++) std::this_thread::sleep_for(std::chrono::microseconds(500));
-                    }
-                } catch (...) {}
+                } catch (...) { ERR("Encode complete check failed"); }
 
                 frameSlot.MarkReleased(fd.poolIdx); fd.Release();
             }
