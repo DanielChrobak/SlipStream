@@ -56,9 +56,18 @@ enum MsgType : uint32_t {
     MSG_MONITOR_SET = 0x4D4F4E53, MSG_AUDIO_DATA = 0x41554449, MSG_MOUSE_MOVE = 0x4D4F5645,
     MSG_MOUSE_BTN = 0x4D42544E, MSG_MOUSE_WHEEL = 0x4D57484C, MSG_KEY = 0x4B455920,
     MSG_CODEC_SET = 0x434F4443, MSG_CODEC_ACK = 0x434F4441, MSG_MOUSE_MOVE_REL = 0x4D4F5652,
-    MSG_CLIPBOARD_DATA = 0x434C4950, MSG_CLIPBOARD_GET = 0x434C4754, MSG_KICKED = 0x4B49434B
+    MSG_CLIPBOARD_DATA = 0x434C4950, MSG_CLIPBOARD_GET = 0x434C4754, MSG_KICKED = 0x4B49434B,
+    MSG_CURSOR_CAPTURE = 0x43555243, MSG_CURSOR_SHAPE = 0x43555253
 };
-enum CodecType : uint8_t { CODEC_H264 = 0, CODEC_AV1 = 1 };
+
+enum CodecType : uint8_t { CODEC_AV1 = 0, CODEC_H265 = 1, CODEC_H264 = 2 };
+
+enum CursorType : uint8_t {
+    CURSOR_DEFAULT = 0, CURSOR_TEXT = 1, CURSOR_POINTER = 2, CURSOR_WAIT = 3,
+    CURSOR_PROGRESS = 4, CURSOR_CROSSHAIR = 5, CURSOR_MOVE = 6, CURSOR_EW_RESIZE = 7,
+    CURSOR_NS_RESIZE = 8, CURSOR_NWSE_RESIZE = 9, CURSOR_NESW_RESIZE = 10,
+    CURSOR_NOT_ALLOWED = 11, CURSOR_HELP = 12, CURSOR_NONE = 13, CURSOR_CUSTOM = 255
+};
 
 inline int64_t GetTimestamp() {
     FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
@@ -114,8 +123,15 @@ inline bool VerifyPassword(const std::string& pw, const std::string& salt, const
 
 class JWTAuth {
     std::string secret;
+    void LoadOrGenerateSecret() {
+        std::ifstream f("jwt_secret.dat");
+        if (f) { std::getline(f, secret); if (secret.size() == 64) return; }
+        unsigned char b[32]; RAND_bytes(b, sizeof(b));
+        secret = BytesToHex(b, sizeof(b));
+        std::ofstream("jwt_secret.dat") << secret;
+    }
 public:
-    JWTAuth() { unsigned char b[32]; RAND_bytes(b, sizeof(b)); secret = BytesToHex(b, sizeof(b)); }
+    JWTAuth() { LoadOrGenerateSecret(); }
     std::string CreateToken(const std::string& user) {
         return jwt::create().set_issuer("slipstream").set_subject(user)
             .set_issued_at(system_clock::now()).set_expires_at(system_clock::now() + hours(24))
@@ -126,8 +142,7 @@ public:
             auto d = jwt::decode(token);
             jwt::verify().allow_algorithm(jwt::algorithm::hs256{secret}).with_issuer("slipstream").verify(d);
             user = d.get_subject(); return true;
-        } catch (const std::exception& e) { ERR("JWT validation failed: %s", e.what()); return false; }
-        catch (...) { ERR("JWT validation failed: unknown error"); return false; }
+        } catch (...) { return false; }
     }
 };
 

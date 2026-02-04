@@ -36,6 +36,25 @@ class InputHandler {
     std::atomic<int> moveCnt{0}, clickCnt{0}, keyCnt{0};
     static constexpr int MAX_MOVES = 500, MAX_CLICKS = 50, MAX_KEYS = 100;
 
+    HCURSOR stdCursors[13] = {};
+    std::atomic<CursorType> lastCursor{CURSOR_DEFAULT};
+
+    void InitCursors() {
+        stdCursors[0] = LoadCursor(nullptr, IDC_ARROW);
+        stdCursors[1] = LoadCursor(nullptr, IDC_IBEAM);
+        stdCursors[2] = LoadCursor(nullptr, IDC_HAND);
+        stdCursors[3] = LoadCursor(nullptr, IDC_WAIT);
+        stdCursors[4] = LoadCursor(nullptr, IDC_APPSTARTING);
+        stdCursors[5] = LoadCursor(nullptr, IDC_CROSS);
+        stdCursors[6] = LoadCursor(nullptr, IDC_SIZEALL);
+        stdCursors[7] = LoadCursor(nullptr, IDC_SIZEWE);
+        stdCursors[8] = LoadCursor(nullptr, IDC_SIZENS);
+        stdCursors[9] = LoadCursor(nullptr, IDC_SIZENWSE);
+        stdCursors[10] = LoadCursor(nullptr, IDC_SIZENESW);
+        stdCursors[11] = LoadCursor(nullptr, IDC_NO);
+        stdCursors[12] = LoadCursor(nullptr, IDC_HELP);
+    }
+
     void ResetWindow() {
         int64_t now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         if (now - rateStart.load() >= 1000) { rateStart = now; moveCnt = clickCnt = keyCnt = 0; }
@@ -72,7 +91,17 @@ public:
             SetMonitorBounds(mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
     }
 
-    void Enable() { enabled = true; }
+    void Enable() { enabled = true; InitCursors(); }
+
+    bool GetCurrentCursor(CursorType& outCursor) {
+        CURSORINFO ci = { sizeof(ci) };
+        if (!GetCursorInfo(&ci)) { outCursor = CURSOR_DEFAULT; return false; }
+        if (!(ci.flags & CURSOR_SHOWING)) { outCursor = CURSOR_NONE; return outCursor != lastCursor.exchange(outCursor); }
+        CursorType newCursor = CURSOR_CUSTOM;
+        for (int i = 0; i < 13; i++) if (ci.hCursor == stdCursors[i]) { newCursor = (CursorType)i; break; }
+        outCursor = newCursor;
+        return newCursor != lastCursor.exchange(newCursor);
+    }
 
     void WiggleCenter() {
         if (!enabled) return;

@@ -23,15 +23,23 @@ class VideoEncoder {
     uint64_t fenceVal = 0, lastSig = 0;
     bool useFence = false;
     int w, h, frameNum = 0, curFps = 60;
-    CodecType codec = CODEC_H264;
+    CodecType codec = CODEC_AV1;
     steady_clock::time_point lastKey;
     static constexpr auto KEY_INTERVAL = 2000ms;
     EncodedFrame out;
 
     static int64_t CalcBitrate(int w, int h, int fps) { return (int64_t)(0.18085 * w * h * fps); }
 
+    static const char* GetEncoderName(CodecType c) {
+        switch (c) {
+            case CODEC_AV1: return "av1_nvenc";
+            case CODEC_H265: return "hevc_nvenc";
+            default: return "h264_nvenc";
+        }
+    }
+
     bool InitHwCtx(const AVCodec* c) {
-        if (strcmp(c->name, "h264_nvenc") != 0 && strcmp(c->name, "av1_nvenc") != 0) return false;
+        if (strcmp(c->name, "h264_nvenc") != 0 && strcmp(c->name, "hevc_nvenc") != 0 && strcmp(c->name, "av1_nvenc") != 0) return false;
         hwDev = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
         if (!hwDev) return false;
         auto* dc = (AVD3D11VADeviceContext*)((AVHWDeviceContext*)hwDev->data)->hwctx;
@@ -76,18 +84,19 @@ class VideoEncoder {
         set("preset", "p1"); set("tune", "ull"); set("zerolatency", "1"); set("rc-lookahead", "0");
         set("rc", "vbr"); set("multipass", "disabled"); set("delay", "0"); set("surfaces", "4");
         if (codec == CODEC_H264) { set("cq", "23"); set("forced-idr", "1"); set("strict_gop", "1"); }
+        else if (codec == CODEC_H265) { set("cq", "25"); set("forced-idr", "1"); set("strict_gop", "1"); }
         else { set("cq", "28"); set("range", "pc"); }
     }
 
 public:
-    VideoEncoder(int width, int height, int fps, ID3D11Device* d, ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc = CODEC_H264)
+    VideoEncoder(int width, int height, int fps, ID3D11Device* d, ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc = CODEC_AV1)
         : w(width), h(height), curFps(fps), dev(d), ctx(c), mt(m), codec(cc) {
         dev->AddRef();
         if (ctx) ctx->AddRef(); else dev->GetImmediateContext(&ctx);
         if (mt) mt->AddRef();
         lastKey = steady_clock::now() - KEY_INTERVAL;
         InitSync();
-        const AVCodec* enc = avcodec_find_encoder_by_name(cc == CODEC_H264 ? "h264_nvenc" : "av1_nvenc");
+        const AVCodec* enc = avcodec_find_encoder_by_name(GetEncoderName(cc));
         if (!enc) throw std::runtime_error("NVENC unavailable");
         codecCtx = avcodec_alloc_context3(enc);
         if (!codecCtx) throw std::runtime_error("Codec alloc failed");
@@ -108,7 +117,7 @@ public:
         hwFrame = av_frame_alloc(); pkt = av_packet_alloc();
         if (!hwFrame || !pkt) throw std::runtime_error("Frame/packet alloc failed");
         hwFrame->format = codecCtx->pix_fmt; hwFrame->width = w; hwFrame->height = h;
-        LOG("Encoder: %dx%d @ %dfps, %.2f Mbps", w, h, fps, br / 1000000.0);
+        LOG("Encoder: %dx%d @ %dfps, %.2f Mbps, codec: %s", w, h, fps, br / 1000000.0, GetEncoderName(cc));
     }
 
     ~VideoEncoder() {

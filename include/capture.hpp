@@ -108,9 +108,11 @@ class ScreenCapture {
     GPUSync sync;
     FrameSlot* slot;
     std::atomic<bool> running{true}, capturing{false}, started{false};
+    std::atomic<int> frameCallbackActive{0};  // Track active callbacks
     HMONITOR curMon = nullptr;
-    std::mutex mtx;
+    std::recursive_mutex mtx;  // Changed to recursive_mutex for nested locking
     std::function<void(int, int, int)> onResChange;
+    bool cursorCaptureEnabled = false;
 
     int FindTex() {
         for (int i = 0; i < POOL; i++) { int idx = (texIdx + i) % POOL; if (!slot->IsInFlight(idx) && sync.Complete(texFences[idx])) { texIdx = idx + 1; return idx; } }
@@ -119,16 +121,38 @@ class ScreenCapture {
     }
 
     void OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Windows::Foundation::IInspectable const&) {
+        // Early exit before acquiring lock
+        if (!running.load(std::memory_order_acquire) || !capturing.load(std::memory_order_acquire)) return;
+
+        // Increment active callback count
+        frameCallbackActive.fetch_add(1, std::memory_order_acq_rel);
+
+        // Ensure we decrement on exit
+        struct CallbackGuard {
+            std::atomic<int>& counter;
+            ~CallbackGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
+        } guard{frameCallbackActive};
+
         auto f = s.TryGetNextFrame();
-        if (!f || !running || !capturing) return;
+        if (!f) return;
+
+        // Acquire lock for thread safety
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+
+        // Re-check state after acquiring lock
+        if (!running.load(std::memory_order_acquire) || !capturing.load(std::memory_order_acquire)) return;
+
         int64_t ts = GetTimestamp();
         auto surf = f.Surface(); if (!surf) return;
         winrt::com_ptr<ID3D11Texture2D> src;
         auto acc = surf.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         if (FAILED(acc->GetInterface(IID_PPV_ARGS(src.put()))) || !src) return;
-        int ti = FindTex(); if (ti < 0 || !texPool[ti]) return;
+
+        int ti = FindTex();
+        if (ti < 0 || ti >= POOL || !texPool[ti]) return;
+
         bool ns = false; uint64_t fv = 0;
-        { MTLock lk(mt); ctx->CopyResource(texPool[ti], src.get()); ctx->Flush(); fv = sync.Signal(ns); }
+        { MTLock mtLk(mt); ctx->CopyResource(texPool[ti], src.get()); ctx->Flush(); fv = sync.Signal(ns); }
         texFences[ti] = fv;
         slot->Push(texPool[ti], ts, fv, ns, ti);
     }
@@ -138,6 +162,17 @@ class ScreenCapture {
         int fps = targetFps.load(); if (fps <= 0) fps = 60;
         try { session.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(10000000 / fps)); }
         catch (...) { LOG("MinUpdateInterval not supported"); }
+    }
+
+    void WaitForCallbacksComplete(int timeoutMs = 500) {
+        auto start = steady_clock::now();
+        while (frameCallbackActive.load(std::memory_order_acquire) > 0) {
+            if (duration_cast<milliseconds>(steady_clock::now() - start).count() > timeoutMs) {
+                ERR("Timeout waiting for frame callbacks to complete");
+                break;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
     }
 
     void InitMon(HMONITOR mon, bool keepFps = false) {
@@ -155,7 +190,7 @@ class ScreenCapture {
         pool = WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(winrtDev, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, {w, h});
         pool.FrameArrived({this, &ScreenCapture::OnFrame});
         session = pool.CreateCaptureSession(item);
-        session.IsCursorCaptureEnabled(true);
+        session.IsCursorCaptureEnabled(cursorCaptureEnabled);
         try { session.IsBorderRequired(false); } catch (...) { LOG("IsBorderRequired not supported"); }
         UpdateSessionInterval();
         started = false; curMon = mon;
@@ -175,14 +210,29 @@ public:
             throw std::runtime_error("WinRT device failed");
         winrtDev = insp.as<WGD::Direct3D11::IDirect3DDevice>();
         RefreshMonitorList();
+        cursorCaptureEnabled = false;
         InitMon(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
         LOG("Capture: %dx%d @ %dHz", w, h, hostFps);
     }
 
     ~ScreenCapture() {
-        running = capturing = false;
+        // Signal shutdown first
+        running.store(false, std::memory_order_release);
+        capturing.store(false, std::memory_order_release);
+
+        // Acquire lock to ensure no callbacks are modifying state
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+
+        // Close session and pool first to stop new callbacks
         try { if (session) session.Close(); } catch (...) { ERR("Session close failed"); }
         try { if (pool) pool.Close(); } catch (...) { ERR("Pool close failed"); }
+        session = nullptr;
+        pool = nullptr;
+
+        // Wait for any in-flight callbacks to complete
+        WaitForCallbacksComplete();
+
+        // Now safe to release textures
         for (auto& t : texPool) SafeRelease(t);
         SafeRelease(mt, ctx, dev);
         winrt::uninit_apartment();
@@ -191,32 +241,40 @@ public:
     void SetResolutionChangeCallback(std::function<void(int, int, int)> cb) { onResChange = cb; }
 
     void StartCapture() {
-        std::lock_guard<std::mutex> lk(mtx);
+        std::lock_guard<std::recursive_mutex> lk(mtx);
         if (capturing) return;
         slot->Reset(); texIdx = 0;
         for (auto& f : texFences) f = 0;
         if (!started.exchange(true)) session.StartCapture();
-        capturing = true;
+        capturing.store(true, std::memory_order_release);
     }
 
-    void PauseCapture() { capturing = false; }
+    void PauseCapture() { capturing.store(false, std::memory_order_release); }
 
     bool SwitchMonitor(int i) {
-        std::lock_guard<std::mutex> lk(mtx);
+        std::lock_guard<std::recursive_mutex> lk(mtx);
         std::lock_guard<std::mutex> ml(g_monitorsMutex);
         if (i < 0 || i >= (int)g_monitors.size()) return false;
         if (monIdx == i && curMon == g_monitors[i].hMon) return true;
-        bool was = capturing.load();
-        capturing = false;
+        bool was = capturing.load(std::memory_order_acquire);
+
+        // Stop capturing and wait for callbacks
+        capturing.store(false, std::memory_order_release);
+
+        // Close session and pool
         try { if (session) session.Close(); } catch (...) { ERR("Session close failed during switch"); }
         try { if (pool) pool.Close(); } catch (...) { ERR("Pool close failed during switch"); }
         session = nullptr; pool = nullptr; item = nullptr;
+
+        // Wait for any pending callbacks to complete before releasing textures
+        WaitForCallbacksComplete();
+
         slot->Reset(); texIdx = 0;
         try {
             InitMon(g_monitors[i].hMon, true);
             monIdx = i;
             if (onResChange) onResChange(w, h, targetFps.load());
-            if (was) { session.StartCapture(); started = true; capturing = true; }
+            if (was) { session.StartCapture(); started = true; capturing.store(true, std::memory_order_release); }
             return true;
         } catch (const std::exception& e) { ERR("SwitchMonitor failed: %s", e.what()); return false; }
         catch (...) { ERR("SwitchMonitor failed: unknown error"); return false; }
@@ -225,23 +283,33 @@ public:
     bool SetFPS(int fps) {
         if (fps < 1 || fps > 240) return false;
         int old = targetFps.exchange(fps);
-        if (old != fps) UpdateSessionInterval();
+        if (old != fps) {
+            std::lock_guard<std::recursive_mutex> lk(mtx);
+            UpdateSessionInterval();
+        }
         return true;
     }
 
     int RefreshHostFPS() {
+        std::lock_guard<std::recursive_mutex> lk(mtx);
         if (curMon) { MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize = sizeof(dm)}; if (GetMonitorInfoW(curMon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hostFps = dm.dmDisplayFrequency; }
         return hostFps;
     }
 
-    int GetCurrentMonitorIndex() const { return monIdx; }
+    int GetCurrentMonitorIndex() const { return monIdx.load(std::memory_order_acquire); }
     int GetHostFPS() const { return hostFps; }
-    int GetCurrentFPS() const { return targetFps; }
-    bool IsCapturing() const { return capturing; }
+    int GetCurrentFPS() const { return targetFps.load(std::memory_order_acquire); }
+    bool IsCapturing() const { return capturing.load(std::memory_order_acquire); }
     bool WaitReady(uint64_t f) { return sync.Wait(f, ctx, mt, 16); }
     ID3D11Device* GetDev() const { return dev; }
     ID3D11DeviceContext* GetCtx() const { return ctx; }
     ID3D11Multithread* GetMT() const { return mt; }
     int GetW() const { return w; }
     int GetH() const { return h; }
+
+    void SetCursorCapture(bool enabled) {
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+        cursorCaptureEnabled = enabled;
+        if (session) { try { session.IsCursorCaptureEnabled(cursorCaptureEnabled); } catch (...) { LOG("SetCursorCapture failed"); } }
+    }
 };
