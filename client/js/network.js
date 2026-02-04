@@ -130,7 +130,7 @@ const processFrame = (frameId, frame) => {
         let off = 0; frame.parts.forEach(p => { b.set(p, off); off += p.byteLength; }); return b;
     })();
     S.stats.framesComplete++;
-    S.stats[frame.isKey ? 'keyframesReceived' : 'framesComplete']++;
+    if (frame.isKey) S.stats.keyframesReceived++;
     if (frameId > S.lastFrameId) S.lastFrameId = frameId;
     decodeFrame({ buf, capTs: frame.capTs, encMs: frame.encMs, isKey: frame.isKey, arrivalMs: frame.arrivalMs });
     if (waitFirstFrame) { waitFirstFrame = false; hideLoading(); hasConnected = true; }
