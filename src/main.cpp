@@ -119,9 +119,8 @@ void SetupConfig() {
 
 std::string ExtractSessionCookie(const httplib::Request& req) {
     auto it = req.headers.find("Cookie"); if (it == req.headers.end()) return "";
-    const std::string prefix = "session="; size_t pos = it->second.find(prefix);
-    if (pos == std::string::npos) return "";
-    size_t start = pos + prefix.size(), end = it->second.find(';', start);
+    size_t pos = it->second.find("session="); if (pos == std::string::npos) return "";
+    size_t start = pos + 8, end = it->second.find(';', start);
     return end != std::string::npos ? it->second.substr(start, end - start) : it->second.substr(start);
 }
 
@@ -176,25 +175,63 @@ void SetupCORS(const httplib::Request& req, httplib::Response& r) {
 std::string GetLocalIPAddress() {
     std::string result = "127.0.0.1";
     char hostname[256];
-    if (gethostname(hostname, sizeof(hostname)) == 0) {
-        addrinfo hints = {}, *info = nullptr;
-        hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-        if (getaddrinfo(hostname, nullptr, &hints, &info) == 0 && info) {
-            for (auto* p = info; p; p = p->ai_next) {
-                if (p->ai_family == AF_INET) {
-                    char ip[INET_ADDRSTRLEN];
-                    sockaddr_in* addr = (sockaddr_in*)p->ai_addr;
-                    if (inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip))) {
-                        std::string ipStr(ip);
-                        if (ipStr != "127.0.0.1" && ipStr.find("127.") != 0) { result = ipStr; break; }
+    if (gethostname(hostname, sizeof(hostname)) != 0) return result;
+    addrinfo hints = {}, *info = nullptr;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(hostname, nullptr, &hints, &info) != 0 || !info) return result;
+    for (auto* p = info; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET) {
+            char ip[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &((sockaddr_in*)p->ai_addr)->sin_addr, ip, sizeof(ip))) {
+                std::string ipStr(ip);
+                if (ipStr != "127.0.0.1" && ipStr.find("127.") != 0) { result = ipStr; break; }
+            }
+        }
+    }
+    freeaddrinfo(info);
+    return result;
+}
+
+// Helper class to manage pending wiggle operations safely
+class WiggleManager {
+    std::atomic<bool>& running;
+    InputHandler& input;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::atomic<int> pendingWiggles{0};
+    std::thread workerThread;
+
+public:
+    WiggleManager(std::atomic<bool>& r, InputHandler& i) : running(r), input(i) {
+        workerThread = std::thread([this] {
+            while (running.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait_for(lk, 50ms, [this] {
+                    return pendingWiggles.load(std::memory_order_acquire) > 0 || !running.load(std::memory_order_acquire);
+                });
+                if (!running.load(std::memory_order_acquire)) break;
+                if (pendingWiggles.load(std::memory_order_acquire) > 0) {
+                    pendingWiggles.store(0, std::memory_order_release);
+                    lk.unlock();
+                    std::this_thread::sleep_for(100ms);
+                    if (running.load(std::memory_order_acquire)) {
+                        input.WiggleCenter();
                     }
                 }
             }
-            freeaddrinfo(info);
-        }
+        });
     }
-    return result;
-}
+
+    ~WiggleManager() {
+        cv.notify_all();
+        if (workerThread.joinable()) workerThread.join();
+    }
+
+    void RequestWiggle() {
+        pendingWiggles.fetch_add(1, std::memory_order_release);
+        cv.notify_one();
+    }
+};
 
 int main() {
     try {
@@ -212,11 +249,17 @@ int main() {
         ScreenCapture capture(&frameSlot);
         std::unique_ptr<VideoEncoder> encoder; std::mutex encMtx;
         std::atomic<bool> encReady{false};
-        std::atomic<CodecType> curCodec{CODEC_H264};
+        std::atomic<CodecType> curCodec{CODEC_AV1};
 
         InputHandler input; input.Enable();
-        auto updateBounds = [&](int i) { std::lock_guard<std::mutex> lk(g_monitorsMutex); if (i >= 0 && i < (int)g_monitors.size()) input.UpdateFromMonitorInfo(g_monitors[i]); };
+        auto updateBounds = [&](int i) {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            if (i >= 0 && i < (int)g_monitors.size()) input.UpdateFromMonitorInfo(g_monitors[i]);
+        };
         updateBounds(capture.GetCurrentMonitorIndex());
+
+        // Create wiggle manager to handle delayed wiggle operations safely
+        WiggleManager wiggleManager(g_running, input);
 
         std::unique_ptr<AudioCapture> audio;
         try { audio = std::make_unique<AudioCapture>(); } catch (...) { ERR("AudioCapture init failed"); }
@@ -228,6 +271,7 @@ int main() {
         };
 
         capture.SetResolutionChangeCallback([&](int w, int h, int fps) { mkEncoder(w, h, fps, curCodec.load()); });
+        std::atomic<bool> cursorCaptureEnabled{false};
 
         rtc->Init({&input,
             [&](int fps, uint8_t) {
@@ -238,14 +282,25 @@ int main() {
                 if (!capture.IsCapturing()) capture.StartCapture(); frameSlot.Wake();
             },
             [&] { return capture.RefreshHostFPS(); },
-            [&](int i) { bool ok = capture.SwitchMonitor(i); if (ok) { updateBounds(i); std::thread([&] { std::this_thread::sleep_for(100ms); input.WiggleCenter(); }).detach(); } return ok; },
+            [&](int i) {
+                bool ok = capture.SwitchMonitor(i);
+                if (ok) {
+                    updateBounds(i);
+                    wiggleManager.RequestWiggle();  // Safe wiggle request
+                }
+                return ok;
+            },
             [&] { return capture.GetCurrentMonitorIndex(); },
             [&] { capture.PauseCapture(); frameSlot.Wake(); },
-            [&] { frameSlot.Wake(); std::thread([&] { std::this_thread::sleep_for(100ms); input.WiggleCenter(); }).detach(); },
+            [&] {
+                frameSlot.Wake();
+                wiggleManager.RequestWiggle();  // Safe wiggle request
+            },
             [&](CodecType c) -> bool { if (c == curCodec.load()) return true; try { mkEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), c); return true; } catch (...) { ERR("Codec change failed"); return false; } },
             [&] { return curCodec.load(); },
             [&] { return input.GetClipboardText(); },
-            [&](const std::string& text) { return input.SetClipboardText(text); }
+            [&](const std::string& text) { return input.SetClipboardText(text); },
+            [&](bool enabled) { cursorCaptureEnabled = enabled; capture.SetCursorCapture(enabled); }
         });
 
         httplib::SSLServer srv(SSL_CERT_FILE, SSL_KEY_FILE);
@@ -290,20 +345,33 @@ int main() {
             if (!audio) return;
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             AudioPacket pkt;
-            while (g_running) {
+            while (g_running.load(std::memory_order_acquire)) {
                 if (!rtc->IsStreaming()) { std::this_thread::sleep_for(10ms); continue; }
                 if (audio->PopPacket(pkt, 5)) try { rtc->SendAudio(pkt.data, pkt.ts, pkt.samples); } catch (...) { ERR("SendAudio failed"); }
+            }
+        });
+
+        std::thread cursorThread([&] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            while (g_running.load(std::memory_order_acquire)) {
+                if (!rtc->IsStreaming() || cursorCaptureEnabled.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(50ms);
+                    continue;
+                }
+                CursorType cursor;
+                if (input.GetCurrentCursor(cursor)) try { rtc->SendCursorShape(cursor); } catch (...) { ERR("SendCursorShape failed"); }
+                std::this_thread::sleep_for(33ms);
             }
         });
 
         std::thread encThread([&] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             FrameData fd; bool wasStreaming = false; int64_t period = 16667;
-            while (g_running) {
-                if (!frameSlot.Pop(fd)) { if (!g_running) break; continue; }
-                int64_t popTime = GetTimestamp(), handoff = popTime - fd.ts;
+            while (g_running.load(std::memory_order_acquire)) {
+                if (!frameSlot.Pop(fd)) { if (!g_running.load(std::memory_order_acquire)) break; continue; }
+                int64_t handoff = GetTimestamp() - fd.ts;
                 bool isStreaming = false;
-                try { isStreaming = rtc->IsStreaming() && encReady.load(); } catch (...) { ERR("IsStreaming check failed"); }
+                try { isStreaming = rtc->IsStreaming() && encReady.load(std::memory_order_acquire); } catch (...) { ERR("IsStreaming check failed"); }
 
                 if (isStreaming && !wasStreaming) {
                     std::lock_guard<std::mutex> lk(encMtx);
@@ -339,11 +407,38 @@ int main() {
             }
         });
 
-        while (g_running) std::this_thread::sleep_for(100ms);
+        while (g_running.load(std::memory_order_acquire)) std::this_thread::sleep_for(100ms);
+
+        // Orderly shutdown
+        LOG("Initiating shutdown...");
+
+        // Stop audio first (it's independent)
         if (audio) audio->Stop();
-        srv.stop(); frameSlot.Wake();
-        std::thread([&] { std::this_thread::sleep_for(3s); ExitProcess(0); }).detach();
-        srvThread.join(); encThread.join(); audioThread.join();
+
+        // Stop server and wake frame slot
+        srv.stop();
+        frameSlot.Wake();
+
+        // Set a timeout for thread cleanup
+        std::atomic<bool> forceExit{false};
+        std::thread timeoutThread([&] {
+            std::this_thread::sleep_for(3s);
+            if (!forceExit.load(std::memory_order_acquire)) {
+                ERR("Shutdown timeout - forcing exit");
+                ExitProcess(0);
+            }
+        });
+        timeoutThread.detach();
+
+        // Join threads in order
+        if (encThread.joinable()) encThread.join();
+        if (audioThread.joinable()) audioThread.join();
+        if (cursorThread.joinable()) cursorThread.join();
+        if (srvThread.joinable()) srvThread.join();
+
+        forceExit.store(true, std::memory_order_release);
+        LOG("Shutdown complete");
+
     } catch (const std::exception& e) { ERR("Fatal: %s", e.what()); getchar(); return 1; }
     return 0;
 }
