@@ -1,4 +1,4 @@
-import { C, S, serverFrameAgeMs, recordRenderTime, logVideoDrop } from './state.js';
+import { C, S, CURSOR_TYPES, serverFrameAgeMs, recordRenderTime, logVideoDrop } from './state.js';
 
 export const canvas = document.getElementById('c');
 export let canvasW = 0, canvasH = 0;
@@ -9,9 +9,7 @@ let lastSuccessfulVp = null, hasValidTexture = false;
 const updateSize = () => {
     const dpr = devicePixelRatio || 1, rect = canvas.getBoundingClientRect();
     const dW = Math.round(rect.width * dpr), dH = Math.round(rect.height * dpr);
-    if (dW > 0 && dH > 0 && (canvas.width !== dW || canvas.height !== dH)) {
-        canvas.width = canvasW = dW; canvas.height = canvasH = dH; return true;
-    }
+    if (dW > 0 && dH > 0 && (canvas.width !== dW || canvas.height !== dH)) { canvas.width = canvasW = dW; canvas.height = canvasH = dH; return true; }
     return false;
 };
 
@@ -88,10 +86,16 @@ const renderFrame = (frame, meta) => {
 
     if (ok) { clearLetterbox(vp); gl.viewport(vp.x, vp.y, vp.w, vp.h); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
     if (meta?.capTs) S.frameMeta.delete(meta.capTs);
-    S.stats.rend++;
     recordRenderTime(performance.now() - renderStart);
     frame.close();
 };
+
+export const setCursorStyle = cursorType => {
+    if (S.relativeMouseMode || S.pointerLocked) { canvas.style.cursor = ''; return; }
+    canvas.style.cursor = CURSOR_TYPES[cursorType] || 'default';
+};
+
+export const resetCursorStyle = () => { canvas.style.cursor = 'default'; };
 
 export const queueFrameForPresentation = entry => {
     if (!S.tabVisible) { try { entry.frame.close(); } catch (e) { console.warn('[Renderer] Failed to close frame:', e.message); } return; }
@@ -115,10 +119,14 @@ export const queueFrameForPresentation = entry => {
     renderFrame(entry.frame, entry.meta);
 };
 
-export const resetRenderer = () => { S.jitterMetrics.lastPresentTs = 0; hasValidTexture = false; lastSuccessfulVp = null; };
+export const resetRenderer = () => {
+    S.jitterMetrics.lastPresentTs = 0;
+    hasValidTexture = false;
+    lastSuccessfulVp = null;
+    resetCursorStyle();
+};
 
 let resizeTimeout;
-
 const handleResize = () => {
     clearTimeout(resizeTimeout);
     resizeTimeout = setTimeout(() => requestAnimationFrame(() => {

@@ -1,8 +1,8 @@
-import { enableControl, setClipboardFns } from './input.js';
+import { enableControl, setClipboardFns, setCursorCaptureFn } from './input.js';
 import { MSG, C, S, $, mkBuf, updateClockOffset, resetClockSync, startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket, clientTimeUs, allChannelsOpen, logVideoDrop } from './state.js';
 import { handleAudioPkt, closeAudio, initDecoder, decodeFrame, setReqKeyFn, stopKeyframeRetryTimer } from './media.js';
 import { updateMonOpts, updateCodecOpts, setNetCbs, updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection, getStoredFps, updateFpsDropdown } from './ui.js';
-import { resetRenderer } from './renderer.js';
+import { resetRenderer, setCursorStyle } from './renderer.js';
 
 const baseUrl = window.location.origin;
 let hasConnected = false, waitFirstFrame = false, connAttempts = 0, pingInterval = null, channelsReady = 0;
@@ -92,6 +92,7 @@ const sendMonSel = i => sendControl(mkBuf(5, v => { v.setUint32(0, MSG.MONITOR_S
 const sendFps = (fps, mode) => sendControl(mkBuf(7, v => { v.setUint32(0, MSG.FPS_SET, true); v.setUint16(4, fps, true); v.setUint8(6, mode); }));
 const sendCodec = codecId => sendControl(mkBuf(5, v => { v.setUint32(0, MSG.CODEC_SET, true); v.setUint8(4, codecId); }));
 const reqKey = () => sendControl(mkBuf(4, v => { v.setUint32(0, MSG.REQUEST_KEY, true); }));
+const sendCursorCapture = enabled => sendControl(mkBuf(5, v => { v.setUint32(0, MSG.CURSOR_CAPTURE, true); v.setUint8(4, enabled ? 1 : 0); }));
 
 setReqKeyFn(reqKey);
 
@@ -128,11 +129,9 @@ const processFrame = (frameId, frame) => {
         const b = new Uint8Array(frame.parts.reduce((s, p) => s + p.byteLength, 0));
         let off = 0; frame.parts.forEach(p => { b.set(p, off); off += p.byteLength; }); return b;
     })();
-
-    S.stats.recv++; S.stats.framesComplete++;
-    S.stats[frame.isKey ? 'keyframesReceived' : 'deltaFramesReceived']++;
+    S.stats.framesComplete++;
+    S.stats[frame.isKey ? 'keyframesReceived' : 'framesComplete']++;
     if (frameId > S.lastFrameId) S.lastFrameId = frameId;
-
     decodeFrame({ buf, capTs: frame.capTs, encMs: frame.encMs, isKey: frame.isKey, arrivalMs: frame.arrivalMs });
     if (waitFirstFrame) { waitFirstFrame = false; hideLoading(); hasConnected = true; }
     S.chunks.delete(frameId);
@@ -141,7 +140,6 @@ const processFrame = (frameId, frame) => {
 const handleControlMsg = e => {
     const arrivalUs = clientTimeUs();
     if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 4) return;
-
     const view = new DataView(e.data), msgType = view.getUint32(0, true), len = e.data.byteLength;
 
     if (msgType === MSG.PING && len === 24) {
@@ -162,14 +160,17 @@ const handleControlMsg = e => {
         const textLen = view.getUint32(4, true);
         if (textLen > 0 && len >= 8 + textLen && textLen <= 1048576) {
             const text = new TextDecoder().decode(new Uint8Array(e.data, 8, textLen));
-            navigator.clipboard.writeText(text).catch(e => { console.warn('[Network] Clipboard write failed:', e.message); });
+            navigator.clipboard.writeText(text).catch(err => { console.warn('[Network] Clipboard write failed:', err.message); });
         }
+        return recordPacket(len, 'control');
+    }
+    if (msgType === MSG.CURSOR_SHAPE && len === 5) {
+        setCursorStyle(view.getUint8(4));
         return recordPacket(len, 'control');
     }
     if (msgType === MSG.KICKED && len === 4) {
         cleanup(); hasConnected = false;
         showAuthModal('Disconnected: Another client connected');
-        return;
     }
 };
 
@@ -185,7 +186,7 @@ const handleVideoMsg = e => {
 
     if (totalChunks === 0 || chunkIdx >= totalChunks || capTs <= 0) return;
 
-    recordPacket(len, 'video'); S.stats.chunksReceived++; S.stats.bytes += len;
+    recordPacket(len, 'video'); S.stats.bytes += len;
     if (S.lastFrameId > 0 && frameId < S.lastFrameId) { logVideoDrop('Stale frame'); return; }
 
     for (const [id, fr] of S.chunks) {
@@ -237,7 +238,9 @@ const onChannelClose = () => {
 const setupDataChannel = (dc, onMessage) => {
     dc.binaryType = 'arraybuffer';
     dc.onopen = async () => { channelsReady++; if (channelsReady === 4) await onAllChannelsOpen(); };
-    dc.onclose = onChannelClose; dc.onerror = e => { console.warn('[Network] DataChannel error:', e.error?.message || 'Unknown error'); }; dc.onmessage = onMessage;
+    dc.onclose = onChannelClose;
+    dc.onerror = e => { console.warn('[Network] DataChannel error:', e.error?.message || 'Unknown error'); };
+    dc.onmessage = onMessage;
 };
 
 const resetState = () => {
@@ -247,7 +250,7 @@ const resetState = () => {
     try { if (S.decoder?.state !== 'closed') S.decoder?.close(); } catch (e) { console.warn('[Network] Failed to close decoder:', e.message); }
     S.dcControl = S.dcVideo = S.dcAudio = S.dcInput = S.pc = S.decoder = null;
     S.ready = S.fpsSent = S.codecSent = waitFirstFrame = false;
-    S.chunks.clear(); S.lastFrameId = 0; S.frameMeta.clear(); S.presentQueue = [];
+    S.chunks.clear(); S.lastFrameId = 0; S.frameMeta.clear();
     channelsReady = 0;
 };
 
@@ -316,6 +319,7 @@ const cleanup = () => {
 
 (async () => {
     setNetCbs(applyFps, sendMonSel, applyCodec);
+    setCursorCaptureFn(sendCursorCapture);
     const codecResult = await initCodecDetection();
     S.currentCodec = codecResult.codecId;
     await updateCodecOpts(); enableControl();

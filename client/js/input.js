@@ -1,5 +1,5 @@
 import { MSG, S, mkBuf } from './state.js';
-import { canvas, canvasW, canvasH, calcVp } from './renderer.js';
+import { canvas, canvasW, canvasH, calcVp, resetCursorStyle } from './renderer.js';
 
 const BUTTON_MAP = { 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 };
 const moveAbsBuf = new ArrayBuffer(12), moveAbsView = new DataView(moveAbsBuf);
@@ -8,9 +8,10 @@ moveAbsView.setUint32(0, MSG.MOUSE_MOVE, true);
 moveRelView.setUint32(0, MSG.MOUSE_MOVE_REL, true);
 
 let pendingAbsMove = null, pendingRelMove = { dx: 0, dy: 0 }, rafId = null;
-let clipboardSendFn = null, clipboardRequestFn = null;
+let clipboardSendFn = null, clipboardRequestFn = null, sendCursorCaptureFn = null;
 
 export const setClipboardFns = (sendFn, requestFn) => { clipboardSendFn = sendFn; clipboardRequestFn = requestFn; };
+export const setCursorCaptureFn = fn => { sendCursorCaptureFn = fn; };
 
 const CODE_MAP = {
     Backspace:8,Tab:9,Enter:13,ShiftLeft:16,ShiftRight:16,ControlLeft:17,ControlRight:17,AltLeft:18,AltRight:18,
@@ -37,9 +38,7 @@ const sendImmediate = (type, ...a) => {
 
 const flushMouseState = () => {
     rafId = null;
-    if (!S.controlEnabled || S.dcInput?.readyState !== 'open') {
-        pendingAbsMove = null; pendingRelMove.dx = pendingRelMove.dy = 0; return;
-    }
+    if (!S.controlEnabled || S.dcInput?.readyState !== 'open') { pendingAbsMove = null; pendingRelMove.dx = pendingRelMove.dy = 0; return; }
     if (pendingRelMove.dx !== 0 || pendingRelMove.dy !== 0) {
         S.stats.moves++;
         moveRelView.setInt16(4, pendingRelMove.dx, true);
@@ -76,14 +75,14 @@ const toNormalized = (cx, cy) => {
 const getMods = e => (e.ctrlKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.shiftKey ? 4 : 0) | (e.metaKey ? 8 : 0);
 const isInputFocused = () => { const el = document.activeElement; return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable); };
 
-const handleClipboardPaste = async (e, mods, vk) => {
+const handleClipboardPaste = async (mods, vk) => {
     if (S.clipboardSyncEnabled && clipboardSendFn) {
         try { const text = await navigator.clipboard.readText(); if (text) await clipboardSendFn(text); } catch (e) { console.warn('[Input] Clipboard read failed:', e.message); }
     }
     sendImmediate('key', vk, 0, true, mods);
 };
 
-const handleClipboardCopy = (e, mods, vk) => {
+const handleClipboardCopy = (mods, vk) => {
     sendImmediate('key', vk, 0, true, mods);
     if (S.clipboardSyncEnabled && clipboardRequestFn) setTimeout(() => clipboardRequestFn(), 150);
 };
@@ -94,8 +93,8 @@ const keyHandler = (e, down) => {
     const mods = getMods(e), vk = codeToVK(e.code);
     if (!vk) return;
     if (down && e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
-        if (e.code === 'KeyV') { handleClipboardPaste(e, mods, vk); return; }
-        if (e.code === 'KeyC') { handleClipboardCopy(e, mods, vk); return; }
+        if (e.code === 'KeyV') { handleClipboardPaste(mods, vk); return; }
+        if (e.code === 'KeyC') { handleClipboardCopy(mods, vk); return; }
     }
     sendImmediate('key', vk, 0, down, mods);
 };
@@ -124,7 +123,7 @@ const h = {
         if (!S.controlEnabled) return;
         e.preventDefault();
         if (rafId !== null) { cancelAnimationFrame(rafId); flushMouseState(); }
-        if (S.relativeMouseMode && !S.pointerLocked) try { canvas.requestPointerLock?.(); } catch (e) { console.warn('[Input] Pointer lock request failed:', e.message); }
+        if (S.relativeMouseMode && !S.pointerLocked) try { canvas.requestPointerLock?.(); } catch (err) { console.warn('[Input] Pointer lock request failed:', err.message); }
         sendImmediate('btn', BUTTON_MAP[e.button] ?? 0, true);
     },
     up: e => {
@@ -133,7 +132,7 @@ const h = {
         if (rafId !== null) { cancelAnimationFrame(rafId); flushMouseState(); }
         sendImmediate('btn', BUTTON_MAP[e.button] ?? 0, false);
     },
-    wheel: e => { if (!S.controlEnabled) return; e.preventDefault(); sendImmediate('wheel', e.deltaX, e.deltaY); },
+    wheel: e => { if (S.controlEnabled) { e.preventDefault(); sendImmediate('wheel', e.deltaX, e.deltaY); } },
     ctx: e => { if (S.controlEnabled) e.preventDefault(); },
     keyD: e => keyHandler(e, true),
     keyU: e => keyHandler(e, false)
@@ -153,7 +152,13 @@ const toggleControl = enable => {
     }
 };
 
-export const setRelativeMouseMode = enabled => { S.relativeMouseMode = enabled; if (!enabled && S.pointerLocked) exitPointerLock(); };
+export const setRelativeMouseMode = enabled => {
+    S.relativeMouseMode = enabled;
+    if (sendCursorCaptureFn) sendCursorCaptureFn(enabled);
+    if (enabled) resetCursorStyle();
+    if (!enabled && S.pointerLocked) exitPointerLock();
+};
+
 export const enableControl = () => toggleControl(true);
 
 if (window.matchMedia('(pointer: fine)').matches) enableControl();

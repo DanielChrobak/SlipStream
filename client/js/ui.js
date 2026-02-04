@@ -31,12 +31,12 @@ $('edge').onclick = () => togglePanel(true);
 $('pnlX').onclick = $('bk').onclick = () => togglePanel(false);
 document.onkeydown = e => { if (e.key === 'Escape' && $('pnl').classList.contains('on') && !S.controlEnabled) togglePanel(false); };
 
-const FPS_KEY = 'slipstream_fps', CODEC_KEY = 'slipstream_codec', TABBED_KEY = 'slipstream_tabbed_mode', STATS_KEY = 'slipstream_stats_overlay';
+const FPS_KEY = 'slipstream_fps', CODEC_KEY = 'slipstream_codec', TABBED_KEY = 'slipstream_tabbed_mode', STATS_KEY = 'slipstream_stats_overlay', CLIPBOARD_KEY = 'slipstream_clipboard_sync';
 const loadPref = (key, parse = parseInt, validate = () => true, def = null) => { try { const v = parse(localStorage.getItem(key)); return validate(v) ? v : def; } catch (e) { console.warn(`[UI] Failed to load preference '${key}':`, e.message); return def; } };
 const savePref = (key, val) => { try { localStorage.setItem(key, val.toString()); } catch (e) { console.warn(`[UI] Failed to save preference '${key}':`, e.message); } };
 
 export const getStoredFps = () => loadPref(FPS_KEY, parseInt, v => v >= 1 && v <= 240, null);
-export const getStoredCodec = () => loadPref(CODEC_KEY, parseInt, v => v === 0 || v === 1, null) ?? detectedDefaultCodec ?? 1;
+export const getStoredCodec = () => loadPref(CODEC_KEY, parseInt, v => v === 0 || v === 1 || v === 2, null) ?? detectedDefaultCodec ?? 0;
 
 export const updateFpsDropdown = fps => {
     const fpsNum = +fps, standardOpts = ['15', '30', '60', '120', '144'];
@@ -90,10 +90,10 @@ export const updateCodecOpts = async () => {
         const suffix = !supported ? ' (unsupported)' : hw ? ' (HW)' : ' (SW)';
         return `<option value="${c.id}" ${!supported ? 'disabled' : ''}>${c.name}${suffix}</option>`;
     }).join('');
-    const stored = loadPref(CODEC_KEY, parseInt, v => v === 0 || v === 1, null);
-    const codecToSelect = stored ?? detectedDefaultCodec ?? 1;
-    const selectedSupported = codecToSelect === 1 ? support.av1 : support.h264;
-    const finalCodec = selectedSupported ? codecToSelect : (support.av1 ? 1 : 0);
+    const stored = loadPref(CODEC_KEY, parseInt, v => v === 0 || v === 1 || v === 2, null);
+    const codecToSelect = stored ?? detectedDefaultCodec ?? 0;
+    const selectedSupported = codecToSelect === 0 ? support.av1 : codecToSelect === 1 ? support.h265 : support.h264;
+    const finalCodec = selectedSupported ? codecToSelect : (support.av1 ? 0 : support.h265 ? 1 : 2);
     codecSel.value = finalCodec; S.currentCodec = finalCodec;
 };
 
@@ -108,15 +108,13 @@ const renderTabs = () => {
     tabContainer.querySelectorAll('.tab-item').forEach(t => { t.onclick = () => { const i = +t.dataset.index; if (i !== S.currentMon && sendMonFn) sendMonFn(i); }; });
 };
 
-const triggerCanvasResize = () => setTimeout(() => window.dispatchEvent(new Event('resize')), 350);
-
 const updateTabbedModeUI = () => {
     tabbedModeBtn.classList.toggle('on', S.tabbedMode);
     document.body.classList.toggle('tabbed-mode', S.tabbedMode);
     const show = S.tabbedMode && S.monitors.length > 0;
     tabStrip.classList.toggle('visible', show);
     if (show) renderTabs();
-    triggerCanvasResize();
+    setTimeout(() => window.dispatchEvent(new Event('resize')), 350);
 };
 
 S.tabbedMode = localStorage.getItem(TABBED_KEY) === 'true';
@@ -151,7 +149,7 @@ const updateStatsDisplay = data => {
     $('statsFps').textContent = `${computed.fps}/${computed.targetFps} (${computed.fpsEff.toFixed(0)}%)`;
     $('statsBitrate').textContent = `${computed.mbps} Mbps`;
     $('statsResolution').textContent = S.W > 0 ? `${S.W}x${S.H}` : '--x--';
-    $('statsCodec').textContent = S.currentCodec === 1 ? `AV1 (${S.hwAccel})` : `H.264 (${S.hwAccel})`;
+    $('statsCodec').textContent = `${S.currentCodec === 0 ? 'AV1' : S.currentCodec === 1 ? 'H.265' : 'H.264'} (${S.hwAccel})`;
     $('statsRtt').textContent = clock.valid ? `${clock.rttMs.toFixed(1)} ms` : '-- ms';
     $('statsFrameAge').textContent = jitter.avgServerAgeMs > 0 ? `${jitter.avgServerAgeMs.toFixed(1)} ms` : '-- ms';
     $('statsRtt').parentElement.className = 'stats-row' + (clock.rttMs > 100 ? ' error' : clock.rttMs > 50 ? ' warn' : clock.rttMs > 0 ? ' highlight' : '');
@@ -215,10 +213,7 @@ updateRelativeMouseUI();
 
 window.addEventListener('pointerlockchange', e => { if (e.detail?.relativeMouseDisabled) { relativeMouseEnabled = false; updateRelativeMouseUI(); } });
 
-// Clipboard sync toggle
-const CLIPBOARD_KEY = 'slipstream_clipboard_sync';
-const clipboardSyncBtn = $('clipboardSyncBtn');
-const clipboardSyncHint = $('clipboardSyncHint');
+const clipboardSyncBtn = $('clipboardSyncBtn'), clipboardSyncHint = $('clipboardSyncHint');
 
 const updateClipboardSyncUI = () => {
     clipboardSyncBtn.classList.toggle('on', S.clipboardSyncEnabled);
