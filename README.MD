@@ -45,7 +45,7 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 |  | Opus 32kbps  |                                            | Capture  |    |
 |  +--------------+                                            +----------+    |
 |                                                                              |
-|  Input Handler -----> Mouse/Keyboard -----> Data Channel -----> Server      |
+|  Input Handler -----> Mouse/Keyboard -----> Data Channel -----> Server       |
 +------------------------------------------------------------------------------+
 ```
 
@@ -645,3 +645,4 @@ See LICENSE.txt for full terms.
 ## Copyright
 
 (c) 2025-2026 Daniel Chrobak. All rights reserved.
+
