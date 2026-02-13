@@ -2,297 +2,301 @@
 #include "common.hpp"
 
 struct FrameData {
-    ID3D11Texture2D* tex = nullptr;
-    int64_t ts = 0; uint64_t fence = 0; int poolIdx = -1; bool needsSync = false;
-    void Release() { SafeRelease(tex); poolIdx = -1; needsSync = false; }
+    ID3D11Texture2D* tex=nullptr;
+    int64_t ts=0; uint64_t fence=0; int poolIdx=-1; bool needsSync=false;
+    uint64_t generation=0;
+    void Release() { SafeRelease(tex); poolIdx=-1; needsSync=false; generation=0; }
 };
 
 class FrameSlot {
-    static constexpr int N = 4;
-    FrameData frames[N];
+    static constexpr int N=4;
+    FrameData fr[N];
     CRITICAL_SECTION cs;
     HANDLE evt;
-    int head = 0, tail = 0, count = 0;
-    uint32_t inFlight = 0;
+    int head=0,tail=0,cnt=0;
+    uint32_t inFlight=0;
+    std::atomic<uint64_t> curGen{0};
 public:
-    FrameSlot() { InitializeCriticalSection(&cs); evt = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
-    ~FrameSlot() { DeleteCriticalSection(&cs); CloseHandle(evt); for (int i = 0; i < N; i++) frames[i].Release(); }
+    FrameSlot() { InitializeCriticalSection(&cs); evt=CreateEventW(nullptr,FALSE,FALSE,nullptr); }
+    ~FrameSlot() { DeleteCriticalSection(&cs); CloseHandle(evt); for(int i=0;i<N;i++) fr[i].Release(); }
 
-    void Push(ID3D11Texture2D* tex, int64_t ts, uint64_t fence, bool sync, int idx = -1) {
+    void SetGeneration(uint64_t g) { curGen.store(g,std::memory_order_release); }
+    uint64_t GetGeneration() const { return curGen.load(std::memory_order_acquire); }
+
+    void Push(ID3D11Texture2D* tex,int64_t ts,uint64_t fence,bool sync,int idx=-1) {
         EnterCriticalSection(&cs);
-        if (count >= N) {
-            if (frames[tail].poolIdx >= 0) inFlight &= ~(1u << frames[tail].poolIdx);
-            frames[tail].Release(); tail = (tail + 1) % N; count--;
+        uint64_t gen=curGen.load(std::memory_order_acquire);
+        if(cnt>=N) {
+            VIDEO_DROP("FrameSlot queue full - dropping oldest | ts=%lld poolIdx=%d",fr[tail].ts,fr[tail].poolIdx);
+            if(fr[tail].poolIdx>=0) inFlight&=~(1u<<fr[tail].poolIdx);
+            fr[tail].Release(); tail=(tail+1)%N; cnt--;
         }
         tex->AddRef();
-        frames[head] = {tex, ts, fence, idx, sync};
-        if (idx >= 0) inFlight |= (1u << idx);
-        head = (head + 1) % N; count++;
+        fr[head]={tex,ts,fence,idx,sync,gen};
+        if(idx>=0) inFlight|=(1u<<idx);
+        head=(head+1)%N; cnt++;
         SetEvent(evt);
         LeaveCriticalSection(&cs);
     }
 
     bool Pop(FrameData& out) {
-        WaitForSingleObject(evt, INFINITE);
+        WaitForSingleObject(evt,INFINITE);
         EnterCriticalSection(&cs);
-        if (count == 0) { LeaveCriticalSection(&cs); return false; }
-        out = frames[tail]; frames[tail] = {};
-        tail = (tail + 1) % N; count--;
-        if (count > 0) SetEvent(evt);
+        if(cnt==0) { LeaveCriticalSection(&cs); return false; }
+        out=fr[tail]; fr[tail]={};
+        tail=(tail+1)%N; cnt--;
+        if(cnt>0) SetEvent(evt);
         LeaveCriticalSection(&cs);
         return true;
     }
 
     void Wake() { SetEvent(evt); }
-    void MarkReleased(int i) { if (i < 0) return; EnterCriticalSection(&cs); inFlight &= ~(1u << i); LeaveCriticalSection(&cs); }
-    bool IsInFlight(int i) { if (i < 0) return false; EnterCriticalSection(&cs); bool r = (inFlight & (1u << i)) != 0; LeaveCriticalSection(&cs); return r; }
+    void MarkReleased(int i) { if(i<0) return; EnterCriticalSection(&cs); inFlight&=~(1u<<i); LeaveCriticalSection(&cs); }
+    bool IsInFlight(int i) { if(i<0) return false; EnterCriticalSection(&cs); bool r=(inFlight&(1u<<i))!=0; LeaveCriticalSection(&cs); return r; }
 
     void Reset() {
         EnterCriticalSection(&cs);
-        for (int i = 0; i < N; i++) frames[i].Release();
-        head = tail = count = 0; inFlight = 0; ResetEvent(evt);
+        for(int i=0;i<N;i++) fr[i].Release();
+        head=tail=cnt=0; inFlight=0; ResetEvent(evt);
         LeaveCriticalSection(&cs);
     }
 };
 
 class GPUSync {
-    ID3D11Device5* dev5 = nullptr;
-    ID3D11DeviceContext4* ctx4 = nullptr;
-    ID3D11Fence* fence = nullptr;
-    HANDLE evt = nullptr;
-    uint64_t val = 0;
-    bool use = false;
+    ID3D11Device5* d5=nullptr;
+    ID3D11DeviceContext4* c4=nullptr;
+    ID3D11Fence* f=nullptr;
+    HANDLE evt=nullptr;
+    uint64_t val=0;
+    bool use=false;
 public:
-    bool Init(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
-        if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dev5))) &&
-            SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&ctx4))) &&
-            SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence)))) {
-            evt = CreateEventW(nullptr, FALSE, FALSE, nullptr); use = true;
-        } else SafeRelease(dev5, ctx4, fence);
-        return true;
+    bool Init(ID3D11Device* d,ID3D11DeviceContext* c) {
+        if(FAILED(d->QueryInterface(IID_PPV_ARGS(&d5)))) return true;
+        if(FAILED(c->QueryInterface(IID_PPV_ARGS(&c4)))) { SafeRelease(d5); return true; }
+        if(FAILED(d5->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&f)))) { SafeRelease(d5,c4); return true; }
+        evt=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        if(!evt) { SafeRelease(f,c4,d5); return false; }
+        use=true; return true;
     }
-    ~GPUSync() { if (evt) CloseHandle(evt); SafeRelease(fence, ctx4, dev5); }
+    ~GPUSync() { if(evt) CloseHandle(evt); SafeRelease(f,c4,d5); }
 
     uint64_t Signal(bool& sync) {
-        sync = true;
-        if (use && ctx4 && fence) { ctx4->Signal(fence, ++val); return val; }
+        sync=true;
+        if(use&&c4&&f) { c4->Signal(f,++val); return val; }
         return 0;
     }
 
-    bool Wait(uint64_t v, ID3D11DeviceContext* ctx, ID3D11Multithread* mt = nullptr, DWORD ms = 16) {
-        if (use && fence && evt) {
-            if (fence->GetCompletedValue() >= v) return true;
-            fence->SetEventOnCompletion(v, evt);
-            return WaitForSingleObject(evt, ms) == WAIT_OBJECT_0 || fence->GetCompletedValue() >= v;
+    bool Wait(uint64_t v,ID3D11DeviceContext* ctx,ID3D11Multithread* mt=nullptr,DWORD ms=16) {
+        if(use&&f&&evt) {
+            if(f->GetCompletedValue()>=v) return true;
+            f->SetEventOnCompletion(v,evt);
+            return WaitForSingleObject(evt,ms)==WAIT_OBJECT_0||f->GetCompletedValue()>=v;
         }
-        if (mt) { MTLock lk(mt); ctx->Flush(); } else ctx->Flush();
+        if(mt) { MTLock lk(mt); ctx->Flush(); } else ctx->Flush();
         return true;
     }
 
-    bool Complete(uint64_t v) const { return !use || !fence || fence->GetCompletedValue() >= v; }
+    bool Complete(uint64_t v) const { return !use||!f||f->GetCompletedValue()>=v; }
 };
 
 class ScreenCapture {
-    static constexpr int POOL = 6;
-    ID3D11Device* dev = nullptr;
-    ID3D11DeviceContext* ctx = nullptr;
-    ID3D11Multithread* mt = nullptr;
+    static constexpr int POOL=6;
+    ID3D11Device* dev=nullptr;
+    ID3D11DeviceContext* ctx=nullptr;
+    ID3D11Multithread* mt=nullptr;
     WGD::Direct3D11::IDirect3DDevice winrtDev{nullptr};
     WGC::GraphicsCaptureItem item{nullptr};
     WGC::Direct3D11CaptureFramePool pool{nullptr};
-    WGC::GraphicsCaptureSession session{nullptr};
-    ID3D11Texture2D* texPool[POOL] = {};
-    uint64_t texFences[POOL] = {};
-    int texIdx = 0, w = 0, h = 0, hostFps = 60;
-    std::atomic<int> targetFps{60}, monIdx{0};
+    WGC::GraphicsCaptureSession sess{nullptr};
+    ID3D11Texture2D* texPool[POOL]={};
+    uint64_t texFences[POOL]={};
+    int texIdx=0,w=0,h=0,hostFps=60;
+    std::atomic<int> targetFps{60},monIdx{0};
+    std::atomic<uint64_t> captureGen{0};
     GPUSync sync;
     FrameSlot* slot;
-    std::atomic<bool> running{true}, capturing{false}, started{false};
-    std::atomic<int> frameCallbackActive{0};  // Track active callbacks
-    HMONITOR curMon = nullptr;
-    std::recursive_mutex mtx;  // Changed to recursive_mutex for nested locking
-    std::function<void(int, int, int)> onResChange;
-    bool cursorCaptureEnabled = false;
+    std::atomic<bool> running{true},capturing{false},started{false};
+    std::atomic<int> cbActive{0};
+    HMONITOR curMon=nullptr;
+    std::recursive_mutex mtx;
+    std::function<void(int,int,int)> onResChange;
+    bool cursorCapture=false;
 
     int FindTex() {
-        for (int i = 0; i < POOL; i++) { int idx = (texIdx + i) % POOL; if (!slot->IsInFlight(idx) && sync.Complete(texFences[idx])) { texIdx = idx + 1; return idx; } }
-        for (int i = 0; i < POOL; i++) { int idx = (texIdx + i) % POOL; if (!slot->IsInFlight(idx)) { if (texFences[idx] > 0 && !sync.Complete(texFences[idx])) { MTLock lk(mt); sync.Wait(texFences[idx], ctx, mt, 4); } texIdx = idx + 1; return idx; } }
+        for(int i=0;i<POOL;i++) {
+            int idx=(texIdx+i)%POOL;
+            if(!slot->IsInFlight(idx)&&sync.Complete(texFences[idx])) { texIdx=idx+1; return idx; }
+        }
+        for(int i=0;i<POOL;i++) {
+            int idx=(texIdx+i)%POOL;
+            if(!slot->IsInFlight(idx)) {
+                if(texFences[idx]>0&&!sync.Complete(texFences[idx])) { MTLock lk(mt); sync.Wait(texFences[idx],ctx,mt,4); }
+                texIdx=idx+1; return idx;
+            }
+        }
+        VIDEO_DROP("No texture available in pool | poolSize=%d",POOL);
         return -1;
     }
 
-    void OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Windows::Foundation::IInspectable const&) {
-        // Early exit before acquiring lock
-        if (!running.load(std::memory_order_acquire) || !capturing.load(std::memory_order_acquire)) return;
+    void OnFrame(WGC::Direct3D11CaptureFramePool const& s,winrt::Windows::Foundation::IInspectable const&) {
+        if(!running.load(std::memory_order_acquire)||!capturing.load(std::memory_order_acquire)) return;
+        uint64_t gen=captureGen.load(std::memory_order_acquire);
+        cbActive.fetch_add(1,std::memory_order_acq_rel);
+        struct Guard { std::atomic<int>& c; ~Guard() { c.fetch_sub(1,std::memory_order_acq_rel); } } g{cbActive};
 
-        // Increment active callback count
-        frameCallbackActive.fetch_add(1, std::memory_order_acq_rel);
+        auto f=s.TryGetNextFrame();
+        if(!f) return;
 
-        // Ensure we decrement on exit
-        struct CallbackGuard {
-            std::atomic<int>& counter;
-            ~CallbackGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
-        } guard{frameCallbackActive};
-
-        auto f = s.TryGetNextFrame();
-        if (!f) return;
-
-        // Acquire lock for thread safety
         std::lock_guard<std::recursive_mutex> lk(mtx);
+        if(!running.load(std::memory_order_acquire)||!capturing.load(std::memory_order_acquire)) return;
+        if(gen!=captureGen.load(std::memory_order_acquire)) return;
 
-        // Re-check state after acquiring lock
-        if (!running.load(std::memory_order_acquire) || !capturing.load(std::memory_order_acquire)) return;
+        auto csz=f.ContentSize();
+        if(csz.Width!=w||csz.Height!=h) return;
 
-        int64_t ts = GetTimestamp();
-        auto surf = f.Surface(); if (!surf) return;
+        int64_t ts=GetTimestamp();
+        auto surf=f.Surface();
+        if(!surf) return;
         winrt::com_ptr<ID3D11Texture2D> src;
-        auto acc = surf.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-        if (FAILED(acc->GetInterface(IID_PPV_ARGS(src.put()))) || !src) return;
+        auto acc=surf.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        if(FAILED(acc->GetInterface(IID_PPV_ARGS(src.put())))||!src) return;
 
-        int ti = FindTex();
-        if (ti < 0 || ti >= POOL || !texPool[ti]) return;
+        D3D11_TEXTURE2D_DESC srcDesc; src->GetDesc(&srcDesc);
+        if(srcDesc.Width!=(UINT)w||srcDesc.Height!=(UINT)h) return;
 
-        bool ns = false; uint64_t fv = 0;
-        { MTLock mtLk(mt); ctx->CopyResource(texPool[ti], src.get()); ctx->Flush(); fv = sync.Signal(ns); }
-        texFences[ti] = fv;
-        slot->Push(texPool[ti], ts, fv, ns, ti);
+        int ti=FindTex();
+        if(ti<0||ti>=POOL||!texPool[ti]) return;
+
+        bool ns=false; uint64_t fv=0;
+        { MTLock l(mt); ctx->CopyResource(texPool[ti],src.get()); ctx->Flush(); fv=sync.Signal(ns); }
+        texFences[ti]=fv;
+        slot->Push(texPool[ti],ts,fv,ns,ti);
     }
 
-    void UpdateSessionInterval() {
-        if (!session) return;
-        int fps = targetFps.load(); if (fps <= 0) fps = 60;
-        try { session.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(10000000 / fps)); }
-        catch (...) { LOG("MinUpdateInterval not supported"); }
+    void UpdateInterval() {
+        if(!sess) return;
+        try { sess.MinUpdateInterval(duration<int64_t,std::ratio<1,10000000>>(0)); } catch(...) {}
     }
 
-    void WaitForCallbacksComplete(int timeoutMs = 500) {
-        auto start = steady_clock::now();
-        while (frameCallbackActive.load(std::memory_order_acquire) > 0) {
-            if (duration_cast<milliseconds>(steady_clock::now() - start).count() > timeoutMs) {
-                ERR("Timeout waiting for frame callbacks to complete");
-                break;
-            }
+    void WaitCB(int ms=500) {
+        auto st=steady_clock::now();
+        while(cbActive.load(std::memory_order_acquire)>0) {
+            if(duration_cast<milliseconds>(steady_clock::now()-st).count()>ms) break;
             std::this_thread::sleep_for(1ms);
         }
     }
 
-    void InitMon(HMONITOR mon, bool keepFps = false) {
-        MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize = sizeof(dm)};
-        if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hostFps = dm.dmDisplayFrequency;
-        if (!keepFps) targetFps = hostFps;
-        auto interop = winrt::get_activation_factory<WGC::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        if (FAILED(interop->CreateForMonitor(mon, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(), winrt::put_abi(item))))
+    void InitMon(HMONITOR mon,bool keepFps=false) {
+        MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize=sizeof(dm)};
+        if(GetMonitorInfoW(mon,&mi)&&EnumDisplaySettingsW(mi.szDevice,ENUM_CURRENT_SETTINGS,&dm)) hostFps=dm.dmDisplayFrequency;
+        if(!keepFps) targetFps=hostFps;
+        auto interop=winrt::get_activation_factory<WGC::GraphicsCaptureItem,IGraphicsCaptureItemInterop>();
+        if(FAILED(interop->CreateForMonitor(mon,winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),winrt::put_abi(item))))
             throw std::runtime_error("Capture item failed");
-        w = item.Size().Width; h = item.Size().Height;
-        for (auto& t : texPool) SafeRelease(t);
-        for (auto& f : texFences) f = 0;
-        D3D11_TEXTURE2D_DESC td = {(UINT)w, (UINT)h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_SHARED};
-        for (int i = 0; i < POOL; i++) if (FAILED(dev->CreateTexture2D(&td, nullptr, &texPool[i]))) throw std::runtime_error("Texture pool failed");
-        pool = WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(winrtDev, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, {w, h});
-        pool.FrameArrived({this, &ScreenCapture::OnFrame});
-        session = pool.CreateCaptureSession(item);
-        session.IsCursorCaptureEnabled(cursorCaptureEnabled);
-        try { session.IsBorderRequired(false); } catch (...) { LOG("IsBorderRequired not supported"); }
-        UpdateSessionInterval();
-        started = false; curMon = mon;
+        w=item.Size().Width; h=item.Size().Height;
+        for(auto& t:texPool) SafeRelease(t);
+        for(auto& f:texFences) f=0;
+        D3D11_TEXTURE2D_DESC td={(UINT)w,(UINT)h,1,1,DXGI_FORMAT_B8G8R8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET,0,D3D11_RESOURCE_MISC_SHARED};
+        for(int i=0;i<POOL;i++) if(FAILED(dev->CreateTexture2D(&td,nullptr,&texPool[i]))) throw std::runtime_error("Texture pool failed");
+        pool=WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(winrtDev,WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized,4,{w,h});
+        pool.FrameArrived({this,&ScreenCapture::OnFrame});
+        sess=pool.CreateCaptureSession(item);
+        sess.IsCursorCaptureEnabled(cursorCapture);
+        try { sess.IsBorderRequired(false); } catch(...) {}
+        UpdateInterval();
+        started=false; curMon=mon;
+        uint64_t newGen=captureGen.fetch_add(1,std::memory_order_acq_rel)+1;
+        slot->SetGeneration(newGen);
     }
 
 public:
-    explicit ScreenCapture(FrameSlot* s) : slot(s) {
+    explicit ScreenCapture(FrameSlot* s):slot(s) {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        D3D_FEATURE_LEVEL lvls[] = {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0}, act;
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, lvls, _countof(lvls), D3D11_SDK_VERSION, &dev, &act, &ctx)))
+        UINT flags=D3D11_CREATE_DEVICE_BGRA_SUPPORT|D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        D3D_FEATURE_LEVEL lvls[]={D3D_FEATURE_LEVEL_12_1,D3D_FEATURE_LEVEL_12_0,D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0},act;
+        if(FAILED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,flags,lvls,_countof(lvls),D3D11_SDK_VERSION,&dev,&act,&ctx)))
             throw std::runtime_error("D3D11 device failed");
-        if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&mt)))) mt->SetMultithreadProtected(TRUE);
-        if (!sync.Init(dev, ctx)) throw std::runtime_error("GPU sync failed");
+        if(SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&mt)))) mt->SetMultithreadProtected(TRUE);
+        if(!sync.Init(dev,ctx)) throw std::runtime_error("GPU sync failed");
         winrt::com_ptr<IDXGIDevice> dxgi; winrt::com_ptr<::IInspectable> insp;
-        if (FAILED(dev->QueryInterface(IID_PPV_ARGS(dxgi.put()))) || FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), insp.put())))
+        if(FAILED(dev->QueryInterface(IID_PPV_ARGS(dxgi.put())))||FAILED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(),insp.put())))
             throw std::runtime_error("WinRT device failed");
-        winrtDev = insp.as<WGD::Direct3D11::IDirect3DDevice>();
+        winrtDev=insp.as<WGD::Direct3D11::IDirect3DDevice>();
         RefreshMonitorList();
-        cursorCaptureEnabled = false;
-        InitMon(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
-        LOG("Capture: %dx%d @ %dHz", w, h, hostFps);
+        cursorCapture=false;
+        InitMon(MonitorFromPoint({0,0},MONITOR_DEFAULTTOPRIMARY));
+        LOG("Capture: %dx%d @ %dHz",w,h,hostFps);
     }
 
     ~ScreenCapture() {
-        // Signal shutdown first
-        running.store(false, std::memory_order_release);
-        capturing.store(false, std::memory_order_release);
-
-        // Acquire lock to ensure no callbacks are modifying state
+        running.store(false,std::memory_order_release);
+        capturing.store(false,std::memory_order_release);
+        captureGen.fetch_add(1,std::memory_order_release);
         std::lock_guard<std::recursive_mutex> lk(mtx);
-
-        // Close session and pool first to stop new callbacks
-        try { if (session) session.Close(); } catch (...) { ERR("Session close failed"); }
-        try { if (pool) pool.Close(); } catch (...) { ERR("Pool close failed"); }
-        session = nullptr;
-        pool = nullptr;
-
-        // Wait for any in-flight callbacks to complete
-        WaitForCallbacksComplete();
-
-        // Now safe to release textures
-        for (auto& t : texPool) SafeRelease(t);
-        SafeRelease(mt, ctx, dev);
+        try { if(sess) sess.Close(); } catch(...) {}
+        try { if(pool) pool.Close(); } catch(...) {}
+        sess=nullptr; pool=nullptr;
+        WaitCB();
+        for(auto& t:texPool) SafeRelease(t);
+        SafeRelease(mt,ctx,dev);
         winrt::uninit_apartment();
     }
 
-    void SetResolutionChangeCallback(std::function<void(int, int, int)> cb) { onResChange = cb; }
+    void SetResolutionChangeCallback(std::function<void(int,int,int)> cb) { onResChange=cb; }
 
     void StartCapture() {
         std::lock_guard<std::recursive_mutex> lk(mtx);
-        if (capturing) return;
-        slot->Reset(); texIdx = 0;
-        for (auto& f : texFences) f = 0;
-        if (!started.exchange(true)) session.StartCapture();
-        capturing.store(true, std::memory_order_release);
+        if(capturing) return;
+        slot->Reset(); texIdx=0;
+        for(auto& f:texFences) f=0;
+        if(!started.exchange(true)) sess.StartCapture();
+        capturing.store(true,std::memory_order_release);
     }
 
-    void PauseCapture() { capturing.store(false, std::memory_order_release); }
+    void PauseCapture() { capturing.store(false,std::memory_order_release); }
 
     bool SwitchMonitor(int i) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
         std::lock_guard<std::mutex> ml(g_monitorsMutex);
-        if (i < 0 || i >= (int)g_monitors.size()) return false;
-        if (monIdx == i && curMon == g_monitors[i].hMon) return true;
-        bool was = capturing.load(std::memory_order_acquire);
+        if(i<0||i>=(int)g_monitors.size()) return false;
+        if(monIdx==i&&curMon==g_monitors[i].hMon) return true;
+        bool was=capturing.load(std::memory_order_acquire);
+        capturing.store(false,std::memory_order_release);
 
-        // Stop capturing and wait for callbacks
-        capturing.store(false, std::memory_order_release);
+        // Increment generation and signal BEFORE cleanup - lets encoding thread drop held frames
+        uint64_t newGen=captureGen.fetch_add(1,std::memory_order_acq_rel)+1;
+        slot->SetGeneration(newGen);
+        slot->Wake(); // Wake encoding thread so it can detect generation change
 
-        // Close session and pool
-        try { if (session) session.Close(); } catch (...) { ERR("Session close failed during switch"); }
-        try { if (pool) pool.Close(); } catch (...) { ERR("Pool close failed during switch"); }
-        session = nullptr; pool = nullptr; item = nullptr;
+        try { if(sess) sess.Close(); } catch(...) {}
+        try { if(pool) pool.Close(); } catch(...) {}
+        sess=nullptr; pool=nullptr; item=nullptr;
+        WaitCB();
 
-        // Wait for any pending callbacks to complete before releasing textures
-        WaitForCallbacksComplete();
+        // Small delay to allow encoding thread to process generation change and release frames
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        slot->Wake();
 
-        slot->Reset(); texIdx = 0;
+        slot->Reset(); texIdx=0;
         try {
-            InitMon(g_monitors[i].hMon, true);
-            monIdx = i;
-            if (onResChange) onResChange(w, h, targetFps.load());
-            if (was) { session.StartCapture(); started = true; capturing.store(true, std::memory_order_release); }
+            InitMon(g_monitors[i].hMon,true);
+            monIdx=i;
+            if(onResChange) onResChange(w,h,targetFps.load());
+            if(was) { sess.StartCapture(); started=true; capturing.store(true,std::memory_order_release); }
             return true;
-        } catch (const std::exception& e) { ERR("SwitchMonitor failed: %s", e.what()); return false; }
-        catch (...) { ERR("SwitchMonitor failed: unknown error"); return false; }
+        } catch(...) { return false; }
     }
 
     bool SetFPS(int fps) {
-        if (fps < 1 || fps > 240) return false;
-        int old = targetFps.exchange(fps);
-        if (old != fps) {
-            std::lock_guard<std::recursive_mutex> lk(mtx);
-            UpdateSessionInterval();
-        }
+        if(fps<1||fps>240) return false;
+        int old=targetFps.exchange(fps);
+        if(old!=fps) { std::lock_guard<std::recursive_mutex> lk(mtx); UpdateInterval(); }
         return true;
     }
 
     int RefreshHostFPS() {
         std::lock_guard<std::recursive_mutex> lk(mtx);
-        if (curMon) { MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize = sizeof(dm)}; if (GetMonitorInfoW(curMon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hostFps = dm.dmDisplayFrequency; }
+        if(curMon) { MONITORINFOEXW mi{sizeof(mi)}; DEVMODEW dm{.dmSize=sizeof(dm)}; if(GetMonitorInfoW(curMon,&mi)&&EnumDisplaySettingsW(mi.szDevice,ENUM_CURRENT_SETTINGS,&dm)) hostFps=dm.dmDisplayFrequency; }
         return hostFps;
     }
 
@@ -300,16 +304,18 @@ public:
     int GetHostFPS() const { return hostFps; }
     int GetCurrentFPS() const { return targetFps.load(std::memory_order_acquire); }
     bool IsCapturing() const { return capturing.load(std::memory_order_acquire); }
-    bool WaitReady(uint64_t f) { return sync.Wait(f, ctx, mt, 16); }
+    bool WaitReady(uint64_t f) { return sync.Wait(f,ctx,mt,16); }
     ID3D11Device* GetDev() const { return dev; }
     ID3D11DeviceContext* GetCtx() const { return ctx; }
     ID3D11Multithread* GetMT() const { return mt; }
     int GetW() const { return w; }
     int GetH() const { return h; }
 
-    void SetCursorCapture(bool enabled) {
+    uint64_t GetGeneration() const { return captureGen.load(std::memory_order_acquire); }
+
+    void SetCursorCapture(bool en) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
-        cursorCaptureEnabled = enabled;
-        if (session) { try { session.IsCursorCaptureEnabled(cursorCaptureEnabled); } catch (...) { LOG("SetCursorCapture failed"); } }
+        cursorCapture=en;
+        if(sess) { try { sess.IsCursorCaptureEnabled(cursorCapture); } catch(...) {} }
     }
 };
