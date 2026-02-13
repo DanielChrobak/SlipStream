@@ -4,14 +4,11 @@ export const MSG = {
     AUDIO_DATA: 0x41554449, MOUSE_MOVE: 0x4D4F5645, MOUSE_BTN: 0x4D42544E,
     MOUSE_WHEEL: 0x4D57484C, KEY: 0x4B455920, CODEC_SET: 0x434F4443, CODEC_ACK: 0x434F4441,
     MOUSE_MOVE_REL: 0x4D4F5652, CLIPBOARD_DATA: 0x434C4950, CLIPBOARD_GET: 0x434C4754,
-    KICKED: 0x4B49434B, CURSOR_CAPTURE: 0x43555243, CURSOR_SHAPE: 0x43555253
+    KICKED: 0x4B49434B, CURSOR_CAPTURE: 0x43555243, CURSOR_SHAPE: 0x43555253, AUDIO_ENABLE: 0x41554445,
+    MIC_DATA: 0x4D494344, MIC_ENABLE: 0x4D494345
 };
 
-export const CURSOR_TYPES = {
-    0:'default',1:'text',2:'pointer',3:'wait',4:'progress',5:'crosshair',6:'move',
-    7:'ew-resize',8:'ns-resize',9:'nwse-resize',10:'nesw-resize',11:'not-allowed',
-    12:'help',13:'none',255:'default'
-};
+export const CURSOR_TYPES = {0:'default',1:'text',2:'pointer',3:'wait',4:'progress',5:'crosshair',6:'move',7:'ew-resize',8:'ns-resize',9:'nwse-resize',10:'nesw-resize',11:'not-allowed',12:'help',13:'none',255:'default'};
 
 export const CODECS = {
     AV1: { id: 0, name: 'AV1', codec: 'av01.0.05M.08' },
@@ -19,68 +16,85 @@ export const CODECS = {
     H264: { id: 2, name: 'H.264', codec: 'avc1.42001f' }
 };
 
+// Simplified logging - level 0=err,1=warn,2=info,3=dbg
+const LL = 2, LM = ['error','warn','info','log'];
+const _log = (l, m, msg, d) => l <= LL && console[LM[l]](`[${m}] ${msg}`, d && Object.keys(d).length ? d : '');
+export const log = {
+    error: (m, msg, d) => _log(0, m, msg, d),
+    warn: (m, msg, d) => _log(1, m, msg, d),
+    info: (m, msg, d) => _log(2, m, msg, d),
+    debug: (m, msg, d) => _log(3, m, msg, d)
+};
+
+// Universal safe executor - replaces all try-catch patterns
+export const safe = (fn, fallback) => { try { return fn(); } catch(e) { log.warn('ERR', e.message); return fallback; } };
+export const safeAsync = async (fn, fallback) => { try { return await fn(); } catch(e) { log.warn('ERR', e.message); return fallback; } };
+
+// Drop loggers with stats increment
+export const logVideoDrop = (r, d) => { log.warn('VIDEO', r, d); S.stats.framesDropped++; };
+export const logAudioDrop = (r, d) => { log.warn('AUDIO', r, d); S.audioMetrics.packetsDropped++; };
+export const logNetworkDrop = (r, d) => log.warn('NET', r, d);
+
 let codecCache = null;
 export const detectCodecs = async () => {
     if (codecCache) return codecCache;
-    const support = { av1: false, h265: false, h264: false, av1Hw: false, h265Hw: false, h264Hw: false };
-    if (!window.VideoDecoder) return codecCache = { support, best: { codecId: 2, hardwareAccel: false, codecName: 'H.264' } };
+    const sup = { av1: 0, h265: 0, h264: 0, av1Hw: 0, h265Hw: 0, h264Hw: 0 };
+    if (!window.VideoDecoder) return codecCache = { support: sup, best: { codecId: 2, hardwareAccel: 0, codecName: 'H.264' } };
     for (const [key, info] of Object.entries(CODECS)) {
         const k = key.toLowerCase();
-        for (const hw of [true, false]) {
-            try {
-                const r = await VideoDecoder.isConfigSupported({ codec: info.codec, optimizeForLatency: true, hardwareAcceleration: hw ? 'prefer-hardware' : 'prefer-software' });
-                if (r.supported) { support[k] = true; if (hw) support[`${k}Hw`] = true; }
-            } catch (e) { console.warn(`[State] Codec check failed for ${key} (${hw ? 'HW' : 'SW'}):`, e.message); }
+        for (const hw of [1, 0]) {
+            const r = await safeAsync(() => VideoDecoder.isConfigSupported({ codec: info.codec, optimizeForLatency: 1, hardwareAcceleration: hw ? 'prefer-hardware' : 'prefer-software' }));
+            if (r?.supported) { sup[k] = 1; if (hw) sup[k+'Hw'] = 1; }
         }
     }
-    const best = support.av1Hw ? { codecId: 0, hardwareAccel: true, codecName: 'AV1' }
-        : support.av1 ? { codecId: 0, hardwareAccel: false, codecName: 'AV1' }
-        : support.h265Hw ? { codecId: 1, hardwareAccel: true, codecName: 'H.265' }
-        : support.h265 ? { codecId: 1, hardwareAccel: false, codecName: 'H.265' }
-        : support.h264Hw ? { codecId: 2, hardwareAccel: true, codecName: 'H.264' }
-        : { codecId: 2, hardwareAccel: false, codecName: 'H.264' };
-    return codecCache = { support, best };
+    const best = sup.av1Hw ? { codecId: 0, hardwareAccel: 1, codecName: 'AV1' }
+        : sup.av1 ? { codecId: 0, hardwareAccel: 0, codecName: 'AV1' }
+        : sup.h265Hw ? { codecId: 1, hardwareAccel: 1, codecName: 'H.265' }
+        : sup.h265 ? { codecId: 1, hardwareAccel: 0, codecName: 'H.265' }
+        : { codecId: 2, hardwareAccel: sup.h264Hw, codecName: 'H.264' };
+    return codecCache = { support: sup, best };
 };
 
 export const C = {
     HEADER: 21, AUDIO_HEADER: 16, PING_MS: 200, MAX_FRAMES: 8, FRAME_TIMEOUT_MS: 200,
-    AUDIO_RATE: 48000, AUDIO_CH: 2,
-    DC_CONTROL: { ordered: true, maxRetransmits: 3 },
-    DC_VIDEO: { ordered: false, maxRetransmits: 0 },
-    DC_AUDIO: { ordered: false, maxRetransmits: 0 },
-    DC_INPUT: { ordered: true, maxRetransmits: 3 },
+    AUDIO_RATE: 48000, AUDIO_CH: 2, MIC_HEADER: 16, MIC_RATE: 48000, MIC_CH: 1, MIC_FRAME_MS: 10,
+    DC_CONTROL: { ordered: 1, maxRetransmits: 3 }, DC_VIDEO: { ordered: 1, maxRetransmits: 1 },
+    DC_AUDIO: { ordered: 1, maxRetransmits: 1 }, DC_INPUT: { ordered: 1, maxRetransmits: 3 },
+    DC_MIC: { ordered: 1, maxRetransmits: 1 },
     JITTER_MAX_AGE_MS: 50, JITTER_SAMPLES: 60, CLOCK_OFFSET_SAMPLES: 8, METRICS_LOG_INTERVAL_MS: 1000
 };
 
-const mkClockSync = () => ({ offset: 0, offsetSamples: [], rttSamples: [], valid: false, sampleCount: 0, avgRttUs: 0 });
-const mkJitterMetrics = () => ({ framesDroppedLate: 0, frameAgeSum: 0, frameAgeSamples: 0, presentIntervals: [], lastPresentTs: 0, serverAgeSum: 0, serverAgeSamples: 0, avgFrameAgeMs: 0, avgServerAgeMs: 0, intervalStdDev: 0, intervalMean: 0 });
-const mkStats = () => ({ bytes: 0, moves: 0, clicks: 0, keys: 0, framesComplete: 0, framesDropped: 0, framesTimeout: 0, keyframesReceived: 0, decodeErrors: 0, renderErrors: 0, lastUpdate: performance.now() });
-const mkAudioMetrics = () => ({ packetsReceived: 0, packetsDecoded: 0, packetsDropped: 0, bufferUnderruns: 0, bufferOverflows: 0, bufferHealthSum: 0, bufferHealthSamples: 0 });
+// Generic metric factory
+const mkMetric = defs => () => ({ ...defs });
+const mkClockSync = mkMetric({ offset: 0, offsetSamples: [], rttSamples: [], valid: 0, sampleCount: 0, avgRttUs: 0 });
+const mkJitter = mkMetric({ framesDroppedLate: 0, frameAgeSum: 0, frameAgeSamples: 0, presentIntervals: [], lastPresentTs: 0, serverAgeSum: 0, serverAgeSamples: 0, avgFrameAgeMs: 0, avgServerAgeMs: 0, intervalStdDev: 0, intervalMean: 0 });
+const mkStats = mkMetric({ bytes: 0, moves: 0, clicks: 0, keys: 0, framesComplete: 0, framesDropped: 0, framesTimeout: 0, keyframesReceived: 0, decodeErrors: 0, renderErrors: 0, lastUpdate: 0 });
+const mkAudio = mkMetric({ packetsReceived: 0, packetsDecoded: 0, packetsDropped: 0, bufferUnderruns: 0, bufferOverflows: 0, bufferHealthSum: 0, bufferHealthSamples: 0 });
+const mkNetwork = mkMetric({ packetsReceived: 0, videoPackets: 0, controlPackets: 0, audioPackets: 0, micPackets: 0, bytesReceived: 0 });
+const mkDecode = mkMetric({ decodeCount: 0, decodeTimeSum: 0, maxQueueSize: 0 });
+const mkRender = mkMetric({ renderCount: 0, renderTimeSum: 0 });
+const mkMic = mkMetric({ packetsSent: 0, packetsDropped: 0, encodeErrors: 0, bytesSent: 0 });
 
 export const S = {
-    pc: null, dcControl: null, dcVideo: null, dcAudio: null, dcInput: null,
-    decoder: null, ready: false, needKey: true, reinit: false, hwAccel: 'unknown',
-    W: 0, H: 0, hostFps: 60, currentFps: 60, currentFpsMode: 0, fpsSent: false,
-    authenticated: false, monitors: [], currentMon: 0, tabbedMode: false,
-    audioCtx: null, audioEnabled: false, audioDecoder: null, audioGain: null,
-    controlEnabled: false, lastVp: { x: 0, y: 0, w: 0, h: 0 },
-    relativeMouseMode: false, pointerLocked: false,
-    isReconnecting: false, firstFrameReceived: false,
-    currentCodec: 1, codecSent: false, stats: mkStats(), clipboardSyncEnabled: false,
+    pc: null, dcControl: null, dcVideo: null, dcAudio: null, dcInput: null, dcMic: null,
+    decoder: null, ready: 0, needKey: 1, reinit: 0, hwAccel: 'unknown',
+    W: 0, H: 0, hostFps: 60, currentFps: 60, currentFpsMode: 0, fpsSent: 0,
+    authenticated: 0, monitors: [], currentMon: 0, tabbedMode: 0,
+    audioCtx: null, audioEnabled: 0, audioDecoder: null, audioGain: null,
+    controlEnabled: 0, lastVp: { x: 0, y: 0, w: 0, h: 0 },
+    relativeMouseMode: 0, pointerLocked: 0, isReconnecting: 0, firstFrameReceived: 0,
+    currentCodec: 1, codecSent: 0, stats: { ...mkStats(), lastUpdate: performance.now() }, clipboardSyncEnabled: 0,
     chunks: new Map(), frameMeta: new Map(), lastFrameId: 0, username: null,
-    clockSync: mkClockSync(), jitterMetrics: mkJitterMetrics(),
-    networkMetrics: { packetsReceived: 0, videoPackets: 0, controlPackets: 0, audioPackets: 0, bytesReceived: 0 },
-    decodeMetrics: { decodeCount: 0, decodeTimeSum: 0, maxQueueSize: 0 },
-    renderMetrics: { renderCount: 0, renderTimeSum: 0 },
-    audioMetrics: mkAudioMetrics(), tabVisible: true
+    clockSync: mkClockSync(), jitterMetrics: mkJitter(),
+    networkMetrics: mkNetwork(), decodeMetrics: mkDecode(),
+    renderMetrics: mkRender(), audioMetrics: mkAudio(),
+    micMetrics: mkMic(), micEnabled: 0, micStream: null
 };
 
-export const allChannelsOpen = () => S.dcControl?.readyState === 'open' && S.dcVideo?.readyState === 'open' && S.dcAudio?.readyState === 'open' && S.dcInput?.readyState === 'open';
 export const $ = id => document.getElementById(id);
 export const mkBuf = (sz, fn) => { const b = new ArrayBuffer(sz); fn(new DataView(b)); return b; };
 export const clientTimeUs = () => Math.floor((performance.timeOrigin + performance.now()) * 1000);
 export const serverFrameAgeMs = ts => S.clockSync.valid ? Math.max(0, (clientTimeUs() - (ts - S.clockSync.offset)) / 1000) : 0;
-export const logVideoDrop = reason => console.warn(`[Video Drop] ${reason}`);
 
 const median = arr => [...arr].sort((a, b) => a - b)[Math.floor(arr.length / 2)];
 
@@ -99,101 +113,70 @@ export const updateClockOffset = (clientSendUs, serverTimeUs, clientRecvUs) => {
 export const resetClockSync = () => { S.clockSync = mkClockSync(); };
 export const getClockSyncStats = () => ({ offsetMs: S.clockSync.offset / 1000, rttMs: S.clockSync.avgRttUs / 1000, samples: S.clockSync.sampleCount, valid: S.clockSync.valid });
 
-export const resetStats = () => {
-    const result = { ...S.stats, elapsed: performance.now() - S.stats.lastUpdate };
-    S.stats = mkStats();
-    return result;
-};
+// Unified metric reset with computed fields
+export const resetStats = () => { const r = { ...S.stats, elapsed: performance.now() - S.stats.lastUpdate }; S.stats = { ...mkStats(), lastUpdate: performance.now() }; return r; };
 
 export const resetJitterMetrics = () => {
     const m = S.jitterMetrics;
     m.avgFrameAgeMs = m.frameAgeSamples > 0 ? m.frameAgeSum / m.frameAgeSamples : 0;
     m.avgServerAgeMs = m.serverAgeSamples > 0 ? m.serverAgeSum / m.serverAgeSamples : 0;
     if (m.presentIntervals.length > 1) {
-        const mean = m.presentIntervals.reduce((a, b) => a + b, 0) / m.presentIntervals.length;
-        m.intervalMean = mean;
-        m.intervalStdDev = Math.sqrt(m.presentIntervals.reduce((s, v) => s + (v - mean) ** 2, 0) / m.presentIntervals.length);
+        const n = m.presentIntervals.reduce((a, b) => a + b, 0) / m.presentIntervals.length;
+        m.intervalMean = n;
+        m.intervalStdDev = Math.sqrt(m.presentIntervals.reduce((s, v) => s + (v - n) ** 2, 0) / m.presentIntervals.length);
     }
-    const result = { avgFrameAgeMs: m.avgFrameAgeMs, avgServerAgeMs: m.avgServerAgeMs, intervalMean: m.intervalMean, intervalStdDev: m.intervalStdDev, framesDroppedLate: m.framesDroppedLate };
-    Object.assign(m, mkJitterMetrics(), { lastPresentTs: m.lastPresentTs });
-    return result;
+    const lt = m.lastPresentTs;
+    const r = { avgFrameAgeMs: m.avgFrameAgeMs, avgServerAgeMs: m.avgServerAgeMs, intervalMean: m.intervalMean, intervalStdDev: m.intervalStdDev, framesDroppedLate: m.framesDroppedLate };
+    S.jitterMetrics = { ...mkJitter(), lastPresentTs: lt };
+    return r;
 };
 
-export const resetNetworkMetrics = () => {
-    const m = S.networkMetrics;
-    const result = { packetsReceived: m.packetsReceived, videoPackets: m.videoPackets, controlPackets: m.controlPackets, audioPackets: m.audioPackets, bytesReceived: m.bytesReceived, avgPacketSize: m.packetsReceived > 0 ? m.bytesReceived / m.packetsReceived : 0 };
-    Object.assign(m, { packetsReceived: 0, videoPackets: 0, controlPackets: 0, audioPackets: 0, bytesReceived: 0 });
-    return result;
-};
+const avgMetric = (m, sum, count) => count > 0 ? sum / count : 0;
+export const resetNetworkMetrics = () => { const m = S.networkMetrics; const r = { ...m, avgPacketSize: avgMetric(m, m.bytesReceived, m.packetsReceived) }; S.networkMetrics = mkNetwork(); return r; };
+export const resetDecodeMetrics = () => { const m = S.decodeMetrics; const r = { ...m, avgDecodeTimeMs: avgMetric(m, m.decodeTimeSum, m.decodeCount) }; S.decodeMetrics = mkDecode(); return r; };
+export const resetRenderMetrics = () => { const m = S.renderMetrics; const r = { ...m, avgRenderTimeMs: avgMetric(m, m.renderTimeSum, m.renderCount) }; S.renderMetrics = mkRender(); return r; };
+export const resetAudioMetrics = () => { const m = S.audioMetrics; const r = { ...m, avgBufferHealth: avgMetric(m, m.bufferHealthSum, m.bufferHealthSamples) }; S.audioMetrics = mkAudio(); return r; };
+export const resetMicMetrics = () => { const r = { ...S.micMetrics }; S.micMetrics = mkMic(); return r; };
 
-export const resetDecodeMetrics = () => {
-    const m = S.decodeMetrics;
-    const result = { decodeCount: m.decodeCount, maxQueueSize: m.maxQueueSize, avgDecodeTimeMs: m.decodeCount > 0 ? m.decodeTimeSum / m.decodeCount : 0 };
-    Object.assign(m, { decodeCount: 0, decodeTimeSum: 0, maxQueueSize: 0 });
-    return result;
-};
-
-export const resetRenderMetrics = () => {
-    const m = S.renderMetrics;
-    const result = { renderCount: m.renderCount, avgRenderTimeMs: m.renderCount > 0 ? m.renderTimeSum / m.renderCount : 0 };
-    Object.assign(m, { renderCount: 0, renderTimeSum: 0 });
-    return result;
-};
-
-export const resetAudioMetrics = () => {
-    const m = S.audioMetrics;
-    const result = { packetsReceived: m.packetsReceived, packetsDecoded: m.packetsDecoded, packetsDropped: m.packetsDropped, bufferUnderruns: m.bufferUnderruns, bufferOverflows: m.bufferOverflows, avgBufferHealth: m.bufferHealthSamples > 0 ? m.bufferHealthSum / m.bufferHealthSamples : 0 };
-    Object.assign(m, mkAudioMetrics());
-    return result;
-};
-
-export const recordAudioPacket = () => { S.audioMetrics.packetsReceived++; };
-export const recordAudioDecoded = () => { S.audioMetrics.packetsDecoded++; };
-export const recordAudioDrop = () => { S.audioMetrics.packetsDropped++; };
+// Simplified metric recorders
+export const recordAudioPacket = () => S.audioMetrics.packetsReceived++;
+export const recordAudioDecoded = () => S.audioMetrics.packetsDecoded++;
 export const recordAudioBufferHealth = h => { S.audioMetrics.bufferHealthSum += h; S.audioMetrics.bufferHealthSamples++; };
-export const recordAudioUnderrun = () => { S.audioMetrics.bufferUnderruns++; };
-export const recordAudioOverflow = () => { S.audioMetrics.bufferOverflows++; };
+export const recordAudioUnderrun = () => S.audioMetrics.bufferUnderruns++;
+export const recordAudioOverflow = () => S.audioMetrics.bufferOverflows++;
+export const recordMicPacket = b => { S.micMetrics.packetsSent++; S.micMetrics.bytesSent += b; };
+export const recordMicEncodeError = () => S.micMetrics.encodeErrors++;
 
-export const recordPacket = (size, type) => {
+export const recordPacket = (sz, t) => {
     const m = S.networkMetrics;
-    m.packetsReceived++; m.bytesReceived += size;
-    m[type === 'video' ? 'videoPackets' : type === 'audio' ? 'audioPackets' : 'controlPackets']++;
+    m.packetsReceived++; m.bytesReceived += sz;
+    m[t === 'video' ? 'videoPackets' : t === 'audio' ? 'audioPackets' : t === 'mic' ? 'micPackets' : 'controlPackets']++;
 };
 
-export const recordDecodeTime = (timeMs, queueSize) => {
-    S.decodeMetrics.decodeCount++; S.decodeMetrics.decodeTimeSum += timeMs;
-    S.decodeMetrics.maxQueueSize = Math.max(S.decodeMetrics.maxQueueSize, queueSize);
-};
+export const recordDecodeTime = (t, q) => { S.decodeMetrics.decodeCount++; S.decodeMetrics.decodeTimeSum += t; S.decodeMetrics.maxQueueSize = Math.max(S.decodeMetrics.maxQueueSize, q); };
+export const recordRenderTime = t => { S.renderMetrics.renderCount++; S.renderMetrics.renderTimeSum += t; };
 
-export const recordRenderTime = timeMs => { S.renderMetrics.renderCount++; S.renderMetrics.renderTimeSum += timeMs; };
+let metricsSubs = [], metricsInt = null, uptime = 0, sesFrames = 0, sesBytes = 0, sesDrops = 0;
 
-let metricsSubscribers = [], metricsLogInterval = null, uptimeSeconds = 0;
-let sessionTotalFrames = 0, sessionTotalBytes = 0, sessionTotalDrops = 0, sessionTotalKeyframes = 0, sessionTotalDecodeErrors = 0;
+export const subscribeToMetrics = cb => { metricsSubs.push(cb); return () => { metricsSubs = metricsSubs.filter(c => c !== cb); }; };
 
-export const subscribeToMetrics = callback => {
-    metricsSubscribers.push(callback);
-    return () => { metricsSubscribers = metricsSubscribers.filter(cb => cb !== callback); };
-};
+const allOpen = () => ['dcControl', 'dcVideo', 'dcAudio', 'dcInput', 'dcMic'].every(k => S[k]?.readyState === 'open');
 
 export const startMetricsLogger = () => {
-    if (metricsLogInterval) return;
-    uptimeSeconds = 0;
-    metricsLogInterval = setInterval(() => {
-        uptimeSeconds++;
-        if (!allChannelsOpen()) return;
+    if (metricsInt) return;
+    uptime = 0;
+    metricsInt = setInterval(() => {
+        uptime++;
+        if (!allOpen()) return;
         const stats = resetStats(), jitter = resetJitterMetrics(), clock = getClockSyncStats();
-        const network = resetNetworkMetrics(), decode = resetDecodeMetrics(), render = resetRenderMetrics(), audio = resetAudioMetrics();
-        sessionTotalFrames += stats.framesComplete;
-        sessionTotalBytes += stats.bytes;
-        sessionTotalDrops += stats.framesDropped + jitter.framesDroppedLate;
-        sessionTotalKeyframes += stats.keyframesReceived;
-        sessionTotalDecodeErrors += stats.decodeErrors;
-        const fps = stats.framesComplete, targetFps = S.currentFps || 60;
-        const session = { totalFrames: sessionTotalFrames, totalBytes: sessionTotalBytes, totalDrops: sessionTotalDrops, totalKeyframes: sessionTotalKeyframes, totalDecodeErrors: sessionTotalDecodeErrors };
-        const computed = { fps, targetFps, fpsEff: targetFps > 0 ? (fps / targetFps) * 100 : 0, mbps: (stats.bytes * 8 / 1048576).toFixed(2) };
-        metricsSubscribers.forEach(cb => { try { cb({ uptime: uptimeSeconds, stats, jitter, clock, network, decode, render, audio, session, computed }); } catch (e) { console.warn('[State] Metrics subscriber error:', e.message); } });
+        const network = resetNetworkMetrics(), decode = resetDecodeMetrics(), render = resetRenderMetrics(), audio = resetAudioMetrics(), mic = resetMicMetrics();
+        sesFrames += stats.framesComplete; sesBytes += stats.bytes; sesDrops += stats.framesDropped + jitter.framesDroppedLate;
+        const fps = stats.framesComplete, tFps = S.currentFps || 60;
+        const session = { totalFrames: sesFrames, totalBytes: sesBytes, totalDrops: sesDrops };
+        const computed = { fps, targetFps: tFps, fpsEff: tFps > 0 ? (fps / tFps) * 100 : 0, mbps: (stats.bytes * 8 / 1048576).toFixed(2) };
+        metricsSubs.forEach(cb => safe(() => cb({ uptime, stats, jitter, clock, network, decode, render, audio, mic, session, computed })));
     }, C.METRICS_LOG_INTERVAL_MS);
 };
 
-export const stopMetricsLogger = () => { clearInterval(metricsLogInterval); metricsLogInterval = null; };
-export const resetSessionStats = () => { uptimeSeconds = sessionTotalFrames = sessionTotalBytes = sessionTotalDrops = sessionTotalKeyframes = sessionTotalDecodeErrors = 0; };
+export const stopMetricsLogger = () => { clearInterval(metricsInt); metricsInt = null; };
+export const resetSessionStats = () => { uptime = sesFrames = sesBytes = sesDrops = 0; };
