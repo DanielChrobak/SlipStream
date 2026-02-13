@@ -29,6 +29,7 @@ add_executable(SlipStream
     include/webrtc.hpp
     include/audio.hpp
     include/input.hpp
+    include/mic.hpp
 )
 
 target_compile_definitions(SlipStream PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -51,7 +52,7 @@ endforeach()
 
 add_custom_command(TARGET SlipStream POST_BUILD COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:SlipStream>/js)
 
-foreach(F input media network renderer state ui)
+foreach(F input media network renderer state ui mic)
     add_custom_command(TARGET SlipStream POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/client/js/${F}.js $<TARGET_FILE_DIR:SlipStream>/js/${F}.js)
 endforeach()
 

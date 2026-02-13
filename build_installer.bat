@@ -28,7 +28,7 @@ echo.
 echo [2/4] Configuring CMake...
 if exist build rmdir /s /q build
 mkdir build && cd build || goto :err
-cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="%VCPKG%/scripts/buildsystems/vcpkg.cmake" || (cd .. & goto :err)
+cmake .. -A x64 -DCMAKE_TOOLCHAIN_FILE="%VCPKG%/scripts/buildsystems/vcpkg.cmake" || (cd .. & goto :err)
 
 echo.
 echo [3/4] Building Release...

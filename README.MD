@@ -4,7 +4,7 @@ Low-latency remote desktop streaming over WebRTC with NVIDIA hardware-accelerate
 
 ## Overview
 
-SlipStream captures the Windows desktop using the Windows Graphics Capture API and encodes frames in real-time using NVIDIA NVENC (H.264, H.265, or AV1). Video and audio are streamed to web browsers via WebRTC data channels with DTLS encryption. The browser client renders frames using WebGL2 and decodes video/audio using the WebCodecs API.
+SlipStream captures the Windows desktop using the Windows Graphics Capture API and encodes frames in real-time using NVIDIA NVENC (AV1, H.265, or H.264). Video and audio are streamed to web browsers via WebRTC data channels with DTLS encryption. The browser client renders frames using WebGL2 and decodes video/audio using the WebCodecs API. Bidirectional microphone support enables voice communication from the client to the server via VB-Cable.
 
 ## Architecture
 
@@ -16,9 +16,13 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 |  +--------------+    +--------------+    +--------------+    +----------+    |
 |  | WGC API      |--->| NVENC        |--->| Data Channel |<-->| WASAPI   |    |
 |  | D3D11 Fence  |    | AV1/H265/264 |    | libdatachan  |    | Opus     |    |
-|  | 6-tex pool   |    | FFmpeg       |    |              |    | 96 kbps  |    |
+|  | 6-tex pool   |    | FFmpeg       |    | 5 channels   |    | 96 kbps  |    |
 |  +--------------+    +--------------+    +--------------+    +----------+    |
-|                                                 |                            |
+|                                                 |                  |         |
+|                                                 |            +----------+    |
+|                                                 |            | VB-Cable |    |
+|                                                 |            | Playback |    |
+|                                                 |            +----------+    |
 |                          +----------------------+----------------------+     |
 |                          |       HTTPS Server (port 443)               |     |
 |                          |    cpp-httplib + OpenSSL                    |     |
@@ -35,8 +39,13 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 |  | VideoDecoder |--->| WebGL2       |    | AudioDecoder |--->| Worklet  |    |
 |  | HW or SW     |    | Letterbox    |    | Opus         |    | RingBuf  |    |
 |  +--------------+    +--------------+    +--------------+    +----------+    |
+|                                                                    |         |
+|  +--------------+                                            +----------+    |
+|  | AudioEncoder |<-------------------------------------------| Mic      |    |
+|  | Opus 32kbps  |                                            | Capture  |    |
+|  +--------------+                                            +----------+    |
 |                                                                              |
-|  Input Handler -----> Mouse/Keyboard -----> Data Channel -----> Server       |
+|  Input Handler -----> Mouse/Keyboard -----> Data Channel -----> Server      |
 +------------------------------------------------------------------------------+
 ```
 
@@ -44,15 +53,16 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 
 - **Triple Codec Support** - AV1, H.265, and H.264 via NVIDIA NVENC
 - **Hardware Decoding** - WebCodecs API with automatic HW/SW fallback
-- **System Audio** - WASAPI loopback capture with Opus encoding
+- **System Audio** - WASAPI loopback capture with Opus encoding at 96 kbps
+- **Microphone Support** - Client-to-server voice via WebCodecs AudioEncoder and VB-Cable
 - **Multi-Monitor** - Live monitor switching with tabbed UI option
 - **Clipboard Sync** - Bidirectional text clipboard (Ctrl+C/V)
 - **Relative Mouse** - Pointer lock mode for games and full-screen apps
-- **Cursor Sync** - Remote cursor shape updates (13 standard cursor types)
+- **Cursor Sync** - Remote cursor shape updates (14 standard cursor types)
 - **Session Auth** - PBKDF2-SHA256 password hashing with JWT tokens
 - **Rate Limiting** - Brute-force protection with IP lockout
 - **Auto SSL** - Self-signed certificate generation on first run
-- **Debug Stats** - Real-time performance overlay
+- **Debug Stats** - Real-time performance overlay with comprehensive metrics
 
 ## Requirements
 
@@ -64,13 +74,14 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 | GPU | NVIDIA GPU with NVENC support |
 | IDE | Visual Studio 2022 with C++20 Desktop workload |
 | Package Manager | [vcpkg](https://github.com/microsoft/vcpkg) |
+| Microphone Output | VB-Cable (optional, for client mic playback) |
 
 ### Client
 
 | Component | Requirement |
 |-----------|-------------|
 | Browser | Chrome 94+, Edge 94+, Firefox 98+ |
-| APIs | WebRTC, WebCodecs (VideoDecoder, AudioDecoder), WebGL2, AudioWorklet |
+| APIs | WebRTC, WebCodecs (VideoDecoder, AudioDecoder, AudioEncoder), WebGL2, AudioWorklet |
 
 ## Quick Start
 
@@ -181,7 +192,7 @@ To use custom certificates, replace `server.crt` and `server.key` before startin
 |-----------|--------|
 | API | Windows Graphics Capture (WGC) |
 | Texture Pool | 6 textures with D3D11 fence sync |
-| Frame Buffer | 4-frame ring buffer |
+| Frame Buffer | 4-frame ring buffer with generation tracking |
 | Cursor | Optional capture in stream |
 | Border | Disabled (if OS supports) |
 
@@ -211,7 +222,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | Header Size | 21 bytes |
 | Video Buffer | 256 KB threshold |
 | Max Queue | 3 frames worth of chunks |
-| Delivery | Unreliable, unordered (UDP semantics) |
+| Delivery | Ordered, limited retransmits |
 
 ### Video Packet Header (21 bytes)
 
@@ -224,7 +235,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | 18 | 2 | totalChunks | Total chunks in frame |
 | 20 | 1 | frameType | 1=keyframe, 0=delta |
 
-## Audio Pipeline
+## Audio Pipeline (Server to Client)
 
 ### Capture
 
@@ -254,7 +265,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 |-----------|-------|
 | Audio Buffer | 128 KB threshold |
 | Max Queue | 8 packets |
-| Delivery | Unreliable, unordered |
+| Delivery | Ordered, 1 retransmit |
 
 ### Audio Packet Header (16 bytes)
 
@@ -272,9 +283,57 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | Decoder | AudioDecoder (WebCodecs) |
 | Processor | AudioWorklet with ring buffer |
 | Buffer Capacity | 9600 samples (200ms) |
-| Prebuffer Threshold | 2400 samples (50ms) |
-| Target Buffer | 3360 samples (70ms) |
-| Max Buffer | 6720 samples (140ms) |
+| Prebuffer Threshold | 1440 samples (30ms) |
+| Target Buffer | 2400 samples (50ms) |
+| Max Buffer | 4800 samples (100ms) |
+
+## Microphone Pipeline (Client to Server)
+
+### Client Capture
+
+| Parameter | Value |
+|-----------|-------|
+| API | MediaDevices.getUserMedia |
+| Sample Rate | 48,000 Hz |
+| Channels | Mono |
+| Frame Duration | 10 ms (480 samples) |
+| Processing | Echo cancellation, noise suppression, auto gain |
+
+### Client Encoding
+
+| Parameter | Value |
+|-----------|-------|
+| Codec | Opus (via WebCodecs AudioEncoder) |
+| Application | VoIP |
+| Bitrate | 32 kbps |
+| Complexity | 5 |
+| Signal Type | Voice |
+| Frame Duration | 10 ms |
+
+### Transport
+
+| Parameter | Value |
+|-----------|-------|
+| Delivery | Ordered, 1 retransmit |
+| Max Queue | 20 packets |
+
+### Microphone Packet Header (16 bytes)
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4 | magic | 0x4D494344 ("MICD") |
+| 4 | 8 | timestamp | Capture timestamp |
+| 12 | 2 | samples | Sample count (480) |
+| 14 | 2 | dataLength | Opus payload size |
+
+### Server Playback
+
+| Component | Detail |
+|-----------|--------|
+| Output Device | VB-Cable Input (auto-detected) |
+| Decoder | Opus (libopus) |
+| Resampling | Linear interpolation if device rate differs |
+| Fallback | Default audio endpoint if VB-Cable unavailable |
 
 ## Input Protocol
 
@@ -354,14 +413,35 @@ Cursor types: 0=default, 1=text, 2=pointer, 3=wait, 4=progress, 5=crosshair, 6=m
 - Windows key (left/right)
 - Ctrl+Alt+Delete
 
+## Control Messages
+
+| Message | Magic | Size | Description |
+|---------|-------|------|-------------|
+| PING | 0x504E4750 | 16/24 | Clock synchronization |
+| HOST_INFO | 0x484F5354 | 6 | Host display refresh rate |
+| FPS_SET | 0x46505343 | 7 | Set target frame rate |
+| FPS_ACK | 0x46505341 | 7 | Frame rate acknowledgment |
+| CODEC_SET | 0x434F4443 | 5 | Set video codec |
+| CODEC_ACK | 0x434F4441 | 5 | Codec acknowledgment |
+| REQUEST_KEY | 0x4B455952 | 4 | Request keyframe |
+| MONITOR_LIST | 0x4D4F4E4C | Variable | Monitor enumeration |
+| MONITOR_SET | 0x4D4F4E53 | 5 | Switch monitor |
+| AUDIO_ENABLE | 0x41554445 | 5 | Enable/disable audio streaming |
+| MIC_ENABLE | 0x4D494345 | 5 | Enable/disable mic streaming |
+| CURSOR_CAPTURE | 0x43555243 | 5 | Toggle cursor capture in video |
+| CLIPBOARD_GET | 0x434C4754 | 4 | Request clipboard contents |
+| CLIPBOARD_DATA | 0x434C4950 | 8+N | Clipboard text transfer |
+| KICKED | 0x4B49434B | 4 | Client disconnected by server |
+
 ## WebRTC Data Channels
 
 | Channel | Ordered | MaxRetransmits | Purpose |
 |---------|---------|----------------|---------|
 | control | Yes | 3 | Commands, ping/pong, monitor list |
-| video | No | 0 | Video frame chunks |
-| audio | No | 0 | Audio packets |
+| video | Yes | 1 | Video frame chunks |
+| audio | Yes | 1 | Audio packets |
 | input | Yes | 3 | Mouse/keyboard events |
+| mic | Yes | 1 | Microphone audio packets |
 
 ## Client Modules
 
@@ -373,6 +453,7 @@ Cursor types: 0=default, 1=text, 2=pointer, 3=wait, 4=progress, 5=crosshair, 6=m
 | `media.js` | VideoDecoder, AudioDecoder, AudioWorklet processor |
 | `input.js` | Mouse/keyboard capture, RAF batching, pointer lock |
 | `ui.js` | Settings panel, fullscreen, tabbed mode, stats overlay |
+| `mic.js` | Microphone capture, AudioEncoder, packet transmission |
 
 ### Clock Synchronization
 
@@ -391,6 +472,7 @@ Cursor types: 0=default, 1=text, 2=pointer, 3=wait, 4=progress, 5=crosshair, 6=m
 | Frame timeout | 200 ms |
 | Max frame age (jitter) | 50 ms |
 | Decode queue limit | 6 frames |
+| Jitter samples | 60 |
 
 ## UI Features
 
@@ -401,6 +483,7 @@ Access by clicking the right edge of the screen:
 - **Logout** - Disconnect and clear session
 - **Fullscreen** - Enter fullscreen with keyboard lock (Escape captured)
 - **Audio** - Toggle system audio playback
+- **Mic** - Toggle microphone transmission to server
 - **Monitor** - Switch between displays
 - **Frame Rate** - 15/30/60/120/144 or custom (1-240)
 - **Codec** - AV1, H.265, or H.264 (shows HW/SW status)
@@ -441,6 +524,7 @@ Real-time metrics display:
 | Encoder | Time Critical | Frame encoding and sending |
 | Audio | Highest | Audio capture and encoding |
 | Cursor | Below Normal | Cursor shape polling |
+| Wiggle | Normal | Mouse cursor initialization after monitor switch |
 
 ## Dependencies
 
@@ -451,7 +535,7 @@ Managed via vcpkg (`vcpkg.json`):
 | libdatachannel | WebRTC implementation |
 | cpp-httplib[openssl] | HTTPS server |
 | nlohmann-json | JSON parsing |
-| opus | Audio encoding |
+| opus | Audio encoding/decoding |
 | openssl | Cryptography, SSL/TLS |
 | ffmpeg[nvcodec,avcodec] | Video encoding |
 | jwt-cpp | JWT token handling |
@@ -482,8 +566,9 @@ SlipStream/
 │   ├── capture.hpp     # Screen capture with WGC
 │   ├── encoder.hpp     # NVENC video encoding
 │   ├── webrtc.hpp      # WebRTC server implementation
-│   ├── audio.hpp       # WASAPI audio capture + Opus
-│   └── input.hpp       # Input handling + clipboard
+│   ├── audio.hpp       # WASAPI audio capture + Opus encoding
+│   ├── input.hpp       # Input handling + clipboard
+│   └── mic.hpp         # VB-Cable microphone playback
 ├── src/
 │   └── main.cpp        # Application entry point
 ├── client/
@@ -495,7 +580,8 @@ SlipStream/
 │       ├── renderer.js # WebGL2 rendering
 │       ├── media.js    # Video/audio decoding
 │       ├── input.js    # Input capture
-│       └── ui.js       # UI controls
+│       ├── ui.js       # UI controls
+│       └── mic.js      # Microphone capture and encoding
 ├── vcpkg.json          # Dependencies
 ├── CMakeLists.txt      # Build configuration
 ├── build.bat           # Build script
@@ -503,6 +589,16 @@ SlipStream/
 ├── run.bat             # Run script
 └── LICENSE.txt         # License
 ```
+
+## Microphone Setup (VB-Cable)
+
+To enable client microphone audio on the server:
+
+1. Install [VB-Cable Virtual Audio Device](https://vb-audio.com/Cable/)
+2. The server automatically detects "CABLE Input" as the output device
+3. Configure your application to use "CABLE Output" as its microphone input
+
+If VB-Cable is not installed, the server falls back to the default audio endpoint.
 
 ## Troubleshooting
 
@@ -513,9 +609,11 @@ SlipStream/
 | Connection refused | Check firewall for TCP 443 and UDP 50000-50020 |
 | Black screen | Wait for keyframe or click canvas to focus |
 | No audio | Click "Enable" in settings panel after first audio playback |
+| Mic not working | Ensure browser has microphone permission, check VB-Cable installation |
 | Input not working | Click the video canvas to capture input focus |
 | Certificate warning | Expected with self-signed certificate, click proceed |
 | Kicked message | Another client connected (single client only) |
+| Monitor switch issues | Frames from previous monitor are automatically discarded |
 
 ## Known Limitations
 
@@ -524,6 +622,17 @@ SlipStream/
 - NVIDIA GPU required for encoding
 - No file transfer support
 - No custom cursor image sync (standard cursors only)
+- Microphone requires VB-Cable for full functionality
+- WebCodecs AudioEncoder required for client microphone
+
+## Codec Support Detection
+
+The client automatically detects codec support on connection:
+
+1. Tests hardware acceleration for each codec (AV1, H.265, H.264)
+2. Falls back to software decoding if hardware unavailable
+3. Selects best available codec (prefers AV1 HW > AV1 SW > H.265 HW > etc.)
+4. Displays HW/SW status in codec dropdown
 
 ## License
 
