@@ -129,13 +129,15 @@
             <div class="sec">
                 <div class="sl">Audio</div>
                 <button class="btn bf" id="aBtn"><svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span id="aTxt">Enable</span></button>
+                <button class="btn bf" id="micBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg><span id="micTxt">Mic</span></button>
+                <p class="input-hint" id="micHint"></p>
             </div>
             <div class="sec">
                 <div class="sl">Capture</div>
                 <div class="sw"><span class="sla">Monitor</span><select class="sel" id="monSel"><option value="0">Waiting...</option></select></div>
                 <div class="sw"><span class="sla">Frame Rate</span><select class="sel" id="fpsSel"><option value="15">15</option><option value="30">30</option><option value="60" selected>60</option><option value="120">120</option><option value="144">144</option><option value="custom">Custom</option></select></div>
                 <div class="sw custom-fps-row" id="customFpsRow" style="display:none"><span class="sla">Custom FPS</span><div class="custom-fps-input"><input type="number" id="customFpsInput" class="fps-input" min="1" max="240" value="60"><button class="btn-small" id="customFpsApply">Apply</button></div></div>
-                <div class="sw"><span class="sla">Codec</span><select class="sel" id="codecSel"><option value="0">H.264</option><option value="1">AV1</option></select></div>
+                <div class="sw"><span class="sla">Codec</span><select class="sel" id="codecSel"><option value="0">AV1</option><option value="1">H.265</option><option value="2">H.264</option></select></div>
             </div>
             <div class="sec">
                 <div class="sl">Display</div>
