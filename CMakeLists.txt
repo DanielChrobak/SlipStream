@@ -59,6 +59,7 @@ target_link_libraries(SlipStream PRIVATE LibDataChannel::LibDataChannel httplib:
 if(WIN32)
     target_link_libraries(SlipStream PRIVATE ws2_32 d3d11 dxgi dxguid ole32 windowsapp)
     target_compile_options(SlipStream PRIVATE /await:strict /EHsc /W4 /wd4100 /wd4189)
+    target_link_options(SlipStream PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
     target_compile_definitions(SlipStream PRIVATE WINRT_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _CRT_SECURE_NO_WARNINGS)
     target_include_directories(SlipStream PRIVATE "$ENV{WindowsSdkDir}Include/$ENV{WindowsSDKVersion}cppwinrt")
 endif()

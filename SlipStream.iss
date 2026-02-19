@@ -23,6 +23,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
@@ -59,7 +60,7 @@ Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""SlipStream"
 ; Create scheduled task to run at boot (SYSTEM account, before any user logs in)
 Filename: "schtasks"; Parameters: "/create /tn ""SlipStream"" /tr """"""{app}\{#MyAppExeName}"""""" /sc onstart /ru SYSTEM /rl HIGHEST /f"; Flags: runhidden; Tasks: startup
 
-; Launch after install - runs as admin (installer is already elevated)
+; Launch after install - use ShellExecute so UAC elevation can be requested by app manifest
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallRun]
