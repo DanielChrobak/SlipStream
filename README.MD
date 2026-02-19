@@ -49,24 +49,6 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 +------------------------------------------------------------------------------+
 ```
 
-## Features
-
-- **Multi-Vendor GPU Support** - NVIDIA NVENC, Intel QSV, AMD AMF with automatic detection and fallback
-- **Triple Codec Support** - AV1, H.265, and H.264 with automatic capability detection
-- **Hardware Decoding** - WebCodecs API with automatic HW/SW fallback
-- **System Audio** - WASAPI loopback capture with Opus encoding at 96 kbps
-- **Microphone Support** - Client-to-server voice via WebCodecs AudioEncoder and VB-Cable
-- **Multi-Monitor** - Live monitor switching with tabbed UI
-- **Clipboard Sync** - Bidirectional text clipboard (Ctrl+C/V)
-- **Relative Mouse** - Pointer lock mode for games and full-screen apps
-- **Cursor Sync** - Remote cursor shape updates (14 standard cursor types)
-- **Session Auth** - PBKDF2-SHA256 password hashing with JWT tokens
-- **Rate Limiting** - Brute-force protection with IP lockout
-- **Auto SSL** - Self-signed certificate generation on first run
-- **System Tray Control** - Starts minimized to tray; right-click tray menu for Open/Exit
-- **Multi-Network URL Output** - Startup logs all non-loopback LAN IPv4 URLs
-- **Debug Stats** - Real-time performance overlay with comprehensive metrics
-
 ## Requirements
 
 ### Server
