@@ -651,7 +651,7 @@ SlipStream/
 ├── build_installer.bat # Installer build script
 ├── run.bat             # Run script
 ├── LICENSE.md          # Styled license text
-└── LICENSE-installer.txt # Installer license text
+└── Installer-LICENSE.txt # Installer license text
 ```
 
 ## Microphone Setup (VB-Cable)
@@ -714,7 +714,7 @@ Business Source License (Personal-Online / No-Company) v1.1
 Personal use permitted. Commercial use requires separate license.
 
 - Styled/readable version: [LICENSE.md](LICENSE.md)
-- Installer-rendered copy: [LICENSE-installer.txt](LICENSE-installer.txt)
+- Installer-rendered copy: [Installer-LICENSE.txt](Installer-LICENSE.txt)
 
 ## Copyright
 
