@@ -240,8 +240,8 @@ class RingBuffer {
 class StreamAudioProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
-        this.rb = new RingBuffer(2, 9600);
-        this.target = 2400; this.max = 4800; this.prebufThreshold = 1440;
+        this.rb = new RingBuffer(2, 4800);
+        this.target = 960; this.max = 1920; this.prebufThreshold = 480;
         this.prebuffering = true; this.volume = 1; this.muted = false;
         this.samplesProcessed = 0; this.underruns = 0; this.overflows = 0;
         this.lastReport = 0; this.consecutiveUnderruns = 0;
@@ -249,8 +249,8 @@ class StreamAudioProcessor extends AudioWorkletProcessor {
             const { type, data } = e.data;
             if (type === 'audio') {
                 const bufLen = this.rb.length;
-                if (bufLen > this.max + this.target) {
-                    const toSkip = bufLen - this.max;
+                if (bufLen > this.max) {
+                    const toSkip = bufLen - this.target;
                     if (toSkip > 0) { this.rb.skip(toSkip); this.overflows++; this.port.postMessage({ type: 'drop', reason: 'Overflow' }); }
                 }
                 const result = this.rb.write(data.channels, data.frames);
@@ -267,6 +267,13 @@ class StreamAudioProcessor extends AudioWorkletProcessor {
         const out = outputs[0];
         if (!out || !out.length) return true;
         const frames = out[0].length;
+        if (!this.prebuffering && this.rb.length > this.max) {
+            const skipped = this.rb.skip(this.rb.length - this.target);
+            if (skipped > 0) {
+                this.overflows++;
+                this.port.postMessage({ type: 'drop', reason: 'Catch-up' });
+            }
+        }
         const bufferMs = (this.rb.length / 48000) * 1000;
         if (this.muted || this.prebuffering) { for (let c = 0; c < out.length; c++) out[c].fill(0); this.samplesProcessed += frames; return true; }
         const read = this.rb.read(out, frames);

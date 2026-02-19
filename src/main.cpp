@@ -5,431 +5,10 @@
 #include "audio.hpp"
 #include "input.hpp"
 #include "mic.hpp"
-#include <conio.h>
+#include "app_support.hpp"
+#include "tray.hpp"
 #include <winsock2.h>
 #include <ws2tcpip.h>
-
-std::atomic<bool> g_running{true};
-std::vector<MonitorInfo> g_monitors;
-std::mutex g_monitorsMutex;
-struct Config { std::string username, passwordHash, salt; } g_config;
-JWTAuth g_jwt;
-RateLimiter g_rateLimiter;
-
-BOOL WINAPI ConsoleHandler(DWORD sig) {
-    if(sig==CTRL_C_EVENT || sig==CTRL_CLOSE_EVENT || sig==CTRL_BREAK_EVENT) {
-        printf("\n[Shutting down...]\n");
-        g_running = false;
-        return TRUE;
-    }
-    DBG("ConsoleHandler: Received signal %lu", sig);
-    return FALSE;
-}
-
-std::string GetMonitorFriendlyName(const wchar_t* gdiName) {
-    UINT32 pathCnt=0, modeCnt=0;
-    LONG result = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCnt, &modeCnt);
-    if(result != ERROR_SUCCESS) {
-        DBG("GetMonitorFriendlyName: GetDisplayConfigBufferSizes failed: %ld", result);
-        return "";
-    }
-    if(!pathCnt) { DBG("GetMonitorFriendlyName: No active paths found"); return ""; }
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCnt);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCnt);
-    result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCnt, paths.data(),
-                                &modeCnt, modes.data(), nullptr);
-    if(result != ERROR_SUCCESS) {
-        DBG("GetMonitorFriendlyName: QueryDisplayConfig failed: %ld", result);
-        return "";
-    }
-
-    for(UINT32 i=0; i<pathCnt; i++) {
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {};
-        src.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(src),
-                      paths[i].sourceInfo.adapterId, paths[i].sourceInfo.id};
-        LONG srcResult = DisplayConfigGetDeviceInfo(&src.header);
-        if(srcResult != ERROR_SUCCESS) {
-            DBG("GetMonitorFriendlyName: DisplayConfigGetDeviceInfo (source) failed: %ld", srcResult);
-            continue;
-        }
-        if(wcscmp(src.viewGdiDeviceName, gdiName) == 0) {
-            DISPLAYCONFIG_TARGET_DEVICE_NAME tgt = {};
-            tgt.header = {DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, sizeof(tgt),
-                          paths[i].targetInfo.adapterId, paths[i].targetInfo.id};
-            LONG tgtResult = DisplayConfigGetDeviceInfo(&tgt.header);
-            if(tgtResult != ERROR_SUCCESS) {
-                DBG("GetMonitorFriendlyName: DisplayConfigGetDeviceInfo (target) failed: %ld", tgtResult);
-                continue;
-            }
-            if(tgt.monitorFriendlyDeviceName[0]) {
-                char name[64] = {};
-                int converted = WideCharToMultiByte(CP_UTF8, 0, tgt.monitorFriendlyDeviceName, -1,
-                                                    name, sizeof(name), nullptr, nullptr);
-                if(converted == 0) { WARN("GetMonitorFriendlyName: WideCharToMultiByte failed: %lu", GetLastError()); }
-                return name;
-            }
-        }
-    }
-    return "";
-}
-
-void RefreshMonitorList() {
-    std::lock_guard<std::mutex> lk(g_monitorsMutex);
-    g_monitors.clear();
-
-    BOOL enumResult = EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMon, HDC, LPRECT, LPARAM lp) -> BOOL {
-        auto* mons = (std::vector<MonitorInfo>*)lp;
-        MONITORINFOEXW mi{sizeof(mi)};
-        DEVMODEW dm{.dmSize = sizeof(dm)};
-
-        if(!GetMonitorInfoW(hMon, &mi)) {
-            WARN("RefreshMonitorList: GetMonitorInfoW failed: %lu", GetLastError());
-            return TRUE;
-        }
-        if(!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
-            DBG("RefreshMonitorList: EnumDisplaySettingsW failed, using 60Hz default");
-        }
-
-        std::string friendly = GetMonitorFriendlyName(mi.szDevice);
-        char name[64] = {};
-        if(!friendly.empty()) {
-            strncpy(name, friendly.c_str(), sizeof(name)-1);
-        } else {
-            int converted = WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1,
-                                                name, sizeof(name), nullptr, nullptr);
-            if(converted == 0) {
-                WARN("RefreshMonitorList: WideCharToMultiByte failed: %lu", GetLastError());
-                strcpy(name, "Unknown");
-            }
-        }
-
-        int refreshRate = dm.dmDisplayFrequency ? (int)dm.dmDisplayFrequency : 60;
-        int width = mi.rcMonitor.right - mi.rcMonitor.left;
-        int height = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
-
-        mons->push_back({hMon, (int)mons->size(), width, height, refreshRate, isPrimary, name});
-        DBG("RefreshMonitorList: Found monitor %zu: %s (%dx%d @ %dHz, primary=%d)",
-            mons->size()-1, name, width, height, refreshRate, isPrimary);
-        return TRUE;
-    }, (LPARAM)&g_monitors);
-
-    if(!enumResult) { ERR("RefreshMonitorList: EnumDisplayMonitors failed: %lu", GetLastError()); }
-
-    std::sort(g_monitors.begin(), g_monitors.end(), [](auto& a, auto& b) {
-        return a.isPrimary != b.isPrimary ? a.isPrimary : a.index < b.index;
-    });
-    for(size_t i=0; i<g_monitors.size(); i++) g_monitors[i].index = (int)i;
-    LOG("RefreshMonitorList: Found %zu monitors", g_monitors.size());
-}
-
-std::string LoadFile(const char* path) {
-    std::ifstream f(path);
-    if(!f) { DBG("LoadFile: Failed to open '%s'", path); return ""; }
-    std::string content(std::istreambuf_iterator<char>(f), {});
-    DBG("LoadFile: Loaded '%s' (%zu bytes)", path, content.size());
-    return content;
-}
-
-bool LoadConfig() {
-    try {
-        auto authPath = GetSlipStreamDataFilePath("auth.json");
-        std::ifstream f(authPath);
-        if(!f) {
-            f.open("auth.json");
-            if(!f) {
-                DBG("LoadConfig: auth.json not found in data dir or working directory");
-                return false;
-            }
-            LOG("LoadConfig: Using legacy auth.json from working directory");
-        }
-        json c = json::parse(f);
-        if(c.contains("username") && c.contains("passwordHash") && c.contains("salt")) {
-            g_config = {c["username"], c["passwordHash"], c["salt"]};
-            bool valid = g_config.username.size() >= 3 &&
-                         g_config.passwordHash.size() == 64 &&
-                         g_config.salt.size() == 32;
-            if(!valid) {
-                WARN("LoadConfig: Config validation failed (username=%zu, hash=%zu, salt=%zu)",
-                     g_config.username.size(), g_config.passwordHash.size(), g_config.salt.size());
-            }
-            return valid;
-        }
-        WARN("LoadConfig: Missing required fields in auth.json");
-    } catch(const json::exception& e) {
-        ERR("LoadConfig: JSON parse error: %s", e.what());
-    } catch(const std::exception& e) {
-        ERR("LoadConfig: Error loading config: %s", e.what());
-    } catch(...) {
-        ERR("LoadConfig: Unknown error loading config");
-    }
-    return false;
-}
-
-bool SaveConfig() {
-    try {
-        auto authPath = GetSlipStreamDataFilePath("auth.json");
-        std::ofstream f(authPath);
-        if(!f) { ERR("SaveConfig: Failed to open %s for writing", authPath.c_str()); return false; }
-        f << json{{"username", g_config.username},
-                  {"passwordHash", g_config.passwordHash},
-                  {"salt", g_config.salt}}.dump(2);
-        if(!f.good()) { ERR("SaveConfig: Error writing to %s", authPath.c_str()); return false; }
-        LOG("SaveConfig: Configuration saved successfully");
-        return true;
-    } catch(const std::exception& e) {
-        ERR("SaveConfig: Exception: %s", e.what());
-        return false;
-    } catch(...) {
-        ERR("SaveConfig: Unknown exception");
-        return false;
-    }
-}
-
-bool ValidateUsername(const std::string& u) {
-    if(u.length() < 3 || u.length() > 32) {
-        DBG("ValidateUsername: Length invalid (%zu, must be 3-32)", u.length());
-        return false;
-    }
-    for(char c : u) {
-        if(!isalnum((unsigned char)c) && c != '_' && c != '-') {
-            DBG("ValidateUsername: Invalid character '%c'", c);
-            return false;
-        }
-    }
-    return true;
-}
-
-bool ValidatePassword(const std::string& p) {
-    if(p.length() < 8 || p.length() > 128) {
-        DBG("ValidatePassword: Length invalid (%zu, must be 8-128)", p.length());
-        return false;
-    }
-    bool l = false, d = false;
-    for(char c : p) {
-        if(isalpha((unsigned char)c)) l = true;
-        if(isdigit((unsigned char)c)) d = true;
-    }
-    if(!l || !d) { DBG("ValidatePassword: Missing letter or digit (hasLetter=%d, hasDigit=%d)", l, d); }
-    return l && d;
-}
-
-std::string GetPasswordInput() {
-    std::string pw;
-    for(int ch; (ch = _getch()) != '\r' && ch != '\n';) {
-        if(ch == 8 || ch == 127) {
-            if(!pw.empty()) { pw.pop_back(); printf("\b \b"); }
-        } else if(ch == 27) {
-            while(!pw.empty()) { pw.pop_back(); printf("\b \b"); }
-        } else if(ch >= 32 && ch <= 126) {
-            pw += (char)ch;
-            printf("*");
-        }
-    }
-    printf("\n");
-    return pw;
-}
-
-void SetupConfig() {
-    if(LoadConfig()) {
-        printf("Loaded config (user: %s)\n", g_config.username.c_str());
-        return;
-    }
-    printf("\n=== First Time Setup ===\n");
-
-    while(true) {
-        printf("Username (3-32 chars): ");
-        std::getline(std::cin, g_config.username);
-        if(ValidateUsername(g_config.username)) break;
-        printf("Invalid username\n");
-    }
-
-    std::string pw, conf;
-    while(true) {
-        printf("Password (8+ chars, letter+number): ");
-        pw = GetPasswordInput();
-        if(!ValidatePassword(pw)) { printf("Invalid password\n"); continue; }
-        printf("Confirm password: ");
-        conf = GetPasswordInput();
-        if(pw == conf) break;
-        printf("Passwords don't match\n");
-    }
-
-    g_config.salt = GenerateSalt();
-    g_config.passwordHash = HashPassword(pw, g_config.salt);
-
-    if(g_config.passwordHash.empty()) {
-        ERR("SetupConfig: Password hashing failed");
-        printf("Failed to hash password\n");
-        SetupConfig();
-        return;
-    }
-
-    if(SaveConfig()) { printf("Configuration saved\n\n"); }
-    else { printf("Failed to save\n"); SetupConfig(); }
-}
-
-std::string ExtractSessionCookie(const httplib::Request& req) {
-    auto it = req.headers.find("Cookie");
-    if(it == req.headers.end()) return "";
-    size_t pos = it->second.find("session=");
-    if(pos == std::string::npos) return "";
-    size_t start = pos + 8, end = it->second.find(';', start);
-    return end != std::string::npos ? it->second.substr(start, end - start) : it->second.substr(start);
-}
-
-std::string GetClientIP(const httplib::Request& req) {
-    auto it = req.headers.find("X-Forwarded-For");
-    if(it != req.headers.end() && !it->second.empty()) {
-        size_t c = it->second.find(',');
-        return c != std::string::npos ? it->second.substr(0, c) : it->second;
-    }
-    return req.remote_addr;
-}
-
-void JsonError(httplib::Response& res, int status, const std::string& err) {
-    res.status = status;
-    res.set_content(json{{"error", err}}.dump(), "application/json");
-    DBG("JsonError: %d - %s", status, err.c_str());
-}
-
-template<typename F>
-auto AuthRequired(F h) {
-    return [h](const httplib::Request& req, httplib::Response& res) {
-        std::string token = ExtractSessionCookie(req), user;
-        if(token.empty()) {
-            DBG("AuthRequired: No session cookie");
-            JsonError(res, 401, "Authentication required");
-            return;
-        }
-        if(!g_jwt.ValidateToken(token, user)) {
-            DBG("AuthRequired: Invalid token");
-            JsonError(res, 401, "Invalid token");
-            return;
-        }
-        h(req, res, user);
-    };
-}
-
-void HandleAuth(const httplib::Request& req, httplib::Response& res) {
-    json body;
-    try { body = json::parse(req.body); }
-    catch(const json::exception& e) {
-        WARN("HandleAuth: JSON parse error: %s", e.what());
-        JsonError(res, 400, "Invalid JSON");
-        return;
-    } catch(...) {
-        WARN("HandleAuth: Unknown JSON parse error");
-        JsonError(res, 400, "Invalid JSON");
-        return;
-    }
-
-    std::string ip = GetClientIP(req);
-    if(!g_rateLimiter.IsAllowed(ip)) {
-        int lockout = g_rateLimiter.LockoutSeconds(ip);
-        WARN("HandleAuth: Rate limited IP %s (lockout=%ds)", ip.c_str(), lockout);
-        res.status = 429;
-        res.set_content(json{{"error", "Too many attempts"}, {"lockoutSeconds", lockout}}.dump(),
-                        "application/json");
-        return;
-    }
-
-    std::string u = body.value("username", ""), p = body.value("password", "");
-    if(u.empty() || p.empty()) {
-        g_rateLimiter.RecordAttempt(ip, false);
-        DBG("HandleAuth: Empty credentials from %s", ip.c_str());
-        JsonError(res, 400, "Credentials required");
-        return;
-    }
-
-    if(u != g_config.username || !VerifyPassword(p, g_config.salt, g_config.passwordHash)) {
-        g_rateLimiter.RecordAttempt(ip, false);
-        int remaining = g_rateLimiter.RemainingAttempts(ip);
-        WARN("HandleAuth: Failed login attempt for '%s' from %s (%d attempts remaining)",
-             u.c_str(), ip.c_str(), remaining);
-        res.status = 401;
-        res.set_content(json{{"error", "Invalid credentials"},
-                             {"remainingAttempts", remaining}}.dump(), "application/json");
-        return;
-    }
-
-    g_rateLimiter.RecordAttempt(ip, true);
-    std::string token = g_jwt.CreateToken(u);
-    if(token.empty()) {
-        ERR("HandleAuth: Failed to create JWT token for '%s'", u.c_str());
-        JsonError(res, 500, "Internal error");
-        return;
-    }
-
-    LOG("HandleAuth: Successful login for '%s' from %s", u.c_str(), ip.c_str());
-    res.set_header("Set-Cookie", "session=" + token +
-                   "; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400");
-    res.set_content(json{{"success", true}, {"username", u}}.dump(), "application/json");
-}
-
-void SetupCORS(const httplib::Request& req, httplib::Response& r) {
-    r.set_header("X-Content-Type-Options", "nosniff");
-    r.set_header("X-Frame-Options", "DENY");
-    r.set_header("Referrer-Policy", "no-referrer");
-
-    std::string origin = req.get_header_value("Origin");
-    if(origin.empty()) return;
-
-    std::string host = req.get_header_value("Host");
-    size_t pe = origin.find("://");
-    std::string oh = (pe != std::string::npos) ? origin.substr(pe + 3) : origin;
-
-    size_t pp = oh.find(':'), hp = host.find(':');
-    std::string ohn = (pp != std::string::npos) ? oh.substr(0, pp) : oh;
-    std::string hn = (hp != std::string::npos) ? host.substr(0, hp) : host;
-
-    if(ohn == "localhost" || ohn == "127.0.0.1" || hn == "localhost" || hn == "127.0.0.1" || ohn == hn) {
-        r.set_header("Access-Control-Allow-Origin", origin);
-        r.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        r.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-        r.set_header("Access-Control-Allow-Credentials", "true");
-    }
-}
-
-std::string GetLocalIPAddress() {
-    std::string result = "127.0.0.1";
-    char hostname[256];
-
-    if(gethostname(hostname, sizeof(hostname)) != 0) {
-        WARN("GetLocalIPAddress: gethostname failed: %d", WSAGetLastError());
-        return result;
-    }
-
-    addrinfo hints = {}, *info = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    int ret = getaddrinfo(hostname, nullptr, &hints, &info);
-    if(ret != 0) {
-        WARN("GetLocalIPAddress: getaddrinfo failed: %d (%s)", ret, gai_strerror(ret));
-        return result;
-    }
-    if(!info) { WARN("GetLocalIPAddress: getaddrinfo returned null"); return result; }
-
-    for(auto* p = info; p; p = p->ai_next) {
-        if(p->ai_family == AF_INET) {
-            char ip[INET_ADDRSTRLEN];
-            if(inet_ntop(AF_INET, &((sockaddr_in*)p->ai_addr)->sin_addr, ip, sizeof(ip))) {
-                std::string ipStr(ip);
-                if(ipStr != "127.0.0.1" && ipStr.find("127.") != 0) {
-                    result = ipStr;
-                    DBG("GetLocalIPAddress: Found %s", result.c_str());
-                    break;
-                }
-            } else {
-                WARN("GetLocalIPAddress: inet_ntop failed: %d", WSAGetLastError());
-            }
-        }
-    }
-    freeaddrinfo(info);
-    return result;
-}
 
 class WiggleManager {
     std::atomic<bool>& running;
@@ -469,6 +48,24 @@ public:
     }
 };
 
+namespace {
+bool JoinThreadWithTimeout(std::thread& t, const char* name, DWORD timeoutMs) {
+    if(!t.joinable()) return true;
+
+    HANDLE h = (HANDLE)t.native_handle();
+    DWORD wait = WaitForSingleObject(h, timeoutMs);
+    if(wait == WAIT_OBJECT_0) {
+        t.join();
+        DBG("main: Joined %s thread", name);
+        return true;
+    }
+
+    WARN("main: Timeout waiting for %s thread (%lu ms); detaching", name, timeoutMs);
+    t.detach();
+    return false;
+}
+}
+
 int main(int argc, char* argv[]) {
     try {
         for(int i = 1; i < argc; i++) {
@@ -504,7 +101,7 @@ int main(int argc, char* argv[]) {
         }
 
         constexpr int PORT = 443;
-        std::string localIP = GetLocalIPAddress();
+        auto localIPs = GetLocalIPAddresses();
 
         if(!SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
             WARN("main: SetPriorityClass failed: %lu", GetLastError());
@@ -728,7 +325,7 @@ int main(int argc, char* argv[]) {
             DBG("Logout request processed");
         });
 
-        srv.Get("/api/session", AuthRequired([](auto&, auto& res, const std::string& user) {
+        srv.Get("/api/session", AuthRequired([](const httplib::Request&, httplib::Response& res, const std::string& user) {
             res.set_content(json{{"valid", true}, {"username", user}}.dump(), "application/json");
         }));
 
@@ -793,7 +390,14 @@ int main(int argc, char* argv[]) {
 
         printf("SlipStream v%s running on port %d\n", SLIPSTREAM_VERSION, PORT);
         printf("  Local:   https://localhost:%d\n", PORT);
-        printf("  Network: https://%s:%d\n", localIP.c_str(), PORT);
+        if(localIPs.empty()) {
+            printf("  Network: (no non-loopback IPv4 addresses found)\n");
+        } else {
+            printf("  Network: https://%s:%d\n", localIPs[0].c_str(), PORT);
+            for(size_t i = 1; i < localIPs.size(); i++) {
+                printf("           https://%s:%d\n", localIPs[i].c_str(), PORT);
+            }
+        }
         printf("  User:    %s | Display: %dHz\n", g_config.username.c_str(), capture.GetHostFPS());
         printf("  Mic:     %s\n", mic && mic->IsInitialized() ? mic->GetDeviceName().c_str() : "Not available");
         printf("Note: Self-signed certificate - browser may show security warning.\n");
@@ -1086,8 +690,11 @@ int main(int argc, char* argv[]) {
                 framesEncoded, framesDropped, encodeErrors);
         });
 
+        if(!InitAppTray()) { WARN("main: Tray initialization failed"); }
+
         while(g_running.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(100ms);
+            PumpAppTrayMessages();
+            std::this_thread::sleep_for(50ms);
         }
 
         LOG("Initiating shutdown...");
@@ -1096,31 +703,24 @@ int main(int argc, char* argv[]) {
         srv.stop();
         frameSlot.Wake();
 
-        std::atomic<bool> forceExit{false};
-        std::thread timeout([&] {
-            std::this_thread::sleep_for(3s);
-            if(!forceExit.load(std::memory_order_acquire)) {
-                WARN("Shutdown timeout, forcing exit");
-                ExitProcess(0);
-            }
-        });
-        timeout.detach();
+        constexpr DWORD JOIN_TIMEOUT_MS = 5000;
+        JoinThreadWithTimeout(encThread, "encoder", JOIN_TIMEOUT_MS);
+        JoinThreadWithTimeout(audioThread, "audio", JOIN_TIMEOUT_MS);
+        JoinThreadWithTimeout(cursorThread, "cursor", JOIN_TIMEOUT_MS);
+        JoinThreadWithTimeout(srvThread, "server", JOIN_TIMEOUT_MS);
 
-        if(encThread.joinable()) { DBG("Waiting for encoder thread..."); encThread.join(); }
-        if(audioThread.joinable()) { DBG("Waiting for audio thread..."); audioThread.join(); }
-        if(cursorThread.joinable()) { DBG("Waiting for cursor thread..."); cursorThread.join(); }
-        if(srvThread.joinable()) { DBG("Waiting for server thread..."); srvThread.join(); }
-
-        forceExit.store(true, std::memory_order_release);
+        CleanupAppTray();
         WSACleanup();
         LOG("Shutdown complete");
 
     } catch(const std::exception& e) {
+        CleanupAppTray();
         ERR("Fatal: %s", e.what());
         WSACleanup();
         getchar();
         return 1;
     } catch(...) {
+        CleanupAppTray();
         ERR("Fatal: Unknown exception");
         WSACleanup();
         getchar();

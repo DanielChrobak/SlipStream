@@ -63,6 +63,8 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 - **Session Auth** - PBKDF2-SHA256 password hashing with JWT tokens
 - **Rate Limiting** - Brute-force protection with IP lockout
 - **Auto SSL** - Self-signed certificate generation on first run
+- **System Tray Control** - Starts minimized to tray; right-click tray menu for Open/Exit
+- **Multi-Network URL Output** - Startup logs all non-loopback LAN IPv4 URLs
 - **Debug Stats** - Real-time performance overlay with comprehensive metrics
 
 ## Requirements
@@ -98,7 +100,8 @@ cd C:\vcpkg
 ### 2. Build
 
 ```batch
-build.bat
+cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --config Release --target SlipStream
 ```
 
 Output: `build\bin\Release\SlipStream.exe`
@@ -106,7 +109,7 @@ Output: `build\bin\Release\SlipStream.exe`
 ### 3. Run
 
 ```batch
-run.bat
+build\bin\Release\SlipStream.exe
 ```
 
 On first run:
@@ -118,6 +121,10 @@ On first run:
 ### 4. Connect
 
 Open browser to `https://<HOST_IP>:443` and log in with your credentials.
+
+At startup, SlipStream prints:
+- `Local` URL (`https://localhost:443`)
+- All detected non-loopback LAN IPv4 `Network` URLs
 
 > **Note:** Self-signed certificate will trigger a browser warning. Click through to proceed.
 
@@ -169,7 +176,9 @@ Passwords are never stored in plain text. Only the salt and derived hash are sav
 Auto-generated on first run:
 - 2048-bit RSA key
 - 10-year validity
-- Subject Alt Names: localhost, 127.0.0.1, 0.0.0.0
+- Subject Alt Names include localhost, host DNS name, and detected LAN IPv4 addresses
+
+If you previously generated certificates, delete `%APPDATA%\\SlipStream\\server.crt` and `%APPDATA%\\SlipStream\\server.key` to regenerate with updated SANs.
 
 To use custom certificates, replace `%APPDATA%\\SlipStream\\server.crt` and `%APPDATA%\\SlipStream\\server.key` before starting.
 
@@ -609,7 +618,14 @@ Managed via vcpkg (`vcpkg.json`):
 ### Standard Build
 
 ```batch
-build.bat
+cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --config Release --target SlipStream
+```
+
+### Standard Run
+
+```batch
+build\bin\Release\SlipStream.exe
 ```
 
 ### Installer Build
@@ -618,7 +634,7 @@ build.bat
 build_installer.bat
 ```
 
-Creates `SlipStream-1.0.0-win64.exe` (NSIS) or `.zip` (fallback).
+Creates `build\SlipStream-1.0.0-Setup.exe` (Inno Setup).
 
 ## File Structure
 
@@ -628,12 +644,21 @@ SlipStream/
 │   ├── common.hpp      # Common includes, types, auth utilities
 │   ├── capture.hpp     # Screen capture with WGC
 │   ├── encoder.hpp     # Hardware video encoding (NVENC/QSV/AMF)
-│   ├── webrtc.hpp      # WebRTC server implementation
+│   ├── webrtc.hpp      # WebRTC server declarations
 │   ├── audio.hpp       # WASAPI audio capture + Opus encoding
 │   ├── input.hpp       # Input handling + clipboard
 │   └── mic.hpp         # VB-Cable microphone playback
 ├── src/
-│   └── main.cpp        # Application entry point
+│   ├── main.cpp        # Application entry point
+│   ├── common.cpp      # Auth/SSL/shared runtime implementations
+│   ├── app_support.cpp # App setup/auth/helpers
+│   ├── webrtc.cpp      # WebRTC server implementation
+│   ├── tray.cpp        # System tray integration
+│   ├── capture.cpp     # Screen capture pipeline
+│   ├── encoder.cpp     # Video encoder pipeline
+│   ├── audio.cpp       # System audio capture
+│   ├── mic.cpp         # Mic playback pipeline
+│   └── input.cpp       # Input injection/clipboard
 ├── client/
 │   ├── index.html      # Web client HTML
 │   ├── styles.css      # Stylesheet
@@ -647,9 +672,7 @@ SlipStream/
 │       └── mic.js      # Microphone capture and encoding
 ├── vcpkg.json          # Dependencies
 ├── CMakeLists.txt      # Build configuration
-├── build.bat           # Build script
 ├── build_installer.bat # Installer build script
-├── run.bat             # Run script
 ├── LICENSE.md          # Styled license text
 └── Installer-LICENSE.txt # Installer license text
 ```
@@ -662,7 +685,7 @@ To enable client microphone audio on the server:
 2. The server automatically detects "CABLE Input" as the output device
 3. Configure your application to use "CABLE Output" as its microphone input
 
-If VB-Cable is not installed, the server falls back to the default audio endpoint.
+If VB-Cable is not installed, microphone playback is unavailable until a matching render device is present.
 
 ## Troubleshooting
 

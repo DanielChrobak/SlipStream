@@ -7,7 +7,7 @@ import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, setReqKeyFn,
     setSendAudioEnableFn, stopKeyframeRetryTimer } from './media.js';
 import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs, setNetCbs,
     updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection,
-    getStoredFps, updateFpsDropdown } from './ui.js';
+    getStoredFps, updateFpsDropdown, closeTabbedMode } from './ui.js';
 import { resetRenderer, setCursorStyle } from './renderer.js';
 import { setDcMic, setMicEnableCallback, closeMic } from './mic.js';
 
@@ -339,6 +339,7 @@ const handleControl = e => {
         logNetworkDrop('Kicked by server');
         cleanup();
         hasConnection = false;
+        closeTabbedMode();
         showAuth('Disconnected: Another client connected');
         return;
     }
@@ -581,6 +582,8 @@ const connect = async () => {
             logNetworkDrop('Connection failed', { state: pc.connectionState });
 
             if (authElements.overlay.classList.contains('visible')) return;
+
+            closeTabbedMode();
 
             if (++connectionAttempts >= 3) {
                 clearSession();

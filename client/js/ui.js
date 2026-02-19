@@ -371,6 +371,15 @@ const updateTabbedUI = () => {
 
     setTimeout(() => window.dispatchEvent(new Event('resize')), 350);
 };
+
+export const closeTabbedMode = () => {
+    if (!S.tabbedMode) return;
+    S.tabbedMode = false;
+    savePref(STORAGE_KEYS.TABBED, false);
+    updateTabbedUI();
+    log.info('UI', 'Tabbed mode closed');
+};
+
 S.tabbedMode = localStorage.getItem(STORAGE_KEYS.TABBED) === 'true';
 
 tabbedModeBtn.onclick = () => {
@@ -448,6 +457,19 @@ let metricsUnsubscribe = null;
 const formatValue = (val, decimals = 2, suffix = '') =>
     val > 0 ? `${val.toFixed(decimals)}${suffix}` : `--${suffix}`;
 
+const formatUptime = totalSeconds => {
+    const sec = Math.max(0, Math.floor(totalSeconds || 0));
+    const days = Math.floor(sec / 86400);
+    const hours = Math.floor((sec % 86400) / 3600);
+    const minutes = Math.floor((sec % 3600) / 60);
+    const seconds = sec % 60;
+
+    if (days > 0) return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+    if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+};
+
 const CODEC_NAMES = ['AV1', 'H.265', 'H.264'];
 
 const updateStats = data => {
@@ -476,7 +498,7 @@ const updateStats = data => {
         statsAudioBuffer: formatValue(audio.avgBufferHealth, 1, ' ms'),
         statsInputMouse: `${stats.moves} moves, ${stats.clicks} clicks`,
         statsInputKeys: stats.keys.toString(),
-        statsUptime: `${data.uptime}s`,
+        statsUptime: formatUptime(data.uptime),
         statsTotalFrames: session.totalFrames.toLocaleString(),
         statsTotalData: `${(session.totalBytes / 1048576).toFixed(2)} MB`,
         statsHostVersion: S.hostVersion || '--'

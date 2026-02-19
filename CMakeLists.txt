@@ -24,9 +24,20 @@ find_library(AVCODEC_LIBRARY avcodec)
 find_path(AVUTIL_INCLUDE_DIR libavutil/avutil.h)
 find_library(AVUTIL_LIBRARY avutil)
 
-add_executable(SlipStream
+set(SLIPSTREAM_SOURCES
     src/main.cpp
+    src/common.cpp
+    src/app_support.cpp
+    src/webrtc.cpp
+    src/tray.cpp
+    src/audio.cpp
+    src/mic.cpp
+    src/input.cpp
+    src/capture.cpp
+    src/encoder.cpp
     include/common.hpp
+    include/app_support.hpp
+    include/tray.hpp
     include/capture.hpp
     include/encoder.hpp
     include/webrtc.hpp
@@ -34,6 +45,12 @@ add_executable(SlipStream
     include/input.hpp
     include/mic.hpp
 )
+
+if(WIN32)
+    list(APPEND SLIPSTREAM_SOURCES src/version.rc)
+endif()
+
+add_executable(SlipStream ${SLIPSTREAM_SOURCES})
 
 target_compile_definitions(SlipStream PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_include_directories(SlipStream PRIVATE ${AVCODEC_INCLUDE_DIR} ${AVUTIL_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/include)
