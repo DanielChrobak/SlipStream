@@ -4,6 +4,80 @@
 #include <ws2tcpip.h>
 
 namespace {
+std::mutex g_logMutex;
+FILE* g_logFile = nullptr;
+std::atomic<bool> g_loggingInit{false};
+
+void CloseLogFileLocked() {
+    if(g_logFile) {
+        fflush(g_logFile);
+        fclose(g_logFile);
+        g_logFile = nullptr;
+    }
+}
+
+std::string ResolveLogFilePath() {
+    const char* appData = std::getenv("APPDATA");
+    std::filesystem::path dir = appData && *appData
+        ? std::filesystem::path(appData) / "SlipStream"
+        : std::filesystem::path(".") / "SlipStream";
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return (dir / "slipstream.log").string();
+}
+}
+
+void ShutdownLogging() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    CloseLogFileLocked();
+    g_loggingInit = false;
+}
+
+void InitLogging() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if(g_loggingInit) return;
+    g_loggingInit = true;
+
+    std::string logPath = ResolveLogFilePath();
+    g_logFile = fopen(logPath.c_str(), "a");
+    if(g_logFile) {
+        setvbuf(g_logFile, nullptr, _IONBF, 0);
+        std::atexit(ShutdownLogging);
+    }
+}
+
+void LogPrint(const char* level, bool toStderr, const char* fmt, ...) {
+    char message[4096];
+
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    FILE* out = toStderr ? stderr : stdout;
+    fprintf(out, "[%s] %s\n", level, message);
+    fflush(out);
+
+    if(!g_loggingInit) InitLogging();
+
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if(!g_logFile) return;
+
+    fprintf(
+        g_logFile,
+        "%04d-%02d-%02d %02d:%02d:%02d.%03d [%s] %s\n",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        level, message
+    );
+    fflush(g_logFile);
+}
+
+namespace {
 std::vector<std::string> GetCertificateSANIPs() {
     std::vector<std::string> ips;
     std::unordered_set<std::string> seen;

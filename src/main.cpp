@@ -68,6 +68,8 @@ bool JoinThreadWithTimeout(std::thread& t, const char* name, DWORD timeoutMs) {
 
 int main(int argc, char* argv[]) {
     try {
+        InitLogging();
+
         for(int i = 1; i < argc; i++) {
             if(strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
                 g_debugLogging = true;

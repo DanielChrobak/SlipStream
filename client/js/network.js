@@ -1,5 +1,5 @@
 
-import { enableControl, setClipboardRequestFn, setCursorCaptureFn } from './input.js';
+import { enableControl, setClipboardRequestFn, setClipboardPushFn, setCursorCaptureFn } from './input.js';
 import { MSG, C, S, $, mkBuf, safe, safeAsync, updateClockOffset, resetClockSync,
     startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log } from './state.js';
@@ -34,6 +34,42 @@ const sendCursorCapture = en => mkByte5Msg(MSG.CURSOR_CAPTURE, en ? 1 : 0);
 const sendFps = (fps, mode) => mkCtrlMsg(MSG.FPS_SET, 7, v => { v.setUint16(4, fps, true); v.setUint8(6, mode); });
 const requestKeyframe = () => mkCtrlMsg(MSG.REQUEST_KEY, 4);
 const requestClipboard = () => S.dcControl?.readyState === 'open' && mkCtrlMsg(MSG.CLIPBOARD_GET, 4);
+const clipboardEncoder = new TextEncoder();
+const pushClipboardToHost = async () => {
+    if (S.dcControl?.readyState !== 'open') {
+        logNetworkDrop('Clipboard push skipped: control channel not open');
+        return false;
+    }
+    if (!navigator.clipboard?.readText) {
+        logNetworkDrop('Clipboard read unavailable in browser');
+        return false;
+    }
+
+    const text = await navigator.clipboard.readText();
+    if (!text) {
+        log.debug('NET', 'Clipboard push skipped: empty clipboard');
+        return false;
+    }
+
+    const encoded = clipboardEncoder.encode(text);
+    if (encoded.byteLength > 1048576) {
+        logNetworkDrop('Clipboard push skipped: payload too large', { len: encoded.byteLength });
+        return false;
+    }
+
+    const sent = mkCtrlMsg(MSG.CLIPBOARD_DATA, 8 + encoded.byteLength, v => {
+        v.setUint32(4, encoded.byteLength, true);
+        new Uint8Array(v.buffer).set(encoded, 8);
+    });
+
+    if (sent) {
+        log.debug('NET', 'Clipboard pushed to host', { len: encoded.byteLength });
+    } else {
+        logNetworkDrop('Clipboard push send failed');
+    }
+
+    return sent;
+};
 
 const sendPing = () => {
     if (S.dcControl?.readyState !== 'open') return;
@@ -43,6 +79,7 @@ const sendPing = () => {
     }));
 };
 setClipboardRequestFn(requestClipboard);
+setClipboardPushFn(pushClipboardToHost);
 setReqKeyFn(requestKeyframe);
 const authElements = {
     overlay: $('authOverlay'),

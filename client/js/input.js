@@ -10,9 +10,12 @@ let pendingAbs = null;
 let pendingRel = { dx: 0, dy: 0 };
 let rafId = null;
 let clipboardRequestFn = null;
+let clipboardPushFn = null;
 let cursorCaptureFn = null;
+let pendingClipboardPaste = null;
 
 export const setClipboardRequestFn = fn => { clipboardRequestFn = fn; };
+export const setClipboardPushFn = fn => { clipboardPushFn = fn; };
 export const setCursorCaptureFn = fn => { cursorCaptureFn = fn; };
 const CODE_MAP = {
     Backspace:8, Tab:9, Enter:13, ShiftLeft:16, ShiftRight:16,
@@ -160,13 +163,37 @@ const handleKey = (e, down) => {
         log.debug('INPUT', 'Unknown key code', { code: e.code });
         return;
     }
+
+    if (!down && e.code === 'KeyV' && pendingClipboardPaste) {
+        pendingClipboardPaste.keyUpQueued = true;
+        return;
+    }
+
     if (down && e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
-        if (e.code === 'KeyV' || e.code === 'KeyC') {
+        if (e.code === 'KeyV') {
+            if (S.clipboardSyncEnabled && clipboardPushFn && !pendingClipboardPaste) {
+                pendingClipboardPaste = { keyUpQueued: false };
+
+                clipboardPushFn()
+                    .catch(err => log.debug('INPUT', 'Clipboard push failed before paste', { error: err?.message }))
+                    .finally(() => {
+                        sendNow('key', vk, 0, 1, mods);
+                        if (pendingClipboardPaste?.keyUpQueued) sendNow('key', vk, 0, 0, mods);
+                        pendingClipboardPaste = null;
+                        log.debug('INPUT', 'Clipboard paste shortcut handled');
+                    });
+                return;
+            }
+
+            sendNow('key', vk, 0, 1, mods);
+            return;
+        }
+
+        if (e.code === 'KeyC') {
             sendNow('key', vk, 0, 1, mods);
             if (S.clipboardSyncEnabled && clipboardRequestFn) {
-                const delay = e.code === 'KeyV' ? 100 : 150;
-                setTimeout(clipboardRequestFn, delay);
-                log.debug('INPUT', 'Clipboard shortcut', { action: e.code === 'KeyV' ? 'paste' : 'copy' });
+                setTimeout(clipboardRequestFn, 150);
+                log.debug('INPUT', 'Clipboard shortcut', { action: 'copy' });
             }
             return;
         }
