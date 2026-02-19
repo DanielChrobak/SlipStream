@@ -12,6 +12,9 @@
 #include <Windows.Graphics.Capture.Interop.h>
 #include <Windows.Graphics.DirectX.Direct3D11.Interop.h>
 #include <rtc/rtc.hpp>
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <openssl/rand.h>

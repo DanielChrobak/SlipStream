@@ -179,13 +179,46 @@ std::string ExtractSessionCookie(const httplib::Request& req) {
     return end != std::string::npos ? it->second.substr(start, end - start) : it->second.substr(start);
 }
 
+std::string Trim(const std::string& value) {
+    size_t start = 0;
+    while(start < value.size() && std::isspace((unsigned char)value[start])) start++;
+
+    size_t end = value.size();
+    while(end > start && std::isspace((unsigned char)value[end - 1])) end--;
+
+    return value.substr(start, end - start);
+}
+
+bool IsIPv4InCidr(const std::string& ip, uint32_t network, uint32_t mask) {
+    in_addr addr{};
+    if(inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
+    uint32_t hostOrder = ntohl(addr.S_un.S_addr);
+    return (hostOrder & mask) == network;
+}
+
+bool IsTrustedProxyAddress(const std::string& ip) {
+    if(ip == "127.0.0.1" || ip == "::1" || ip == "localhost") return true;
+
+    return IsIPv4InCidr(ip, 0x0A000000u, 0xFF000000u) ||      // 10.0.0.0/8
+           IsIPv4InCidr(ip, 0xAC100000u, 0xFFF00000u) ||      // 172.16.0.0/12
+           IsIPv4InCidr(ip, 0xC0A80000u, 0xFFFF0000u) ||      // 192.168.0.0/16
+           IsIPv4InCidr(ip, 0x7F000000u, 0xFF000000u);        // 127.0.0.0/8
+}
+
 std::string GetClientIP(const httplib::Request& req) {
+    std::string remote = Trim(req.remote_addr);
+    if(!IsTrustedProxyAddress(remote)) return remote;
+
     auto it = req.headers.find("X-Forwarded-For");
     if(it != req.headers.end() && !it->second.empty()) {
-        size_t c = it->second.find(',');
-        return c != std::string::npos ? it->second.substr(0, c) : it->second;
+        std::string forwarded = it->second;
+        size_t comma = forwarded.find(',');
+        if(comma != std::string::npos) forwarded = forwarded.substr(0, comma);
+        forwarded = Trim(forwarded);
+        if(!forwarded.empty()) return forwarded;
     }
-    return req.remote_addr;
+
+    return remote;
 }
 
 }
