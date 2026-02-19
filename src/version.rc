@@ -21,7 +21,7 @@ BEGIN
             VALUE "FileDescription", "SlipStream\0"
             VALUE "FileVersion", "1.0.0\0"
             VALUE "InternalName", "SlipStream.exe\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 SlipStream\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Daniel Chrobak\0"
             VALUE "OriginalFilename", "SlipStream.exe\0"
             VALUE "ProductName", "SlipStream\0"
             VALUE "ProductVersion", "1.0.0\0"

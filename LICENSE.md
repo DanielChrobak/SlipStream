@@ -7,7 +7,7 @@ This license text (as modified) (c) 2026 Daniel Chrobak.
 
 - **Licensor:** Daniel Chrobak ("Licensor")
 - **Licensed Work:** SlipStream (the "Work")
-- **Copyright:** (c) 2025-2026 Daniel Chrobak
+- **Copyright:** (c) 2026 Daniel Chrobak
 - **Additional Use Grant:** Personal Online Use is permitted as defined in Section 2 and Section 3
 - **Change Date:** 2029-01-01
 - **Change License:** GNU Affero General Public License v3.0 or later ("AGPL-3.0-or-later")
@@ -135,4 +135,4 @@ This License is the entire agreement for the Work unless Licensor and You sign a
 
 ---
 
-(c) 2025-2026 Daniel Chrobak. All rights reserved.
+(c) 2026 Daniel Chrobak. All rights reserved.

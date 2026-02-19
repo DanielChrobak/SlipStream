@@ -741,5 +741,5 @@ Personal use permitted. Commercial use requires separate license.
 
 ## Copyright
 
-(c) 2025-2026 Daniel Chrobak. All rights reserved.
+(c) 2026 Daniel Chrobak. All rights reserved.
 
