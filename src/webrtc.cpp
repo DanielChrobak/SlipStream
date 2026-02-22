@@ -1,616 +1,453 @@
 #include "webrtc.hpp"
+#include <cstring>
 
-bool WebRTCServer::ChOpen(const std::shared_ptr<rtc::DataChannel>& ch) const {
-    return ch && ch->isOpen();
+namespace {
+template <typename T>
+void WritePod(uint8_t* dst, const T& value) {
+    std::memcpy(dst, &value, sizeof(T));
 }
 
-bool WebRTCServer::AllOpen() const {
-    return ChOpen(dcCtrl) && ChOpen(dcVid) && ChOpen(dcAud) && ChOpen(dcIn) && ChOpen(dcMic);
+template <typename T>
+[[nodiscard]] T ReadPod(const uint8_t* src) {
+    T value{};
+    std::memcpy(&value, src, sizeof(T));
+    return value;
+}
+
+const char* ToPeerStateString(rtc::PeerConnection::State s) {
+    switch (s) {
+        case rtc::PeerConnection::State::New: return "new";
+        case rtc::PeerConnection::State::Connecting: return "connecting";
+        case rtc::PeerConnection::State::Connected: return "connected";
+        case rtc::PeerConnection::State::Disconnected: return "disconnected";
+        case rtc::PeerConnection::State::Failed: return "failed";
+        case rtc::PeerConnection::State::Closed: return "closed";
+        default: return "unknown";
+    }
+}
+
+const char* ToGatherStateString(rtc::PeerConnection::GatheringState s) {
+    switch (s) {
+        case rtc::PeerConnection::GatheringState::New: return "new";
+        case rtc::PeerConnection::GatheringState::InProgress: return "in-progress";
+        case rtc::PeerConnection::GatheringState::Complete: return "complete";
+        default: return "unknown";
+    }
+}
 }
 
 bool WebRTCServer::SendCtrl(const void* d, size_t len) {
-    if(!ChOpen(dcCtrl)) {
-        DBG("WebRTC: SendCtrl failed - control channel not open");
-        return false;
+    std::shared_ptr<rtc::DataChannel> ctrl;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        ctrl = dcCtrl;
     }
+    if (!ctrl || !ctrl->isOpen()) return false;
     try {
-        dcCtrl->send((const std::byte*)d, len);
-        ctrlMsgsSent++;
+        ctrl->send((const std::byte*)d, len);
+        ctrlSent++;
         return true;
-    } catch(const std::exception& e) {
-        WARN("WebRTC: SendCtrl exception: %s", e.what());
-        return false;
-    } catch(...) {
-        WARN("WebRTC: SendCtrl unknown exception");
+    } catch (...) {
+        WARN("WebRTC: SendCtrl failed");
         return false;
     }
 }
 
 void WebRTCServer::SendHostInfo() {
     uint8_t buf[6];
-    *(uint32_t*)buf = MSG_HOST_INFO;
-    int fps = cb.getHostFps ? cb.getHostFps() : 60;
-    *(uint16_t*)(buf + 4) = (uint16_t)fps;
-    if(!SendCtrl(buf, sizeof(buf))) {
-        WARN("WebRTC: Failed to send host info (fps=%d)", fps);
-    } else {
-        DBG("WebRTC: Sent host info (fps=%d)", fps);
-    }
+    WritePod<uint32_t>(buf, MSG_HOST_INFO);
+    WritePod<uint16_t>(buf + 4, static_cast<uint16_t>(cb.getHostFps ? cb.getHostFps() : 60));
+    SendCtrl(buf, sizeof(buf));
 }
 
 void WebRTCServer::SendMonitorList() {
     std::vector<uint8_t> buf;
     std::lock_guard<std::mutex> lk(g_monitorsMutex);
 
-    if(g_monitors.empty()) {
-        WARN("WebRTC: SendMonitorList called with no monitors");
-    }
-
     buf.resize(6 + g_monitors.size() * 74);
     size_t o = 0;
-    *(uint32_t*)&buf[o] = MSG_MONITOR_LIST;
-    o += 4;
-    buf[o++] = (uint8_t)g_monitors.size();
-    buf[o++] = (uint8_t)(cb.getMonitor ? cb.getMonitor() : 0);
+    WritePod<uint32_t>(buf.data() + o, MSG_MONITOR_LIST); o += 4;
+    buf[o++] = static_cast<uint8_t>(g_monitors.size());
+    buf[o++] = static_cast<uint8_t>(cb.getMonitor ? cb.getMonitor() : 0);
 
-    for(const auto& m : g_monitors) {
-        buf[o++] = (uint8_t)m.index;
-        *(uint16_t*)&buf[o] = (uint16_t)m.width;
-        *(uint16_t*)&buf[o + 2] = (uint16_t)m.height;
-        *(uint16_t*)&buf[o + 4] = (uint16_t)m.refreshRate;
+    for (const auto& m : g_monitors) {
+        buf[o++] = static_cast<uint8_t>(m.index);
+        WritePod<uint16_t>(buf.data() + o, static_cast<uint16_t>(m.width));
+        WritePod<uint16_t>(buf.data() + o + 2, static_cast<uint16_t>(m.height));
+        WritePod<uint16_t>(buf.data() + o + 4, static_cast<uint16_t>(m.refreshRate));
         o += 6;
         buf[o++] = m.isPrimary ? 1 : 0;
-        size_t nl = std::min(m.name.size(), (size_t)63);
-        buf[o++] = (uint8_t)nl;
+        size_t nl = std::min(m.name.size(), static_cast<size_t>(63));
+        buf[o++] = static_cast<uint8_t>(nl);
         memcpy(&buf[o], m.name.c_str(), nl);
         o += nl;
     }
-
     buf.resize(o);
-    if(!SendCtrl(buf.data(), buf.size())) {
-        WARN("WebRTC: Failed to send monitor list (%zu monitors)", g_monitors.size());
-    } else {
-        DBG("WebRTC: Sent monitor list (%zu monitors, current=%d)",
-            g_monitors.size(), cb.getMonitor ? cb.getMonitor() : 0);
-    }
+    SendCtrl(buf.data(), buf.size());
 }
 
 void WebRTCServer::SendCodecCaps() {
-    uint8_t caps = cb.getCodecCaps ? cb.getCodecCaps() : 0x07;
-    uint8_t buf[5];
-    *(uint32_t*)buf = MSG_CODEC_CAPS;
-    buf[4] = caps;
-    if(!SendCtrl(buf, sizeof(buf))) {
-        WARN("WebRTC: Failed to send codec caps (0x%02X)", caps);
-    } else {
-        DBG("WebRTC: Sent codec caps (AV1:%d H265:%d H264:%d)",
-            (caps & 1) ? 1 : 0, (caps & 2) ? 1 : 0, (caps & 4) ? 1 : 0);
-    }
+    uint8_t buf[5] = {};
+    WritePod<uint32_t>(buf, MSG_CODEC_CAPS);
+    buf[4] = cb.getCodecCaps ? cb.getCodecCaps() : 0x07;
+    SendCtrl(buf, sizeof(buf));
 }
 
 void WebRTCServer::SendVersion() {
     std::string ver = SLIPSTREAM_VERSION;
     std::vector<uint8_t> buf(5 + ver.size());
-    *(uint32_t*)buf.data() = MSG_VERSION;
-    buf[4] = (uint8_t)ver.size();
+    WritePod<uint32_t>(buf.data(), MSG_VERSION);
+    buf[4] = static_cast<uint8_t>(ver.size());
     memcpy(buf.data() + 5, ver.c_str(), ver.size());
-    if(!SendCtrl(buf.data(), buf.size())) {
-        WARN("WebRTC: Failed to send version");
-    } else {
-        DBG("WebRTC: Sent version %s", ver.c_str());
-    }
+    SendCtrl(buf.data(), buf.size());
 }
 
 void WebRTCServer::HandleCtrl(const rtc::binary& m) {
-    if(m.size() < 4) {
-        WARN("WebRTC: HandleCtrl received message too small (%zu bytes)", m.size());
-        return;
-    }
-    if(chRdy < NUM_CH) {
-        DBG("WebRTC: HandleCtrl called before all channels ready (%d/%d)", chRdy.load(), NUM_CH);
-        return;
-    }
+    if (m.size() < 4 || chRdy < NUM_CH) return;
+    ctrlRecv++;
 
-    ctrlMsgsReceived++;
-    uint32_t magic = *(const uint32_t*)m.data();
-
-    switch(magic) {
+    uint32_t magic = ReadPod<uint32_t>(reinterpret_cast<const uint8_t*>(m.data()));
+    switch (magic) {
         case MSG_PING:
-            if(m.size() == 16) {
+            if (m.size() == 16) {
                 lastPing = GetTimestamp() / 1000;
                 overflow = 0;
                 uint8_t r[24];
                 memcpy(r, m.data(), 16);
-                *(uint64_t*)(r + 16) = GetTimestamp();
+                WritePod<uint64_t>(r + 16, static_cast<uint64_t>(GetTimestamp()));
                 SendCtrl(r, sizeof(r));
-            } else {
-                WARN("WebRTC: MSG_PING invalid size (%zu, expected 16)", m.size());
             }
             break;
 
         case MSG_FPS_SET:
-            if(m.size() == 7) {
-                uint16_t fps = *(const uint16_t*)((const uint8_t*)m.data() + 4);
-                uint8_t mode = (uint8_t)m[6];
-                if(fps >= 1 && fps <= 240 && mode <= 2) {
+            if (m.size() == 7) {
+                uint16_t fps = ReadPod<uint16_t>(reinterpret_cast<const uint8_t*>(m.data()) + 4);
+                uint8_t mode = static_cast<uint8_t>(m[6]);
+                if (fps >= 1 && fps <= 240 && mode <= 2) {
                     int act = (mode == 1 && cb.getHostFps) ? cb.getHostFps() : fps;
                     fpsRecv = true;
-                    LOG("WebRTC: FPS set to %d (requested=%d, mode=%d)", act, fps, mode);
-                    if(cb.onFpsChange) cb.onFpsChange(act, mode);
+                    LOG("WebRTC: FPS set to %d (mode=%d)", act, mode);
+                    if (cb.onFpsChange) cb.onFpsChange(act, mode);
                     uint8_t a[7];
-                    *(uint32_t*)a = MSG_FPS_ACK;
-                    *(uint16_t*)(a + 4) = (uint16_t)act;
+                    WritePod<uint32_t>(a, MSG_FPS_ACK);
+                    WritePod<uint16_t>(a + 4, static_cast<uint16_t>(act));
                     a[6] = mode;
                     SendCtrl(a, sizeof(a));
-                } else {
-                    WARN("WebRTC: MSG_FPS_SET invalid params (fps=%d, mode=%d)", fps, mode);
                 }
-            } else {
-                WARN("WebRTC: MSG_FPS_SET invalid size (%zu, expected 7)", m.size());
             }
             break;
 
         case MSG_CODEC_SET:
-            if(m.size() == 5) {
-                uint8_t codecVal = (uint8_t)m[4];
-                if(codecVal <= 2) {
-                    CodecType nc = (CodecType)codecVal;
-                    const char* codecNames[] = {"AV1", "H265", "H264"};
-                    bool success = !cb.onCodecChange || cb.onCodecChange(nc);
-                    if(success) {
-                        curCodec = nc;
-                        needsKey = true;
-                        LOG("WebRTC: Codec changed to %s", codecNames[codecVal]);
-                    } else {
-                        WARN("WebRTC: Codec change to %s rejected", codecNames[codecVal]);
-                    }
-                    uint8_t a[5];
-                    *(uint32_t*)a = MSG_CODEC_ACK;
-                    a[4] = (uint8_t)curCodec.load();
-                    SendCtrl(a, sizeof(a));
-                } else {
-                    WARN("WebRTC: MSG_CODEC_SET invalid codec value %d", codecVal);
-                }
-            } else {
-                WARN("WebRTC: MSG_CODEC_SET invalid size (%zu, expected 5)", m.size());
+            if (m.size() == 5 && static_cast<uint8_t>(m[4]) <= 2) {
+                CodecType nc = static_cast<CodecType>(static_cast<uint8_t>(m[4]));
+                bool ok = !cb.onCodecChange || cb.onCodecChange(nc);
+                if (ok) { curCodec = nc; needsKey = true; }
+                uint8_t a[5];
+                WritePod<uint32_t>(a, MSG_CODEC_ACK);
+                a[4] = static_cast<uint8_t>(curCodec.load());
+                SendCtrl(a, sizeof(a));
             }
             break;
 
         case MSG_REQUEST_KEY:
-            needsKey = true;
-            DBG("WebRTC: Keyframe requested by client");
+            {
+                constexpr int64_t KEY_REQ_MIN_INTERVAL_MS = 350;
+                int64_t nowMs = GetTimestamp() / 1000;
+                int64_t lastMs = lastKeyReqMs.load(std::memory_order_acquire);
+                if (nowMs - lastMs >= KEY_REQ_MIN_INTERVAL_MS) {
+                    lastKeyReqMs.store(nowMs, std::memory_order_release);
+                    if (!needsKey.exchange(true, std::memory_order_acq_rel))
+                        DBG("WebRTC: Keyframe request accepted");
+                }
+            }
             break;
 
         case MSG_MONITOR_SET:
-            if(m.size() == 5) {
-                int monIdx = (int)(uint8_t)m[4];
-                if(cb.onMonitorChange) {
-                    bool success = cb.onMonitorChange(monIdx);
-                    if(success) {
-                        needsKey = true;
-                        SendMonitorList();
-                        SendHostInfo();
-                        LOG("WebRTC: Monitor switched to %d", monIdx);
-                    } else {
-                        WARN("WebRTC: Monitor switch to %d failed", monIdx);
-                    }
-                } else {
-                    WARN("WebRTC: MSG_MONITOR_SET but no handler configured");
+            if (m.size() == 5 && cb.onMonitorChange) {
+                if (cb.onMonitorChange(static_cast<int>(static_cast<uint8_t>(m[4])))) {
+                    needsKey = true;
+                    SendMonitorList();
+                    SendHostInfo();
                 }
-            } else {
-                WARN("WebRTC: MSG_MONITOR_SET invalid size (%zu, expected 5)", m.size());
             }
             break;
 
         case MSG_CLIPBOARD_DATA:
-            if(m.size() >= 8 && cb.setClipboard) {
-                uint32_t len = *(const uint32_t*)((const uint8_t*)m.data() + 4);
-                if(len > 0 && m.size() >= 8 + len && len <= 1048576) {
-                    bool success = cb.setClipboard(std::string((const char*)m.data() + 8, len));
-                    DBG("WebRTC: Clipboard data received (%u bytes, set=%s)",
-                        len, success ? "yes" : "no");
-                } else {
-                    WARN("WebRTC: MSG_CLIPBOARD_DATA invalid (len=%u, msgSize=%zu)", len, m.size());
-                }
-            } else if(m.size() < 8) {
-                WARN("WebRTC: MSG_CLIPBOARD_DATA too small (%zu bytes)", m.size());
+            if (m.size() >= 8 && cb.setClipboard) {
+                uint32_t len = ReadPod<uint32_t>(reinterpret_cast<const uint8_t*>(m.data()) + 4);
+                if (len > 0 && m.size() >= 8 + len && len <= 1048576)
+                    cb.setClipboard(std::string(reinterpret_cast<const char*>(m.data()) + 8, len));
             }
             break;
 
         case MSG_CLIPBOARD_GET:
-            if(cb.getClipboard) {
+            if (cb.getClipboard) {
                 std::string text = cb.getClipboard();
-                if(!text.empty() && text.size() <= 1048576) {
+                if (!text.empty() && text.size() <= 1048576) {
                     std::vector<uint8_t> buf(8 + text.size());
-                    *(uint32_t*)buf.data() = MSG_CLIPBOARD_DATA;
-                    *(uint32_t*)(buf.data() + 4) = (uint32_t)text.size();
+                    WritePod<uint32_t>(buf.data(), MSG_CLIPBOARD_DATA);
+                    WritePod<uint32_t>(buf.data() + 4, static_cast<uint32_t>(text.size()));
                     memcpy(buf.data() + 8, text.data(), text.size());
-                    if(SendCtrl(buf.data(), buf.size())) {
-                        DBG("WebRTC: Sent clipboard data (%zu bytes)", text.size());
-                    } else {
-                        WARN("WebRTC: Failed to send clipboard data");
-                    }
-                } else if(text.size() > 1048576) {
-                    WARN("WebRTC: Clipboard too large (%zu bytes, max 1MB)", text.size());
+                    SendCtrl(buf.data(), buf.size());
                 }
-            } else {
-                DBG("WebRTC: MSG_CLIPBOARD_GET but no handler configured");
             }
             break;
 
         case MSG_CURSOR_CAPTURE:
-            if(m.size() == 5) {
-                bool enable = (uint8_t)m[4] != 0;
-                if(cb.onCursorCapture) {
-                    cb.onCursorCapture(enable);
-                    DBG("WebRTC: Cursor capture %s", enable ? "enabled" : "disabled");
-                }
-            } else {
-                WARN("WebRTC: MSG_CURSOR_CAPTURE invalid size (%zu)", m.size());
-            }
+            if (m.size() == 5 && cb.onCursorCapture)
+                cb.onCursorCapture(static_cast<uint8_t>(m[4]) != 0);
             break;
 
         case MSG_AUDIO_ENABLE:
-            if(m.size() == 5) {
-                bool enable = (uint8_t)m[4] != 0;
-                if(cb.onAudioEnable) {
-                    cb.onAudioEnable(enable);
-                    LOG("WebRTC: Audio streaming %s", enable ? "enabled" : "disabled");
-                }
-            } else {
-                WARN("WebRTC: MSG_AUDIO_ENABLE invalid size (%zu)", m.size());
-            }
+            if (m.size() == 5 && cb.onAudioEnable)
+                cb.onAudioEnable(static_cast<uint8_t>(m[4]) != 0);
             break;
 
         case MSG_MIC_ENABLE:
-            if(m.size() == 5) {
-                bool enable = (uint8_t)m[4] != 0;
-                if(cb.onMicEnable) {
-                    cb.onMicEnable(enable);
-                    LOG("WebRTC: Mic streaming %s", enable ? "enabled" : "disabled");
-                }
-            } else {
-                WARN("WebRTC: MSG_MIC_ENABLE invalid size (%zu)", m.size());
-            }
-            break;
-
-        default:
-            DBG("WebRTC: Unknown control message type 0x%08X (%zu bytes)", magic, m.size());
+            if (m.size() == 5 && cb.onMicEnable)
+                cb.onMicEnable(static_cast<uint8_t>(m[4]) != 0);
             break;
     }
 }
 
 void WebRTCServer::HandleInput(const rtc::binary& m) {
-    if(m.size() < 4) {
-        WARN("WebRTC: HandleInput message too small (%zu bytes)", m.size());
-        return;
-    }
-    if(chRdy < NUM_CH) {
-        DBG("WebRTC: HandleInput called before all channels ready");
-        return;
-    }
-    if(!cb.input) {
-        DBG("WebRTC: HandleInput but no input handler configured");
-        return;
-    }
-    inputMsgsReceived++;
-    cb.input->HandleMessage((const uint8_t*)m.data(), m.size());
+    if (m.size() < 4 || chRdy < NUM_CH || !cb.input) return;
+    inputRecv++;
+    [[maybe_unused]] const bool handled = cb.input->HandleMessage(reinterpret_cast<const uint8_t*>(m.data()), m.size());
 }
 
 void WebRTCServer::HandleMic(const rtc::binary& m) {
-    if(m.size() < sizeof(MicPacketHeader)) {
-        WARN("WebRTC: HandleMic packet too small (%zu bytes, need %zu)",
-             m.size(), sizeof(MicPacketHeader));
-        return;
-    }
-    if(chRdy < NUM_CH) return;
-
-    if(*(const uint32_t*)m.data() == MSG_MIC_DATA) {
-        micPacketsReceived++;
-        if(cb.onMicData) {
-            cb.onMicData((const uint8_t*)m.data(), m.size());
-        }
-    } else {
-        WARN("WebRTC: HandleMic wrong magic 0x%08X", *(const uint32_t*)m.data());
+    if (m.size() < sizeof(MicPacketHeader) || chRdy < NUM_CH) return;
+    if (ReadPod<uint32_t>(reinterpret_cast<const uint8_t*>(m.data())) == MSG_MIC_DATA) {
+        micRecv++;
+        if (cb.onMicData) cb.onMicData(reinterpret_cast<const uint8_t*>(m.data()), m.size());
     }
 }
 
-void WebRTCServer::OnChOpen() {
+void WebRTCServer::OnChannelOpen(const std::string& label, uint64_t epoch) {
     int ready = ++chRdy;
-    DBG("WebRTC: Channel opened (%d/%d ready)", ready, NUM_CH);
-    if(ready == NUM_CH) {
+    LOG("WebRTC: Channel '%s' open (epoch=%llu active=%llu ready=%d/%d conn=%d fpsRecv=%d)",
+        label.c_str(), epoch, peerEpoch.load(), ready, NUM_CH, conn.load() ? 1 : 0, fpsRecv.load() ? 1 : 0);
+    if (ready == NUM_CH) {
         conn = true;
         needsKey = true;
         lastPing = GetTimestamp() / 1000;
         overflow = 0;
-        connectionCount++;
-        LOG("WebRTC: All channels ready, connection #%llu established", connectionCount.load());
+        connCount++;
+        LOG("WebRTC: Connection #%llu established (epoch=%llu)", connCount.load(), epoch);
         SendHostInfo();
         SendCodecCaps();
         SendMonitorList();
         SendVersion();
-        if(cb.onConnected) cb.onConnected();
+        if (cb.onConnected) cb.onConnected();
     }
 }
 
-void WebRTCServer::OnChClose() {
-    int wasReady = chRdy.exchange(0);
+void WebRTCServer::OnChannelClose(const std::string& label, uint64_t epoch) {
+    chRdy = 0;
     bool wasConn = conn.exchange(false);
     fpsRecv = false;
     overflow = 0;
-    if(wasConn) {
-        LOG("WebRTC: Connection closed (was ready: %d/%d)", wasReady, NUM_CH);
-    } else {
-        DBG("WebRTC: Channel closed (was ready: %d/%d)", wasReady, NUM_CH);
+    LOG("WebRTC: Channel '%s' closed (epoch=%llu active=%llu wasConn=%d)",
+        label.c_str(), epoch, peerEpoch.load(), wasConn ? 1 : 0);
+    if (epoch != peerEpoch.load()) {
+        WARN("WebRTC: Stale channel close from previous peer (channel=%s epoch=%llu active=%llu)",
+            label.c_str(), epoch, peerEpoch.load());
     }
-    if(cb.onDisconnect) cb.onDisconnect();
+    if (wasConn) LOG("WebRTC: Connection closed (epoch=%llu)", epoch);
+    if (cb.onDisconnect) cb.onDisconnect();
 }
 
-void WebRTCServer::SetupCh(std::shared_ptr<rtc::DataChannel>& ch, bool drain, bool msg,
-                           std::function<void(const rtc::binary&)> h) {
-    if(!ch) {
-        WARN("WebRTC: SetupCh called with null channel");
-        return;
-    }
-
+void WebRTCServer::SetupChannel(std::shared_ptr<rtc::DataChannel>& ch, bool drain,
+                                 std::function<void(const rtc::binary&)> handler,
+                                 uint64_t epoch) {
+    if (!ch) return;
     std::string label = ch->label();
-    DBG("WebRTC: Setting up channel '%s' (drain=%d, msg=%d)", label.c_str(), drain, msg);
+    LOG("WebRTC: Setup channel '%s' (epoch=%llu)", label.c_str(), epoch);
 
     ch->setBufferedAmountLowThreshold(BUF_LOW);
+    ch->onOpen([this, label, epoch] { OnChannelOpen(label, epoch); });
+    ch->onClosed([this, label, epoch] { OnChannelClose(label, epoch); });
+    ch->onError([label](std::string e) { ERR("WebRTC: Channel '%s' error: %s", label.c_str(), e.c_str()); });
 
-    ch->onOpen([this, label] {
-        DBG("WebRTC: Channel '%s' opened", label.c_str());
-        OnChOpen();
-    });
-
-    ch->onClosed([this, label] {
-        DBG("WebRTC: Channel '%s' closed", label.c_str());
-        OnChClose();
-    });
-
-    ch->onError([this, label](std::string error) {
-        ERR("WebRTC: Channel '%s' error: %s", label.c_str(), error.c_str());
-    });
-
-    if(msg && h) {
-        ch->onMessage([this, h, label](auto d) {
-            if(auto* b = std::get_if<rtc::binary>(&d)) {
-                h(*b);
-            } else {
-                DBG("WebRTC: Channel '%s' received non-binary message", label.c_str());
-            }
+    if (handler) {
+        ch->onMessage([handler](auto d) {
+            if (auto* b = std::get_if<rtc::binary>(&d)) handler(*b);
         });
     }
 
-    if(drain) {
+    if (drain) {
         ch->onBufferedAmountLow([this, label] {
-            if(label == "video") DrainVid();
-            else if(label == "audio") DrainAud();
+            if (label == "video") DrainVideo();
+            else if (label == "audio") DrainAudio();
         });
     }
 }
 
-void WebRTCServer::DrainVid() {
-    if(!ChOpen(dcVid)) return;
+void WebRTCServer::DrainVideo() {
+    std::shared_ptr<rtc::DataChannel> video;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        video = dcVid;
+    }
+    if (!video || !video->isOpen()) return;
     std::lock_guard<std::mutex> lk(sendMtx);
-    size_t sent = 0;
-
-    while(!vidQ.empty() && dcVid->bufferedAmount() <= VID_BUF) {
+    while (!vidQ.empty() && video->bufferedAmount() <= VID_BUF) {
         try {
-            dcVid->send((const std::byte*)vidQ.front().data(), vidQ.front().size());
-            sent++;
-        } catch(const std::exception& e) {
-            videoSendErrors++;
+            video->send((const std::byte*)vidQ.front().data(), vidQ.front().size());
+        } catch (...) {
+            videoErr++;
             overflow++;
             needsKey = true;
-            WARN("WebRTC: DrainVid send error: %s (overflow=%d)", e.what(), overflow.load());
-        } catch(...) {
-            videoSendErrors++;
-            overflow++;
-            needsKey = true;
-            WARN("WebRTC: DrainVid unknown send error (overflow=%d)", overflow.load());
         }
         vidQ.pop();
     }
-    if(sent > 0) {
-        DBG("WebRTC: DrainVid sent %zu packets, %zu remaining", sent, vidQ.size());
-    }
 }
 
-void WebRTCServer::DrainAud() {
-    if(!ChOpen(dcAud)) return;
+void WebRTCServer::DrainAudio() {
+    std::shared_ptr<rtc::DataChannel> audio;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        audio = dcAud;
+    }
+    if (!audio || !audio->isOpen()) return;
     std::lock_guard<std::mutex> lk(sendMtx);
-    size_t sent = 0;
-
-    while(!audQ.empty() && dcAud->bufferedAmount() <= AUD_BUF) {
+    while (!audQ.empty() && audio->bufferedAmount() <= AUD_BUF) {
         try {
-            dcAud->send((const std::byte*)audQ.front().data(), audQ.front().size());
-            sent++;
-        } catch(const std::exception& e) {
-            audioSendErrors++;
-            WARN("WebRTC: DrainAud send error: %s", e.what());
-        } catch(...) {
-            audioSendErrors++;
-            WARN("WebRTC: DrainAud unknown send error");
+            audio->send((const std::byte*)audQ.front().data(), audQ.front().size());
+        } catch (...) {
+            audioErr++;
         }
         audQ.pop();
     }
 }
 
 void WebRTCServer::Reset() {
-    DBG("WebRTC: Resetting connection state");
+    std::shared_ptr<rtc::DataChannel> ctrl, vid, aud, in, mic;
+    std::shared_ptr<rtc::PeerConnection> localPc;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        ctrl = std::move(dcCtrl);
+        vid = std::move(dcVid);
+        aud = std::move(dcAud);
+        in = std::move(dcIn);
+        mic = std::move(dcMic);
+        localPc = std::move(pc);
+    }
 
-    auto close = [](auto& ch, const char* name) {
-        try {
-            if(ch && ch->isOpen()) {
-                DBG("WebRTC: Closing channel '%s'", name);
-                ch->close();
-            }
-        } catch(const std::exception& e) {
-            WARN("WebRTC: Exception closing channel '%s': %s", name, e.what());
-        } catch(...) {
-            WARN("WebRTC: Unknown exception closing channel '%s'", name);
-        }
+    auto close = [](auto& ch) {
+        try { if (ch && ch->isOpen()) ch->close(); } catch (...) {}
         ch.reset();
     };
+    close(ctrl); close(vid); close(aud); close(in); close(mic);
+    try { if (localPc) localPc->close(); } catch (...) {}
 
-    close(dcCtrl, "control");
-    close(dcVid, "video");
-    close(dcAud, "audio");
-    close(dcIn, "input");
-    close(dcMic, "mic");
+    conn = false; fpsRecv = false; gathered = false; hasDesc = false;
+    chRdy = 0; overflow = 0; lastPing = 0;
 
-    try {
-        if(pc) {
-            DBG("WebRTC: Closing peer connection");
-            pc->close();
-        }
-    } catch(const std::exception& e) {
-        WARN("WebRTC: Exception closing peer connection: %s", e.what());
-    } catch(...) {
-        WARN("WebRTC: Unknown exception closing peer connection");
-    }
-
-    conn = false;
-    fpsRecv = false;
-    gathered = false;
-    hasDesc = false;
-    chRdy = 0;
-    overflow = 0;
-    lastPing = 0;
-
-    {
-        std::lock_guard<std::mutex> lk(descMtx);
-        localDesc.clear();
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(sendMtx);
-        size_t vidDropped = vidQ.size();
-        size_t audDropped = audQ.size();
-        while(!vidQ.empty()) vidQ.pop();
-        while(!audQ.empty()) audQ.pop();
-        if(vidDropped > 0 || audDropped > 0) {
-            DBG("WebRTC: Reset dropped %zu video, %zu audio packets", vidDropped, audDropped);
-        }
-    }
+    { std::lock_guard<std::mutex> lk(descMtx); localDesc.clear(); }
+    { std::lock_guard<std::mutex> lk(sendMtx); while (!vidQ.empty()) vidQ.pop(); while (!audQ.empty()) audQ.pop(); }
 }
 
-void WebRTCServer::SetupPC() {
-    if(pc && ChOpen(dcCtrl)) {
+void WebRTCServer::SetupPeerConnection() {
+    std::shared_ptr<rtc::DataChannel> ctrl;
+    std::shared_ptr<rtc::PeerConnection> existingPc;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        ctrl = dcCtrl;
+        existingPc = pc;
+    }
+
+    if (existingPc && ctrl && ctrl->isOpen()) {
         try {
-            uint8_t k[4];
-            *(uint32_t*)k = MSG_KICKED;
-            dcCtrl->send((const std::byte*)k, 4);
-            LOG("WebRTC: Kicked existing client for new connection");
+            uint8_t k[4]; WritePod<uint32_t>(k, MSG_KICKED);
+            ctrl->send((const std::byte*)k, 4);
             std::this_thread::sleep_for(50ms);
-        } catch(const std::exception& e) {
-            DBG("WebRTC: Failed to send kick message: %s", e.what());
-        } catch(...) {
-            DBG("WebRTC: Failed to send kick message (unknown error)");
-        }
+        } catch (...) {}
     }
 
     Reset();
     needsKey = true;
-    LOG("WebRTC: Creating new peer connection");
-    pc = std::make_shared<rtc::PeerConnection>(cfg);
+    uint64_t epoch = peerEpoch.fetch_add(1) + 1;
+    LOG("WebRTC: Creating peer connection (epoch=%llu)", epoch);
+    auto newPc = std::make_shared<rtc::PeerConnection>(cfg);
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        pc = newPc;
+    }
 
-    pc->onLocalDescription([this](rtc::Description d) {
+    newPc->onLocalDescription([this, epoch](rtc::Description d) {
+        LOG("WebRTC: Local description ready (epoch=%llu)", epoch);
         std::lock_guard<std::mutex> lk(descMtx);
         localDesc = std::string(d);
         hasDesc = true;
         descCv.notify_all();
-        DBG("WebRTC: Local description generated (%zu bytes)", localDesc.size());
     });
 
-    pc->onLocalCandidate([this](rtc::Candidate c) {
-        DBG("WebRTC: Local ICE candidate: %s", std::string(c).substr(0, 60).c_str());
+    newPc->onLocalCandidate([this, epoch](rtc::Candidate) {
+        DBG("WebRTC: Local candidate gathered (epoch=%llu)", epoch);
         descCv.notify_all();
     });
 
-    pc->onStateChange([this](auto s) {
-        const char* stateNames[] = {"New", "Connecting", "Connected", "Disconnected", "Failed", "Closed"};
-        int stateIdx = static_cast<int>(s);
-        LOG("WebRTC: Connection state -> %s", stateIdx < 6 ? stateNames[stateIdx] : "Unknown");
+    newPc->onStateChange([this, epoch](auto s) {
+        LOG("WebRTC: Peer state=%s (epoch=%llu active=%llu ch=%d fpsRecv=%d conn=%d)",
+            ToPeerStateString(s), epoch, peerEpoch.load(), chRdy.load(), fpsRecv.load() ? 1 : 0, conn.load() ? 1 : 0);
         bool now = s == rtc::PeerConnection::State::Connected;
-        if(now && !conn) {
-            needsKey = true;
-            lastPing = GetTimestamp() / 1000;
-        }
-        if(!now && conn) {
-            fpsRecv = false;
-            chRdy = 0;
-            if(cb.onDisconnect) cb.onDisconnect();
-        }
+        if (now && !conn) { needsKey = true; lastPing = GetTimestamp() / 1000; }
+        if (!now && conn) { fpsRecv = false; chRdy = 0; if (cb.onDisconnect) cb.onDisconnect(); }
         conn = now;
     });
 
-    pc->onGatheringStateChange([this](auto s) {
-        const char* gatherNames[] = {"New", "InProgress", "Complete"};
-        int gatherIdx = static_cast<int>(s);
-        DBG("WebRTC: ICE gathering state -> %s", gatherIdx < 3 ? gatherNames[gatherIdx] : "Unknown");
-        if(s == rtc::PeerConnection::GatheringState::Complete) {
+    newPc->onGatheringStateChange([this, epoch](auto s) {
+        LOG("WebRTC: Gathering state=%s (epoch=%llu)", ToGatherStateString(s), epoch);
+        if (s == rtc::PeerConnection::GatheringState::Complete) {
             gathered = true;
             descCv.notify_all();
         }
     });
 
-    pc->onDataChannel([this](auto ch) {
+    newPc->onDataChannel([this, epoch](auto ch) {
         std::string l = ch->label();
-        DBG("WebRTC: Remote data channel created: '%s'", l.c_str());
-
-        if(l == "control") {
+        LOG("WebRTC: Data channel announced '%s' (epoch=%llu active=%llu)", l.c_str(), epoch, peerEpoch.load());
+        if (l == "control") {
+            std::lock_guard<std::mutex> lk(chMtx);
             dcCtrl = ch;
-            SetupCh(dcCtrl, false, true, [this](auto& m) { HandleCtrl(m); });
-        } else if(l == "video") {
+            SetupChannel(dcCtrl, false, [this](auto& m) { HandleCtrl(m); }, epoch);
+        } else if (l == "video") {
+            std::lock_guard<std::mutex> lk(chMtx);
             dcVid = ch;
-            SetupCh(dcVid, true, false);
-        } else if(l == "audio") {
+            SetupChannel(dcVid, true, nullptr, epoch);
+        } else if (l == "audio") {
+            std::lock_guard<std::mutex> lk(chMtx);
             dcAud = ch;
-            SetupCh(dcAud, true, false);
-        } else if(l == "input") {
+            SetupChannel(dcAud, true, nullptr, epoch);
+        } else if (l == "input") {
+            std::lock_guard<std::mutex> lk(chMtx);
             dcIn = ch;
-            SetupCh(dcIn, false, true, [this](auto& m) { HandleInput(m); });
-        } else if(l == "mic") {
+            SetupChannel(dcIn, false, [this](auto& m) { HandleInput(m); }, epoch);
+        } else if (l == "mic") {
+            std::lock_guard<std::mutex> lk(chMtx);
             dcMic = ch;
-            SetupCh(dcMic, false, true, [this](auto& m) { HandleMic(m); });
-        } else {
-            WARN("WebRTC: Unknown data channel '%s' ignored", l.c_str());
+            SetupChannel(dcMic, false, [this](auto& m) { HandleMic(m); }, epoch);
         }
     });
 }
 
 bool WebRTCServer::IsStale() {
-    if(!conn) return false;
+    if (!conn) return false;
     int64_t now = GetTimestamp() / 1000;
-    int64_t pingAge = lastPing > 0 ? (now - lastPing) : 0;
-    int curOverflow = overflow.load();
-
-    if(pingAge > 3000) {
-        WARN("WebRTC: Connection stale - no ping for %lldms", pingAge);
-        return true;
-    }
-    if(curOverflow >= 10) {
-        WARN("WebRTC: Connection stale - overflow count %d", curOverflow);
-        return true;
-    }
-    return false;
+    if (lastPing > 0 && now - lastPing > 3000) return true;
+    return overflow.load() >= 10;
 }
 
 void WebRTCServer::LogStats() {
     int64_t now = GetTimestamp() / 1000;
-    if(now - lastStatLog.load() < 60000) return;
+    if (now - lastStatLog.load() < 60000) return;
     lastStatLog.store(now);
-
-    if(conn || totalVideoFramesSent > 0) {
-        LOG("WebRTC Stats: video=%llu/%llu audio=%llu/%llu ctrl=%llu/%llu input=%llu mic=%llu connections=%llu",
-            totalVideoFramesSent.load(), videoSendErrors.load(),
-            totalAudioPacketsSent.load(), audioSendErrors.load(),
-            ctrlMsgsSent.load(), ctrlMsgsReceived.load(),
-            inputMsgsReceived.load(), micPacketsReceived.load(),
-            connectionCount.load());
-    }
+    if (conn || videoSent > 0)
+        LOG("WebRTC Stats: v=%llu/%llu a=%llu/%llu ctrl=%llu/%llu in=%llu mic=%llu conn=%llu",
+            videoSent.load(), videoErr.load(), audioSent.load(), audioErr.load(),
+            ctrlSent.load(), ctrlRecv.load(), inputRecv.load(), micRecv.load(), connCount.load());
 }
 
 WebRTCServer::WebRTCServer() {
@@ -618,183 +455,165 @@ WebRTCServer::WebRTCServer() {
     cfg.portRangeBegin = 50000;
     cfg.portRangeEnd = 50020;
     cfg.enableIceTcp = false;
-    LOG("WebRTC: Server initialized (ports 50000-50020)");
-    SetupPC();
+    LOG("WebRTC: Server initialized");
+    SetupPeerConnection();
 }
 
 WebRTCServer::~WebRTCServer() {
-    LOG("WebRTC: Server shutting down");
     LogStats();
     Reset();
 }
 
-void WebRTCServer::Init(WebRTCCallbacks c) {
-    cb = std::move(c);
-    DBG("WebRTC: Callbacks initialized");
+void WebRTCServer::Init(WebRTCCallbacks c) { cb = std::move(c); }
+
+void WebRTCServer::Shutdown() {
+    Reset();
 }
 
 std::string WebRTCServer::GetLocal() {
     std::unique_lock<std::mutex> lk(descMtx);
-    if(!descCv.wait_for(lk, 200ms, [this] { return hasDesc.load(); })) {
-        WARN("WebRTC: GetLocal timed out waiting for local description");
-        return localDesc;
-    }
+    descCv.wait_for(lk, 200ms, [this] { return hasDesc.load(); });
     descCv.wait_for(lk, 150ms, [this] { return gathered.load(); });
-    DBG("WebRTC: GetLocal returning %zu byte description (gathered=%d)",
-        localDesc.size(), gathered.load());
     return localDesc;
 }
 
 void WebRTCServer::SetRemote(const std::string& sdp, const std::string& type) {
-    LOG("WebRTC: SetRemote called (type=%s, sdp=%zu bytes)", type.c_str(), sdp.size());
-    if(type == "offer") SetupPC();
+    LOG("WebRTC: SetRemote (type=%s)", type.c_str());
+    if (type == "offer") SetupPeerConnection();
 
-    try {
-        pc->setRemoteDescription(rtc::Description(sdp, type));
-        DBG("WebRTC: Remote description set successfully");
-    } catch(const std::exception& e) {
-        ERR("WebRTC: setRemoteDescription failed: %s", e.what());
-        throw;
+    std::shared_ptr<rtc::PeerConnection> localPc;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        localPc = pc;
     }
+    if (!localPc) return;
 
-    if(type == "offer") {
-        try {
-            pc->setLocalDescription();
-            DBG("WebRTC: Local description set");
-        } catch(const std::exception& e) {
-            ERR("WebRTC: setLocalDescription failed: %s", e.what());
-            throw;
-        }
-    }
-}
-
-bool WebRTCServer::IsStreaming() const {
-    return conn && fpsRecv && chRdy == NUM_CH;
-}
-
-bool WebRTCServer::NeedsKey() {
-    return needsKey.exchange(false);
+    localPc->setRemoteDescription(rtc::Description(sdp, type));
+    if (type == "offer") localPc->setLocalDescription();
 }
 
 bool WebRTCServer::SendCursorShape(CursorType ct) {
-    if(!IsStreaming()) return false;
+    if (!IsStreaming()) return false;
     uint8_t buf[5];
-    *(uint32_t*)buf = MSG_CURSOR_SHAPE;
-    buf[4] = (uint8_t)ct;
+    WritePod<uint32_t>(buf, MSG_CURSOR_SHAPE);
+    buf[4] = static_cast<uint8_t>(ct);
     return SendCtrl(buf, sizeof(buf));
 }
 
 bool WebRTCServer::Send(const EncodedFrame& f) {
-    if(!IsStreaming()) {
-        DBG("WebRTC: Send called but not streaming");
-        return false;
-    }
-
-    if(IsStale()) {
-        WARN("WebRTC: Connection stale, resetting");
-        Reset();
-        if(cb.onDisconnect) cb.onDisconnect();
-        return false;
-    }
+    if (!IsStreaming()) return false;
+    if (IsStale()) { Reset(); if (cb.onDisconnect) cb.onDisconnect(); return false; }
 
     size_t sz = f.data.size();
+    if (!sz || sz > DATA_CHUNK * 65535) return false;
+
     size_t nch = (sz + DATA_CHUNK - 1) / DATA_CHUNK;
-
-    if(!sz) {
-        WARN("WebRTC: Send called with empty frame");
-        return false;
-    }
-    if(nch > 65535) {
-        ERR("WebRTC: Frame too large (%zu bytes, %zu chunks)", sz, nch);
-        return false;
-    }
-
     uint32_t fid = frmId++;
-    PacketHeader h = {f.ts, (uint32_t)f.encUs, fid, 0, (uint16_t)nch, f.isKey ? (uint8_t)1 : (uint8_t)0};
+    if (nch > 65535) return false;
+
+    constexpr uint8_t PKT_DATA = 0;
+    constexpr uint8_t PKT_FEC = 1;
+    constexpr uint8_t FEC_GROUP_SIZE = 4;
+    size_t nfec = nch / FEC_GROUP_SIZE;
+
+    PacketHeader h = {
+        f.ts,
+        static_cast<uint32_t>(f.encUs),
+        fid,
+        static_cast<uint32_t>(sz),
+        0,
+        static_cast<uint16_t>(nch),
+        0,
+        static_cast<uint16_t>(DATA_CHUNK),
+        f.isKey ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+        PKT_DATA,
+        FEC_GROUP_SIZE
+    };
 
     {
         std::lock_guard<std::mutex> lk(sendMtx);
-        size_t dropped = 0;
-        while(vidQ.size() > nch * 3) {
+        while (vidQ.size() > (nch + nfec) * 3) {
             vidQ.pop();
             needsKey = true;
-            dropped++;
-        }
-        if(dropped > 0) {
-            droppedVideoFrames += dropped;
-            DBG("WebRTC: Dropped %zu old video packets (queue overflow)", dropped);
         }
 
-        for(size_t i = 0; i < nch; i++) {
-            h.chunkIndex = (uint16_t)i;
-            size_t off = i * DATA_CHUNK;
-            size_t len = std::min(DATA_CHUNK, sz - off);
-            std::vector<uint8_t> pkt(HDR_SZ + len);
-            memcpy(pkt.data(), &h, HDR_SZ);
-            memcpy(pkt.data() + HDR_SZ, f.data.data() + off, len);
-            vidQ.push(std::move(pkt));
+        for (size_t g = 0; g * FEC_GROUP_SIZE < nch; g++) {
+            size_t start = g * FEC_GROUP_SIZE;
+            size_t end = std::min(start + FEC_GROUP_SIZE, nch);
+            size_t parityLen = 0;
+
+            std::vector<uint8_t> parity(DATA_CHUNK, 0);
+
+            for (size_t i = start; i < end; i++) {
+                h.chunkIndex = static_cast<uint16_t>(i);
+                size_t off = i * DATA_CHUNK;
+                size_t len = std::min(DATA_CHUNK, sz - off);
+
+                h.chunkBytes = static_cast<uint16_t>(len);
+                h.packetType = PKT_DATA;
+
+                std::vector<uint8_t> pkt(HDR_SZ + len);
+                memcpy(pkt.data(), &h, HDR_SZ);
+                memcpy(pkt.data() + HDR_SZ, f.data.data() + off, len);
+                vidQ.push(std::move(pkt));
+
+                parityLen = std::max(parityLen, len);
+                const uint8_t* src = f.data.data() + off;
+                for (size_t j = 0; j < len; j++) parity[j] ^= src[j];
+            }
+
+            if (end - start == FEC_GROUP_SIZE && parityLen > 0) {
+                h.chunkIndex = static_cast<uint16_t>(g);
+                h.chunkBytes = static_cast<uint16_t>(parityLen);
+                h.packetType = PKT_FEC;
+
+                std::vector<uint8_t> pkt(HDR_SZ + parityLen);
+                memcpy(pkt.data(), &h, HDR_SZ);
+                memcpy(pkt.data() + HDR_SZ, parity.data(), parityLen);
+                vidQ.push(std::move(pkt));
+            }
         }
     }
-
-    DrainVid();
-    totalVideoFramesSent++;
+    DrainVideo();
+    videoSent++;
     LogStats();
     return true;
 }
 
 bool WebRTCServer::SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples) {
-    if(!IsStreaming()) return false;
-    if(data.empty()) {
-        DBG("WebRTC: SendAudio called with empty data");
-        return false;
-    }
-    if(data.size() > 4000) {
-        WARN("WebRTC: SendAudio packet too large (%zu bytes, max 4000)", data.size());
-        return false;
-    }
+    if (!IsStreaming() || data.empty() || data.size() > 4000) return false;
 
     std::vector<uint8_t> pkt(sizeof(AudioPacketHeader) + data.size());
-    auto* h = (AudioPacketHeader*)pkt.data();
+    auto* h = reinterpret_cast<AudioPacketHeader*>(pkt.data());
     h->magic = MSG_AUDIO_DATA;
     h->timestamp = ts;
-    h->samples = (uint16_t)samples;
-    h->dataLength = (uint16_t)data.size();
+    h->samples = static_cast<uint16_t>(samples);
+    h->dataLength = static_cast<uint16_t>(data.size());
     memcpy(pkt.data() + sizeof(AudioPacketHeader), data.data(), data.size());
 
-    if(ChOpen(dcAud) && dcAud->bufferedAmount() <= AUD_BUF / 2) {
+    std::shared_ptr<rtc::DataChannel> audio;
+    {
+        std::lock_guard<std::mutex> lk(chMtx);
+        audio = dcAud;
+    }
+
+    if (audio && audio->isOpen() && audio->bufferedAmount() <= AUD_BUF / 2) {
         try {
-            dcAud->send((const std::byte*)pkt.data(), pkt.size());
-            totalAudioPacketsSent++;
+            audio->send((const std::byte*)pkt.data(), pkt.size());
+            audioSent++;
             return true;
-        } catch(const std::exception& e) {
-            audioSendErrors++;
-            WARN("WebRTC: Audio send error: %s", e.what());
-        } catch(...) {
-            audioSendErrors++;
-            WARN("WebRTC: Audio send unknown error");
-        }
+        } catch (...) { audioErr++; }
     }
 
     std::lock_guard<std::mutex> lk(sendMtx);
-    size_t dropped = 0;
-    while(audQ.size() >= 3) {
-        audQ.pop();
-        dropped++;
-    }
-    if(dropped > 0) {
-        droppedAudioPackets += dropped;
-        DBG("WebRTC: Dropped %zu old audio packets", dropped);
-    }
+    while (audQ.size() >= 3) audQ.pop();
     audQ.push(std::move(pkt));
-    DrainAud();
+    DrainAudio();
     return true;
 }
 
-void WebRTCServer::GetStats(uint64_t& vidSent, uint64_t& vidErr, uint64_t& audSent,
-                            uint64_t& audErr, uint64_t& conns) {
-    vidSent = totalVideoFramesSent.load();
-    vidErr = videoSendErrors.load();
-    audSent = totalAudioPacketsSent.load();
-    audErr = audioSendErrors.load();
-    conns = connectionCount.load();
+void WebRTCServer::GetStats(uint64_t& vS, uint64_t& vE, uint64_t& aS, uint64_t& aE, uint64_t& c) {
+    vS = videoSent.load(); vE = videoErr.load();
+    aS = audioSent.load(); aE = audioErr.load();
+    c = connCount.load();
 }

@@ -7,8 +7,13 @@
 struct PacketHeader {
     int64_t timestamp;
     uint32_t encodeTimeUs, frameId;
+    uint32_t frameSize;
     uint16_t chunkIndex, totalChunks;
+    uint16_t chunkBytes;
+    uint16_t dataChunkSize;
     uint8_t frameType;
+    uint8_t packetType;
+    uint8_t fecGroupSize;
 };
 struct AudioPacketHeader {
     uint32_t magic;
@@ -35,10 +40,11 @@ struct WebRTCCallbacks {
 class WebRTCServer {
     std::shared_ptr<rtc::PeerConnection> pc;
     std::shared_ptr<rtc::DataChannel> dcCtrl, dcVid, dcAud, dcIn, dcMic;
+    std::mutex chMtx;
 
     std::atomic<bool> conn{false}, needsKey{true}, fpsRecv{false}, gathered{false}, hasDesc{false};
     std::atomic<int> chRdy{0}, overflow{0};
-    std::atomic<int64_t> lastPing{0};
+    std::atomic<int64_t> lastPing{0}, lastStatLog{0}, lastKeyReqMs{0};
     std::atomic<uint32_t> frmId{0};
     std::atomic<CodecType> curCodec{CODEC_AV1};
 
@@ -47,23 +53,16 @@ class WebRTCServer {
     std::condition_variable descCv;
     rtc::Configuration cfg;
     WebRTCCallbacks cb;
-
-    static constexpr size_t VID_BUF = 262144, AUD_BUF = 131072, CHUNK = 1400, HDR_SZ = sizeof(PacketHeader);
-    static constexpr size_t DATA_CHUNK = CHUNK - HDR_SZ, BUF_LOW = CHUNK * 16;
-    static constexpr int NUM_CH = 5;
-
-    std::atomic<uint64_t> totalVideoFramesSent{0}, totalAudioPacketsSent{0};
-    std::atomic<uint64_t> videoSendErrors{0}, audioSendErrors{0};
-    std::atomic<uint64_t> ctrlMsgsSent{0}, ctrlMsgsReceived{0};
-    std::atomic<uint64_t> inputMsgsReceived{0}, micPacketsReceived{0};
-    std::atomic<uint64_t> droppedVideoFrames{0}, droppedAudioPackets{0};
-    std::atomic<uint64_t> connectionCount{0};
-    std::atomic<int64_t> lastStatLog{0};
-
     std::queue<std::vector<uint8_t>> vidQ, audQ;
 
-    bool ChOpen(const std::shared_ptr<rtc::DataChannel>& ch) const;
-    bool AllOpen() const;
+    static constexpr size_t VID_BUF=262144, AUD_BUF=131072, CHUNK=1400;
+    static constexpr size_t HDR_SZ=sizeof(PacketHeader), DATA_CHUNK=CHUNK-HDR_SZ, BUF_LOW=CHUNK*16;
+    static constexpr int NUM_CH=5;
+
+    std::atomic<uint64_t> videoSent{0}, audioSent{0}, videoErr{0}, audioErr{0};
+    std::atomic<uint64_t> ctrlSent{0}, ctrlRecv{0}, inputRecv{0}, micRecv{0}, connCount{0};
+    std::atomic<uint64_t> peerEpoch{0};
+
     bool SendCtrl(const void* d, size_t len);
     void SendHostInfo();
     void SendMonitorList();
@@ -72,14 +71,15 @@ class WebRTCServer {
     void HandleCtrl(const rtc::binary& m);
     void HandleInput(const rtc::binary& m);
     void HandleMic(const rtc::binary& m);
-    void OnChOpen();
-    void OnChClose();
-    void SetupCh(std::shared_ptr<rtc::DataChannel>& ch, bool drain, bool msg,
-                 std::function<void(const rtc::binary&)> h = nullptr);
-    void DrainVid();
-    void DrainAud();
+    void OnChannelOpen(const std::string& label, uint64_t epoch);
+    void OnChannelClose(const std::string& label, uint64_t epoch);
+    void SetupChannel(std::shared_ptr<rtc::DataChannel>& ch, bool drain,
+                      std::function<void(const rtc::binary&)> handler = nullptr,
+                      uint64_t epoch = 0);
+    void DrainVideo();
+    void DrainAudio();
     void Reset();
-    void SetupPC();
+    void SetupPeerConnection();
     bool IsStale();
     void LogStats();
 
@@ -88,15 +88,14 @@ public:
     ~WebRTCServer();
 
     void Init(WebRTCCallbacks c);
+    void Shutdown();
     std::string GetLocal();
     void SetRemote(const std::string& sdp, const std::string& type);
 
-    bool IsStreaming() const;
-    bool NeedsKey();
-    bool SendCursorShape(CursorType ct);
-    bool Send(const EncodedFrame& f);
-    bool SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples);
-
-    void GetStats(uint64_t& vidSent, uint64_t& vidErr, uint64_t& audSent,
-                  uint64_t& audErr, uint64_t& conns);
+    [[nodiscard]] bool IsStreaming() const { return conn && fpsRecv && chRdy == NUM_CH; }
+    [[nodiscard]] bool NeedsKey() { return needsKey.exchange(false); }
+    [[nodiscard]] bool SendCursorShape(CursorType ct);
+    [[nodiscard]] bool Send(const EncodedFrame& f);
+    [[nodiscard]] bool SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples);
+    void GetStats(uint64_t& vS, uint64_t& vE, uint64_t& aS, uint64_t& aE, uint64_t& c);
 };

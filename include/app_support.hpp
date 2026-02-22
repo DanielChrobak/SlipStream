@@ -10,14 +10,12 @@ extern JWTAuth g_jwt;
 extern RateLimiter g_rateLimiter;
 
 BOOL WINAPI ConsoleHandler(DWORD sig);
-
 void RefreshMonitorList();
 std::string LoadFile(const char* path);
 void SetupConfig();
 void HandleAuth(const httplib::Request& req, httplib::Response& res);
 void SetupCORS(const httplib::Request& req, httplib::Response& r);
 std::vector<std::string> GetLocalIPAddresses();
-std::string GetLocalIPAddress();
 void JsonError(httplib::Response& res, int status, const std::string& err);
 std::function<void(const httplib::Request&, httplib::Response&)> AuthRequired(
-	std::function<void(const httplib::Request&, httplib::Response&, const std::string&)> h);
+    std::function<void(const httplib::Request&, httplib::Response&, const std::string&)> h);

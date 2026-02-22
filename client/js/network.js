@@ -17,6 +17,11 @@ let waitingFirstFrame = false;
 let connectionAttempts = 0;
 let pingInterval = null;
 let channelsReady = 0;
+let connectSeqCounter = 0;
+let activeConnectSeq = 0;
+let firstFrameWatchdog = null;
+let lastKeyReqAt = 0;
+let pendingKeyReqTimer = null;
 const sendControl = buf => {
     if (S.dcControl?.readyState !== 'open') {
         logNetworkDrop('Control channel not open');
@@ -32,7 +37,35 @@ const sendMonitor = idx => mkByte5Msg(MSG.MONITOR_SET, idx);
 const sendCodec = id => mkByte5Msg(MSG.CODEC_SET, id);
 const sendCursorCapture = en => mkByte5Msg(MSG.CURSOR_CAPTURE, en ? 1 : 0);
 const sendFps = (fps, mode) => mkCtrlMsg(MSG.FPS_SET, 7, v => { v.setUint16(4, fps, true); v.setUint8(6, mode); });
-const requestKeyframe = () => mkCtrlMsg(MSG.REQUEST_KEY, 4);
+const requestKeyframe = (reason = 'unspecified') => {
+    if (S.dcControl?.readyState !== 'open') return false;
+
+    const now = performance.now();
+    const minInterval = C.KEY_REQ_MIN_INTERVAL_MS || 180;
+    const waitMs = Math.max(0, minInterval - (now - lastKeyReqAt));
+
+    if (waitMs > 0) {
+        if (!pendingKeyReqTimer) {
+            pendingKeyReqTimer = setTimeout(() => {
+                pendingKeyReqTimer = null;
+                requestKeyframe('coalesced');
+            }, waitMs);
+        }
+        return false;
+    }
+
+    if (pendingKeyReqTimer) {
+        clearTimeout(pendingKeyReqTimer);
+        pendingKeyReqTimer = null;
+    }
+
+    const sent = mkCtrlMsg(MSG.REQUEST_KEY, 4);
+    if (sent) {
+        lastKeyReqAt = performance.now();
+        log.debug('NET', 'Requested keyframe', { reason });
+    }
+    return sent;
+};
 const requestClipboard = () => S.dcControl?.readyState === 'open' && mkCtrlMsg(MSG.CLIPBOARD_GET, 4);
 const clipboardEncoder = new TextEncoder();
 const pushClipboardToHost = async () => {
@@ -101,6 +134,32 @@ const clearPing = () => {
         clearInterval(pingInterval);
         pingInterval = null;
     }
+};
+
+const clearFirstFrameWatchdog = () => {
+    if (firstFrameWatchdog) {
+        clearTimeout(firstFrameWatchdog);
+        firstFrameWatchdog = null;
+    }
+};
+
+const armFirstFrameWatchdog = () => {
+    clearFirstFrameWatchdog();
+    const seq = activeConnectSeq;
+    firstFrameWatchdog = setTimeout(() => {
+        if (!waitingFirstFrame || seq !== activeConnectSeq) return;
+        log.warn('NET', 'Still waiting for first frame', {
+            seq,
+            pcState: S.pc?.connectionState,
+            iceState: S.pc?.iceConnectionState,
+            control: S.dcControl?.readyState,
+            video: S.dcVideo?.readyState,
+            audio: S.dcAudio?.readyState,
+            input: S.dcInput?.readyState,
+            mic: S.dcMic?.readyState,
+            channelsReady
+        });
+    }, 3000);
 };
 
 const setAuthError = (error, focusEl) => {
@@ -266,6 +325,56 @@ const applyFps = val => {
         log.info('NET', 'FPS set', { fps, mode });
     }
 };
+const VIDEO_PKT_DATA = 0;
+const VIDEO_PKT_FEC = 1;
+
+const expectedChunkSize = (frame, chunkIndex) => {
+    if (chunkIndex < 0 || chunkIndex >= frame.total) return 0;
+    if (chunkIndex < frame.total - 1) return frame.dataChunkSize;
+    const used = frame.dataChunkSize * Math.max(0, frame.total - 1);
+    const remaining = frame.frameSize - used;
+    return remaining > 0 ? remaining : frame.dataChunkSize;
+};
+
+const tryRecoverFrameGroup = (frameId, frame, groupIndex) => {
+    const fec = frame.fecParts.get(groupIndex);
+    if (!fec) return false;
+
+    const groupSize = Math.max(1, frame.fecGroupSize || C.FEC_GROUP_SIZE || 4);
+    const start = groupIndex * groupSize;
+    if (start >= frame.total) return false;
+    const end = Math.min(start + groupSize, frame.total);
+
+    const missing = [];
+    for (let i = start; i < end; i++) {
+        if (!frame.parts[i]) missing.push(i);
+    }
+    if (missing.length !== 1) return false;
+
+    const missingIndex = missing[0];
+    const recoveredSize = expectedChunkSize(frame, missingIndex);
+    if (recoveredSize <= 0 || recoveredSize > fec.byteLength) return false;
+
+    const recovered = new Uint8Array(recoveredSize);
+    recovered.set(fec.subarray(0, recoveredSize));
+
+    for (let i = start; i < end; i++) {
+        if (i === missingIndex) continue;
+        const part = frame.parts[i];
+        if (!part) return false;
+        const partLen = Math.min(part.byteLength, recoveredSize);
+        for (let j = 0; j < partLen; j++) recovered[j] ^= part[j];
+    }
+
+    frame.parts[missingIndex] = recovered;
+    frame.partSizes[missingIndex] = recoveredSize;
+    frame.received++;
+    frame.fecRecovered = (frame.fecRecovered || 0) + 1;
+
+    log.debug('VIDEO', 'Recovered chunk from FEC', { frameId, groupIndex, chunkIndex: missingIndex });
+    return true;
+};
+
 const processFrame = (frameId, frame) => {
     if (!frame.parts.every(p => p)) {
         logVideoDrop('Incomplete frame', { frameId, received: frame.received, total: frame.total });
@@ -297,6 +406,7 @@ const processFrame = (frameId, frame) => {
 
     if (waitingFirstFrame) {
         waitingFirstFrame = false;
+        clearFirstFrameWatchdog();
         hideLoading();
         hasConnection = true;
         log.info('NET', 'First frame received');
@@ -304,7 +414,7 @@ const processFrame = (frameId, frame) => {
 
     S.chunks.delete(frameId);
 };
-const handleControl = e => {
+const handleControl = async e => {
     const arrivalUs = clientTimeUs();
 
     if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 4) {
@@ -326,7 +436,12 @@ const handleControl = e => {
     if (msgType === MSG.HOST_INFO && length === 6) {
         S.hostFps = view.getUint16(4, true);
         if (!S.fpsSent) setTimeout(() => applyFps(getStoredFps() ?? 60), 50);
-        if (!hasConnection) { updateLoadingStage('Connected'); waitingFirstFrame = true; }
+        if (!hasConnection) {
+            updateLoadingStage('Connected');
+            waitingFirstFrame = true;
+            armFirstFrameWatchdog();
+            log.info('NET', 'Waiting for first frame', { seq: activeConnectSeq });
+        }
         log.info('NET', 'Host info', { fps: S.hostFps });
         return recordPacket(length, 'control');
     }
@@ -361,10 +476,12 @@ const handleControl = e => {
         const textLen = view.getUint32(4, true);
         if (textLen > 0 && length >= 8 + textLen && textLen <= 1048576) {
             const text = new TextDecoder().decode(new Uint8Array(e.data, 8, textLen));
-            navigator.clipboard.writeText(text).then(
-                () => log.debug('NET', 'Clipboard set', { len: textLen }),
-                err => logNetworkDrop('Clipboard write failed', { error: err.message })
-            );
+            try {
+                await navigator.clipboard.writeText(text);
+                log.debug('NET', 'Clipboard set', { len: textLen });
+            } catch (err) {
+                logNetworkDrop('Clipboard write failed', { error: err?.message });
+            }
         }
         return recordPacket(length, 'control');
     }
@@ -402,61 +519,123 @@ const handleVideo = e => {
 
     const captureTs = Number(view.getBigUint64(0, true));
     const frameId = view.getUint32(12, true);
-    const chunkIndex = view.getUint16(16, true);
-    const totalChunks = view.getUint16(18, true);
-    const frameType = view.getUint8(20);
-    const chunkData = new Uint8Array(e.data, C.HEADER);
+    const frameSize = view.getUint32(16, true);
+    const chunkIndex = view.getUint16(20, true);
+    const totalChunks = view.getUint16(22, true);
+    const chunkBytes = view.getUint16(24, true);
+    const dataChunkSize = view.getUint16(26, true);
+    const frameType = view.getUint8(28);
+    const packetType = view.getUint8(29);
+    const fecGroupSize = view.getUint8(30) || C.FEC_GROUP_SIZE;
 
-    if (totalChunks === 0 || chunkIndex >= totalChunks || captureTs <= 0) {
+    if (totalChunks === 0 || captureTs <= 0 || frameSize === 0 || dataChunkSize === 0) {
         logVideoDrop('Invalid packet data');
         return;
     }
+    if (packetType === VIDEO_PKT_DATA && chunkIndex >= totalChunks) {
+        logVideoDrop('Invalid data chunk index', { frameId, chunkIndex, totalChunks });
+        return;
+    }
+    if (packetType !== VIDEO_PKT_DATA && packetType !== VIDEO_PKT_FEC) {
+        logVideoDrop('Unknown video packet type', { packetType, frameId });
+        return;
+    }
+    if (length < C.HEADER || chunkBytes !== length - C.HEADER) {
+        logVideoDrop('Video size mismatch', { frameId, chunkBytes, actual: length - C.HEADER });
+        return;
+    }
+    const chunkData = new Uint8Array(e.data, C.HEADER, chunkBytes);
 
     recordPacket(length, 'video');
     S.stats.bytes += length;
-    if (S.lastFrameId > 0 && frameId < S.lastFrameId) {
-        logVideoDrop('Stale frame', { frameId, lastId: S.lastFrameId });
+    if (S.lastFrameId > 0 && frameId <= S.lastFrameId) {
         return;
     }
     for (const [id, frame] of S.chunks) {
         if (arrivalMs - frame.arrivalMs > C.FRAME_TIMEOUT_MS && frame.received < frame.total) {
+            if (S.lastFrameId > 0 && id < S.lastFrameId) {
+                S.chunks.delete(id);
+                continue;
+            }
+
+            if (frame.fecParts.size > 0) {
+                for (const groupIndex of frame.fecParts.keys()) {
+                    tryRecoverFrameGroup(id, frame, groupIndex);
+                }
+                if (frame.received === frame.total) {
+                    processFrame(id, frame);
+                    continue;
+                }
+            }
+
             logVideoDrop('Frame timeout', { frameId: id });
             S.chunks.delete(id);
             S.stats.framesTimeout++;
-            if (frame.isKey) {
+            if (frame.isKey && frame.received > 0 && !S.needKey) {
                 S.needKey = 1;
-                requestKeyframe();
+                requestKeyframe('timed-out-keyframe-unrecoverable');
             }
         }
     }
     if (!S.chunks.has(frameId)) {
         S.chunks.set(frameId, {
             parts: Array(totalChunks).fill(null),
+            partSizes: Array(totalChunks).fill(0),
             total: totalChunks,
             received: 0,
             capTs: captureTs,
             encMs: view.getUint32(8, true) / 1000,
             arrivalMs,
-            isKey: frameType === 1
+            isKey: frameType === 1,
+            frameSize,
+            dataChunkSize,
+            fecGroupSize: Math.max(1, fecGroupSize),
+            fecParts: new Map(),
+            fecRecovered: 0
         });
         if (S.chunks.size > C.MAX_FRAMES) {
             const oldest = [...S.chunks.keys()].sort((a, b) => a - b)[0];
             if (oldest !== frameId) {
                 logVideoDrop('Max frames exceeded');
+                const dropped = S.chunks.get(oldest);
                 S.chunks.delete(oldest);
+                if (dropped?.isKey && !S.needKey) {
+                    S.needKey = 1;
+                    requestKeyframe('evicted-keyframe-unrecoverable');
+                }
             }
         }
     }
 
     const frame = S.chunks.get(frameId);
     if (!frame) return;
-    if (frame.parts[chunkIndex]) {
-        logNetworkDrop('Duplicate chunk', { frameId, chunkIndex });
+    if (frame.total !== totalChunks || frame.frameSize !== frameSize || frame.dataChunkSize !== dataChunkSize) {
+        logVideoDrop('Frame metadata mismatch', { frameId });
         return;
     }
 
-    frame.parts[chunkIndex] = chunkData;
-    frame.received++;
+    if (packetType === VIDEO_PKT_DATA) {
+        if (frame.parts[chunkIndex]) {
+            logNetworkDrop('Duplicate data chunk', { frameId, chunkIndex });
+            return;
+        }
+
+        frame.parts[chunkIndex] = chunkData;
+        frame.partSizes[chunkIndex] = chunkBytes;
+        frame.received++;
+
+        const groupIndex = Math.floor(chunkIndex / frame.fecGroupSize);
+        if (frame.fecParts.has(groupIndex)) {
+            tryRecoverFrameGroup(frameId, frame, groupIndex);
+        }
+    } else {
+        if (frame.fecParts.has(chunkIndex)) {
+            logNetworkDrop('Duplicate FEC chunk', { frameId, groupIndex: chunkIndex });
+            return;
+        }
+        frame.fecParts.set(chunkIndex, chunkData);
+        tryRecoverFrameGroup(frameId, frame, chunkIndex);
+    }
 
     if (frame.received === frame.total) {
         processFrame(frameId, frame);
@@ -483,8 +662,15 @@ const handleAudio = e => {
         logAudioDrop('Unknown audio message', { type: msgType });
     }
 };
-const onAllChannelsOpen = async () => {
-    log.info('NET', 'All channels open');
+const onAllChannelsOpen = async connectSeq => {
+    log.info('NET', 'All channels open', {
+        seq: connectSeq,
+        control: S.dcControl?.readyState,
+        video: S.dcVideo?.readyState,
+        audio: S.dcAudio?.readyState,
+        input: S.dcInput?.readyState,
+        mic: S.dcMic?.readyState
+    });
 
     S.fpsSent = S.codecSent = 0;
     S.authenticated = 1;
@@ -502,30 +688,54 @@ const onAllChannelsOpen = async () => {
     setDcMic(S.dcMic);
     setMicEnableCallback(sendMicEnable);
 };
-const onChannelClose = () => {
-    log.info('NET', 'Channel closed');
+const onChannelClose = (connectSeq, label) => {
+    log.info('NET', 'Channel closed', {
+        seq: connectSeq,
+        activeSeq: activeConnectSeq,
+        label,
+        control: S.dcControl?.readyState,
+        video: S.dcVideo?.readyState,
+        audio: S.dcAudio?.readyState,
+        input: S.dcInput?.readyState,
+        mic: S.dcMic?.readyState
+    });
+    if (connectSeq !== activeConnectSeq) {
+        log.warn('NET', 'Stale channel close callback', { seq: connectSeq, activeSeq: activeConnectSeq, label });
+    }
 
     S.fpsSent = S.codecSent = 0;
     clearPing();
+    clearFirstFrameWatchdog();
     stopMetricsLogger();
     resetRenderer();
     stopKeyframeRetryTimer?.();
     channelsReady = 0;
     closeMic();
 };
-const setupDataChannel = (dc, onMessage) => {
+const setupDataChannel = (dc, onMessage, connectSeq) => {
     dc.binaryType = 'arraybuffer';
 
     dc.onopen = async () => {
         channelsReady++;
-        log.debug('NET', 'Channel open', { label: dc.label, ready: channelsReady });
-        if (channelsReady === 5) await onAllChannelsOpen();
+        log.info('NET', 'Channel open', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq,
+            label: dc.label,
+            ready: channelsReady,
+            state: dc.readyState
+        });
+        if (channelsReady === 5) await onAllChannelsOpen(connectSeq);
     };
 
-    dc.onclose = onChannelClose;
+    dc.onclose = () => onChannelClose(connectSeq, dc.label);
 
     dc.onerror = err => {
-        logNetworkDrop('Channel error', { label: dc.label, error: err?.error?.message || 'Unknown' });
+        logNetworkDrop('Channel error', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq,
+            label: dc.label,
+            error: err?.error?.message || 'Unknown'
+        });
     };
 
     dc.onmessage = onMessage;
@@ -548,6 +758,11 @@ const cleanup = () => {
     log.info('NET', 'Cleanup');
 
     clearPing();
+    clearFirstFrameWatchdog();
+    if (pendingKeyReqTimer) {
+        clearTimeout(pendingKeyReqTimer);
+        pendingKeyReqTimer = null;
+    }
     stopMetricsLogger();
     resetRenderer();
     stopKeyframeRetryTimer?.();
@@ -566,6 +781,7 @@ const resetState = () => {
     DC_KEYS.forEach(k => S[k] = null);
     S.pc = S.decoder = null;
     S.ready = S.fpsSent = S.codecSent = waitingFirstFrame = 0;
+    hasConnection = false;
     S.chunks.clear();
     S.lastFrameId = 0;
     S.frameMeta.clear();
@@ -593,6 +809,10 @@ const connect = async () => {
     updateLoadingStage('Connecting...', 'Establishing');
     resetState();
 
+    const connectSeq = ++connectSeqCounter;
+    activeConnectSeq = connectSeq;
+    log.info('NET', 'Connection attempt started', { seq: connectSeq, retry: connectionAttempts });
+
     const pc = S.pc = new RTCPeerConnection({
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
@@ -609,7 +829,19 @@ const connect = async () => {
     });
 
     pc.onconnectionstatechange = () => {
-        log.info('NET', 'Connection state', { state: pc.connectionState });
+        log.info('NET', 'Connection state', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq,
+            state: pc.connectionState,
+            ice: pc.iceConnectionState,
+            signaling: pc.signalingState,
+            channelsReady
+        });
+
+        if (connectSeq !== activeConnectSeq) {
+            log.warn('NET', 'Stale connection state callback', { seq: connectSeq, activeSeq: activeConnectSeq, state: pc.connectionState });
+            return;
+        }
 
         if (pc.connectionState === 'connected') {
             connectionAttempts = 0;
@@ -633,9 +865,30 @@ const connect = async () => {
             }
         }
     };
+    pc.oniceconnectionstatechange = () => {
+        log.info('NET', 'ICE connection state', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq,
+            state: pc.iceConnectionState
+        });
+    };
+    pc.onicegatheringstatechange = () => {
+        log.debug('NET', 'ICE gathering state', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq,
+            state: pc.iceGatheringState
+        });
+    };
+    pc.onsignalingstatechange = () => {
+        log.info('NET', 'Signaling state', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq,
+            state: pc.signalingState
+        });
+    };
     DC_CONFIG.forEach(([key, name, config, handler]) => {
         S[key] = pc.createDataChannel(name, config);
-        setupDataChannel(S[key], handler);
+        setupDataChannel(S[key], handler, connectSeq);
     });
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -650,7 +903,7 @@ const connect = async () => {
     });
 
     updateLoadingStage('Connecting...', 'Sending offer...');
-    log.debug('NET', 'Sending offer');
+    log.debug('NET', 'Sending offer', { seq: connectSeq });
 
     const res = await fetch(`${BASE_URL}/api/offer`, {
         method: 'POST',
@@ -663,7 +916,12 @@ const connect = async () => {
     });
 
     if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
+        let data = {};
+        try {
+            data = await res.json();
+        } catch {
+            data = {};
+        }
         if (res.status === 401) {
             clearSession();
             showAuth('Session expired.');
@@ -674,7 +932,7 @@ const connect = async () => {
 
     const answer = await res.json();
     await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    log.info('NET', 'Connection established');
+    log.info('NET', 'Connection established', { seq: connectSeq });
 };
 (async () => {
     log.info('NET', 'Initializing');

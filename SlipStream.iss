@@ -5,6 +5,15 @@
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "SlipStream"
 #define MyAppExeName "SlipStream.exe"
+#ifndef BuildConfig
+	#define BuildConfig "Release"
+#endif
+#ifndef RunArgs
+	#define RunArgs ""
+#endif
+#ifndef OutputSuffix
+	#define OutputSuffix BuildConfig
+#endif
 
 [Setup]
 AppId={{8F3E4A2B-1C5D-4E6F-9A8B-7C2D1E0F3A4B}
@@ -17,7 +26,7 @@ DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 LicenseFile=Installer-LICENSE.txt
 OutputDir=build
-OutputBaseFilename=SlipStream-{#MyAppVersion}-Setup
+OutputBaseFilename=SlipStream-{#MyAppVersion}-{#OutputSuffix}-Setup
 ; SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
@@ -41,16 +50,16 @@ Name: "firewall"; Description: "Add Windows Firewall exception"; GroupDescriptio
 Name: "startup"; Description: "Start SlipStream when computer boots (before login)"; GroupDescription: "Startup:"; Flags: checkedonce
 
 [Files]
-Source: "build\bin\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\bin\Release\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "build\bin\Release\index.html"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\bin\Release\styles.css"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\bin\Release\js\*"; DestDir: "{app}\js"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "build\bin\{#BuildConfig}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\bin\{#BuildConfig}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "build\bin\{#BuildConfig}\index.html"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\bin\{#BuildConfig}\styles.css"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\bin\{#BuildConfig}\js\*"; DestDir: "{app}\js"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#RunArgs}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#RunArgs}"; Tasks: desktopicon
 
 [Run]
 ; Firewall rules
@@ -58,10 +67,10 @@ Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""SlipStream"
 Filename: "netsh"; Parameters: "advfirewall firewall add rule name=""SlipStream"" dir=out action=allow program=""{app}\{#MyAppExeName}"" enable=yes"; Flags: runhidden; Tasks: firewall
 
 ; Create scheduled task to run at boot (SYSTEM account, before any user logs in)
-Filename: "schtasks"; Parameters: "/create /tn ""SlipStream"" /tr """"""{app}\{#MyAppExeName}"""""" /sc onstart /ru SYSTEM /rl HIGHEST /f"; Flags: runhidden; Tasks: startup
+Filename: "schtasks"; Parameters: "/create /tn ""SlipStream"" /tr """"""{app}\{#MyAppExeName}"" {#RunArgs}"""" /sc onstart /ru SYSTEM /rl HIGHEST /f"; Flags: runhidden; Tasks: startup
 
 ; Launch after install - use ShellExecute so UAC elevation can be requested by app manifest
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
+Filename: "{app}\{#MyAppExeName}"; Parameters: "{#RunArgs}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallRun]
 ; Remove firewall rules

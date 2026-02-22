@@ -9,6 +9,7 @@ let kfRetryInterval = null;
 let lastCaptureTs = 0;
 let workletNode = null;
 let workletReady = false;
+let lastWaitingKeyLogAt = 0;
 
 export const setReqKeyFn = fn => { reqKeyFn = fn; };
 export const setSendAudioEnableFn = fn => { sendAudioEnableFn = fn; };
@@ -21,15 +22,15 @@ const stopKeyframeRetry = () => {
 };
 
 const startKeyframeRetry = () => {
-    stopKeyframeRetry();
+    if (kfRetryInterval) return;
     kfRetryInterval = setInterval(() => {
         if (S.needKey && S.ready && reqKeyFn) {
             log.debug('MEDIA', 'Requesting keyframe (retry)');
-            reqKeyFn();
+            reqKeyFn('retry');
         } else if (!S.needKey) {
             stopKeyframeRetry();
         }
-    }, 250);
+    }, C.KEY_RETRY_INTERVAL_MS || 500);
     log.debug('MEDIA', 'Keyframe retry started');
 };
 const tryReinitDecoder = () => {
@@ -87,7 +88,7 @@ export const initDecoder = async (force = false) => {
             S.stats.decodeErrors++;
             S.ready = 1;
             S.needKey = 1;
-            reqKeyFn?.();
+            reqKeyFn?.('decoder-error');
             startKeyframeRetry();
             tryReinitDecoder();
         }
@@ -123,7 +124,7 @@ export const initDecoder = async (force = false) => {
     }
 
     S.ready = 1;
-    reqKeyFn?.();
+    reqKeyFn?.('decoder-init');
     startKeyframeRetry();
     resetRenderer();
 };
@@ -131,13 +132,16 @@ export const initDecoder = async (force = false) => {
 export const decodeFrame = data => {
     if (!S.ready) {
         logVideoDrop('Decoder not ready');
-        reqKeyFn?.();
+        reqKeyFn?.('decoder-not-ready');
         return;
     }
 
     if (!data.isKey && S.needKey) {
-        logVideoDrop('Waiting for keyframe');
-        reqKeyFn?.();
+        const now = performance.now();
+        if (now - lastWaitingKeyLogAt >= 1000) {
+            logVideoDrop('Waiting for keyframe');
+            lastWaitingKeyLogAt = now;
+        }
         startKeyframeRetry();
         return;
     }
@@ -151,7 +155,6 @@ export const decodeFrame = data => {
     const queueSize = S.decoder.decodeQueueSize || 0;
     if (queueSize > 6 && !data.isKey) {
         logVideoDrop('Decode queue full', { queueSize });
-        reqKeyFn?.();
         return;
     }
 
@@ -184,6 +187,7 @@ export const decodeFrame = data => {
 
         if (data.isKey) {
             S.needKey = 0;
+            lastWaitingKeyLogAt = 0;
             stopKeyframeRetry();
             log.debug('MEDIA', 'Keyframe decoded');
         }
@@ -192,7 +196,7 @@ export const decodeFrame = data => {
         S.stats.decodeErrors++;
         S.needKey = 1;
         S.ready = 1;
-        reqKeyFn?.();
+        reqKeyFn?.('decode-exception');
         startKeyframeRetry();
     }
 };
@@ -469,12 +473,13 @@ export const handleAudioPacket = data => {
     }
 };
 
-export const toggleAudio = () => {
+export const toggleAudio = async () => {
     const btn = $('aBtn');
     const txt = $('aTxt');
 
     if (!S.audioEnabled) {
-        initAudio().then(ok => {
+        try {
+            const ok = await initAudio();
             if (ok) {
                 S.audioEnabled = 1;
                 btn.classList.add('on');
@@ -484,7 +489,9 @@ export const toggleAudio = () => {
             } else {
                 log.error('MEDIA', 'Failed to enable audio');
             }
-        });
+        } catch (e) {
+            log.error('MEDIA', 'Failed to enable audio', { error: e?.message });
+        }
     } else {
         S.audioEnabled = 0;
         btn.classList.remove('on');

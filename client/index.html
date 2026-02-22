@@ -9,25 +9,25 @@
 <body>
     <canvas id="c"></canvas>
 
-    <div class="stats-overlay" id="statsOverlay">
+    <aside class="stats-overlay" id="statsOverlay">
         <div class="stats-header"><span class="stats-title">Debug Stats</span></div>
         <div class="stats-content" id="statsContent"></div>
-    </div>
+    </aside>
 
-    <div class="tab-strip" id="tabStrip">
+    <nav class="tab-strip" id="tabStrip">
         <button class="tab-back" id="tabBack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
         <div class="tab-container" id="tabContainer"></div>
-    </div>
+    </nav>
 
-    <div class="loading-overlay" id="loadingOverlay">
+    <section class="loading-overlay" id="loadingOverlay">
         <div class="loading-container">
             <div class="loading-spinner"><div class="spinner-ring"></div><div class="spinner-ring"></div><div class="spinner-ring"></div></div>
             <div class="loading-status" id="loadingStatus">Connecting...</div>
             <div class="loading-substatus" id="loadingSubstatus">Initializing</div>
         </div>
-    </div>
+    </section>
 
-    <div class="auth-overlay" id="authOverlay">
+    <section class="auth-overlay" id="authOverlay">
         <div class="auth-container">
             <div class="auth-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
             <h2 class="auth-title">Authentication</h2>
@@ -43,16 +43,16 @@
             <p class="auth-error" id="authError"></p>
             <button class="auth-btn" id="authSubmit">Login</button>
         </div>
-    </div>
+    </section>
 
     <button class="edge" id="edge"></button>
     <div class="bk" id="bk"></div>
 
-    <div class="pnl" id="pnl">
-        <div class="ph">
+    <aside class="pnl" id="pnl">
+        <header class="ph">
             <span class="pt">Settings</span>
             <button class="px" id="pnlX">&times;</button>
-        </div>
+        </header>
         <div class="pc">
             <div class="sec">
                 <div class="btn-row">
@@ -84,7 +84,7 @@
                 <div class="sw"><span class="sla">Clipboard sync</span><button class="tog" id="clipboardSyncBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
             </div>
         </div>
-    </div>
+    </aside>
 
     <script type="module" src="js/network.js"></script>
 </body>

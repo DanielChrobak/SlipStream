@@ -4,7 +4,7 @@ Low-latency remote desktop streaming over WebRTC with hardware-accelerated encod
 
 ## Overview
 
-SlipStream captures the Windows desktop using the Windows Graphics Capture API and encodes frames in real-time using hardware encoders (NVIDIA NVENC, Intel QSV, or AMD AMF). Video and audio are streamed to web browsers via WebRTC data channels with DTLS encryption. The browser client renders frames using WebGL2 and decodes video/audio using the WebCodecs API. Bidirectional microphone support enables voice communication from the client to the server via VB-Cable.
+SlipStream captures the Windows desktop using the Windows Graphics Capture API and encodes frames in real-time using hardware encoders (NVIDIA NVENC, Intel QSV, or AMD AMF). Video and audio are streamed to web browsers via WebRTC data channels with encrypted WebRTC transport provided by the browser/libdatachannel stack. The browser client renders frames using WebGL2 and decodes video/audio using the WebCodecs API. Bidirectional microphone support enables voice communication from the client to the server with automatic output-device fallback (VB-Cable preferred when available).
 
 ## Architecture
 
@@ -15,7 +15,7 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 |  Screen Capture         Encoder             WebRTC              Audio        |
 |  +--------------+    +--------------+    +--------------+    +----------+    |
 |  | WGC API      |--->| NVENC/QSV/   |--->| Data Channel |<-->| WASAPI   |    |
-|  | D3D11 Fence  |    | AMF          |    | libdatachan  |    | Opus     |    |
+|  | D3D11 Fence  |    | AMF          |    | libdatachannel |    | Opus     |    |
 |  | 6-tex pool   |    | AV1/H265/264 |    | 5 channels   |    | 96 kbps  |    |
 |  +--------------+    +--------------+    +--------------+    +----------+    |
 |                                                 |                  |         |
@@ -55,18 +55,18 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 
 | Component | Requirement |
 |-----------|-------------|
-| OS | Windows 10/11 64-bit (build 1903+) |
+| OS | Windows 10/11 64-bit |
 | GPU | NVIDIA (NVENC), Intel (QSV), or AMD (AMF) GPU |
 | IDE | Visual Studio 2022 with C++20 Desktop workload |
 | Package Manager | [vcpkg](https://github.com/microsoft/vcpkg) |
-| Microphone Output | VB-Cable (optional, for client mic playback) |
+| Microphone Output | VB-Cable optional (`CABLE Input` preferred), default render fallback supported |
 
 ### Client
 
 | Component | Requirement |
 |-----------|-------------|
-| Browser | Chrome 94+, Edge 94+, Firefox 98+ |
-| APIs | WebRTC, WebCodecs (VideoDecoder, AudioDecoder, AudioEncoder), WebGL2, AudioWorklet |
+| Browser | Modern browser with WebRTC DataChannel support |
+| APIs | WebRTC, WebCodecs (VideoDecoder, AudioDecoder, AudioEncoder for mic), WebGL2, AudioWorklet |
 
 ## Quick Start
 
@@ -94,11 +94,17 @@ Output: `build\bin\Release\SlipStream.exe`
 build\bin\Release\SlipStream.exe
 ```
 
+Optional debug logging:
+
+```batch
+build\bin\Release\SlipStream.exe --debug
+```
+
 On first run:
 - Prompts for username (3-32 alphanumeric characters, underscores, hyphens)
 - Prompts for password (8+ characters with at least one letter and one digit)
-- Generates self-signed SSL certificate (`server.crt`, `server.key`) in `%APPDATA%\\SlipStream`
-- Saves hashed credentials to `%APPDATA%\\SlipStream\\auth.json`
+- Generates self-signed SSL certificate (`server.crt`, `server.key`) in `%APPDATA%\SlipStream`
+- Saves hashed credentials to `%APPDATA%\SlipStream\auth.json`
 
 ### 4. Connect
 
@@ -135,7 +141,7 @@ netsh advfirewall firewall add rule name="SlipStream WebRTC" dir=in action=allow
 | Salt | 16 bytes (random) |
 | Key Length | 32 bytes |
 
-Passwords are never stored in plain text. Only the salt and derived hash are saved in `%APPDATA%\\SlipStream\\auth.json`.
+Passwords are never stored in plain text. Only the salt and derived hash are saved in `%APPDATA%\SlipStream\auth.json`.
 
 ### Rate Limiting
 
@@ -160,9 +166,9 @@ Auto-generated on first run:
 - 10-year validity
 - Subject Alt Names include localhost, host DNS name, and detected LAN IPv4 addresses
 
-If you previously generated certificates, delete `%APPDATA%\\SlipStream\\server.crt` and `%APPDATA%\\SlipStream\\server.key` to regenerate with updated SANs.
+If you previously generated certificates, delete `%APPDATA%\SlipStream\server.crt` and `%APPDATA%\SlipStream\server.key` to regenerate with updated SANs.
 
-To use custom certificates, replace `%APPDATA%\\SlipStream\\server.crt` and `%APPDATA%\\SlipStream\\server.key` before starting.
+To use custom certificates, replace `%APPDATA%\SlipStream\server.crt` and `%APPDATA%\SlipStream\server.key` before starting.
 
 ## API Endpoints
 
@@ -247,22 +253,27 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 
 | Parameter | Value |
 |-----------|-------|
-| Chunk Size | 1400 bytes max (1379 payload + 21 header) |
-| Header Size | 21 bytes |
+| Chunk Size | 1400 bytes max (31-byte header + up to 1369-byte payload) |
+| Header Size | 31 bytes |
 | Video Buffer | 256 KB threshold |
 | Max Queue | 3 frames worth of chunks |
-| Delivery | Ordered, limited retransmits |
+| Delivery | Ordered, maxRetransmits=0 |
 
-### Video Packet Header (21 bytes)
+### Video Packet Header (31 bytes)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 8 | timestamp | Capture timestamp (microseconds) |
 | 8 | 4 | encodeTimeUs | Encode duration (microseconds) |
 | 12 | 4 | frameId | Frame sequence number |
-| 16 | 2 | chunkIndex | Current chunk index |
-| 18 | 2 | totalChunks | Total chunks in frame |
-| 20 | 1 | frameType | 1=keyframe, 0=delta |
+| 16 | 4 | frameSize | Encoded frame size in bytes |
+| 20 | 2 | chunkIndex | Chunk index (data: chunk number, FEC: group number) |
+| 22 | 2 | totalChunks | Number of data chunks |
+| 24 | 2 | chunkBytes | Payload bytes in this packet |
+| 26 | 2 | dataChunkSize | Nominal data-chunk size |
+| 28 | 1 | frameType | 1=keyframe, 0=delta |
+| 29 | 1 | packetType | 0=data, 1=FEC parity |
+| 30 | 1 | fecGroupSize | FEC group size (currently 4) |
 
 ## Audio Pipeline (Server to Client)
 
@@ -293,7 +304,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | Parameter | Value |
 |-----------|-------|
 | Audio Buffer | 128 KB threshold |
-| Max Queue | 8 packets |
+| Max Queue | 3 packets (WebRTC send queue), 4 packets capture queue |
 | Delivery | Ordered, 1 retransmit |
 
 ### Audio Packet Header (16 bytes)
@@ -311,10 +322,10 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 |-----------|--------|
 | Decoder | AudioDecoder (WebCodecs) |
 | Processor | AudioWorklet with ring buffer |
-| Buffer Capacity | 9600 samples (200ms) |
-| Prebuffer Threshold | 1440 samples (30ms) |
-| Target Buffer | 2400 samples (50ms) |
-| Max Buffer | 4800 samples (100ms) |
+| Buffer Capacity | 4800 samples (100ms) |
+| Prebuffer Threshold | 480 samples (10ms) |
+| Target Buffer | 960 samples (20ms) |
+| Max Buffer | 1920 samples (40ms) |
 
 ## Microphone Pipeline (Client to Server)
 
@@ -359,7 +370,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 
 | Component | Detail |
 |-----------|--------|
-| Output Device | VB-Cable Input (auto-detected) |
+| Output Device | VB-Cable Input preferred (`CABLE Input`) |
 | Decoder | Opus (libopus) |
 | Resampling | Linear interpolation if device rate differs |
 | Fallback | Default audio endpoint if VB-Cable unavailable |
@@ -408,7 +419,7 @@ Button mapping: 0=left, 1=right, 2=middle, 3=X1, 4=X2
 | 4 | 2 | keyCode (JS keyCode) |
 | 6 | 2 | scanCode |
 | 8 | 1 | action (1=down, 0=up) |
-| 9 | 1 | modifiers |
+| 9 | 1 | modifiers (currently sent by client, ignored by server) |
 
 Modifiers: Ctrl=1, Alt=2, Shift=4, Meta=8
 
@@ -461,6 +472,7 @@ Cursor types: 0=default, 1=text, 2=pointer, 3=wait, 4=progress, 5=crosshair, 6=m
 | CURSOR_CAPTURE | 0x43555243 | 5 | Toggle cursor capture in video |
 | CLIPBOARD_GET | 0x434C4754 | 4 | Request clipboard contents |
 | CLIPBOARD_DATA | 0x434C4950 | 8+N | Clipboard text transfer |
+| VERSION | 0x56455253 | Variable | Host version string |
 | KICKED | 0x4B49434B | 4 | Client disconnected by server |
 
 ### Codec Capabilities (CODEC_CAPS)
@@ -477,7 +489,7 @@ The client uses this to enable/disable codec options in the UI.
 | Channel | Ordered | MaxRetransmits | Purpose |
 |---------|---------|----------------|---------|
 | control | Yes | 3 | Commands, ping/pong, monitor list |
-| video | Yes | 1 | Video frame chunks |
+| video | Yes | 0 | Video frame chunks |
 | audio | Yes | 1 | Audio packets |
 | input | Yes | 3 | Mouse/keyboard events |
 | mic | Yes | 1 | Microphone audio packets |
@@ -507,8 +519,8 @@ The client uses this to enable/disable codec options in the UI.
 
 | Parameter | Value |
 |-----------|-------|
-| Max buffered frames | 8 |
-| Frame timeout | 200 ms |
+| Max buffered frames | 20 |
+| Frame timeout | 900 ms |
 | Max frame age (jitter) | 50 ms |
 | Decode queue limit | 6 frames |
 
@@ -533,10 +545,10 @@ Access by clicking the right edge of the screen:
 ### Tabbed Mode
 
 When enabled, displays a tab strip showing all monitors with:
-- Monitor name (EDID friendly name)
-- Resolution and refresh rate
+- Monitor name (EDID friendly name or user rename)
 - Primary indicator (star icon)
 - Click to switch monitors
+- Double-click active tab to rename monitor label (saved in browser localStorage)
 
 ### Debug Stats Overlay
 
@@ -555,6 +567,7 @@ Real-time metrics display organized into sections:
 | Audio Drops | Dropped, underruns, overflows |
 | Input | Mouse moves/clicks, keystrokes |
 | Session | Uptime, total frames, total data transferred |
+| Version | Host version |
 
 ## Server Components
 
@@ -578,7 +591,7 @@ Real-time metrics display organized into sections:
 | `webrtc.hpp` | WebRTC server, data channels |
 | `audio.hpp` | WASAPI audio capture + Opus encoding |
 | `input.hpp` | Input handling, keyboard/mouse injection, clipboard |
-| `mic.hpp` | VB-Cable microphone playback |
+| `mic.hpp` | Mic packet playback (VB-Cable preferred) |
 
 ## Dependencies
 
@@ -593,7 +606,6 @@ Managed via vcpkg (`vcpkg.json`):
 | openssl | Cryptography, SSL/TLS |
 | ffmpeg[nvcodec,avcodec] | Video encoding |
 | jwt-cpp | JWT token handling |
-| picojson | Required by jwt-cpp |
 
 ## Building
 
@@ -613,10 +625,22 @@ build\bin\Release\SlipStream.exe
 ### Installer Build
 
 ```batch
-build_installer.bat
+build_installer_release.bat
 ```
 
-Creates `build\SlipStream-1.0.0-Setup.exe` (Inno Setup).
+Creates `build\SlipStream-1.0.0-Release-Setup.exe` (Inno Setup).
+
+### Installer Build (Debug)
+
+```batch
+build_installer_debug.bat
+```
+
+Creates `build\SlipStream-1.0.0-Debug-Setup.exe` and configures shortcuts/startup launch with:
+
+```batch
+SlipStream.exe --debug
+```
 
 ## File Structure
 
@@ -624,12 +648,14 @@ Creates `build\SlipStream-1.0.0-Setup.exe` (Inno Setup).
 SlipStream/
 ├── include/
 │   ├── common.hpp      # Common includes, types, auth utilities
+│   ├── app_support.hpp # App setup/auth helpers
+│   ├── tray.hpp        # System tray declarations
 │   ├── capture.hpp     # Screen capture with WGC
 │   ├── encoder.hpp     # Hardware video encoding (NVENC/QSV/AMF)
 │   ├── webrtc.hpp      # WebRTC server declarations
 │   ├── audio.hpp       # WASAPI audio capture + Opus encoding
 │   ├── input.hpp       # Input handling + clipboard
-│   └── mic.hpp         # VB-Cable microphone playback
+│   └── mic.hpp         # Mic playback
 ├── src/
 │   ├── main.cpp        # Application entry point
 │   ├── common.cpp      # Auth/SSL/shared runtime implementations
@@ -640,7 +666,8 @@ SlipStream/
 │   ├── encoder.cpp     # Video encoder pipeline
 │   ├── audio.cpp       # System audio capture
 │   ├── mic.cpp         # Mic playback pipeline
-│   └── input.cpp       # Input injection/clipboard
+│   ├── input.cpp       # Input injection/clipboard
+│   └── version.rc      # Windows version resource
 ├── client/
 │   ├── index.html      # Web client HTML
 │   ├── styles.css      # Stylesheet
@@ -654,7 +681,9 @@ SlipStream/
 │       └── mic.js      # Microphone capture and encoding
 ├── vcpkg.json          # Dependencies
 ├── CMakeLists.txt      # Build configuration
-├── build_installer.bat # Installer build script
+├── build_installer_release.bat # Release installer builder
+├── build_installer_debug.bat # Debug installer builder (--debug launch)
+├── SlipStream.iss      # Inno Setup installer script
 ├── LICENSE.md          # Styled license text
 └── Installer-LICENSE.txt # Installer license text
 ```
@@ -664,35 +693,34 @@ SlipStream/
 To enable client microphone audio on the server:
 
 1. Install [VB-Cable Virtual Audio Device](https://vb-audio.com/Cable/)
-2. The server automatically detects "CABLE Input" as the output device
-3. Configure your application to use "CABLE Output" as its microphone input
+2. The server attempts to detect `CABLE Input` as the output device
+3. Configure your target application to use `CABLE Output` as its microphone input
 
-If VB-Cable is not installed, microphone playback is unavailable until a matching render device is present.
+If VB-Cable is not installed, SlipStream falls back to the default audio render endpoint.
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
 | vcpkg not found | Set `VCPKG_ROOT` environment variable or install to `C:\vcpkg` |
-| No hardware encoder | Requires NVIDIA (GTX 600+), Intel (6th gen+), or AMD (RX 400+) GPU |
+| No hardware encoder | Ensure FFmpeg hardware codec path and supported NVIDIA/Intel/AMD encoder are available |
 | Connection refused | Check firewall for TCP 443 and UDP 50000-50020 |
-| Black screen | Wait for keyframe or click canvas to focus |
-| No audio | Click "Enable" in settings panel after first audio playback |
-| Mic not working | Ensure browser has microphone permission, check VB-Cable installation |
+| Black screen | Wait for keyframe; verify codec compatibility and channel readiness |
+| No audio | Click "Enable" in settings panel after connecting |
+| Mic not working | Ensure browser has microphone permission; confirm WebCodecs AudioEncoder support |
 | Input not working | Click the video canvas to capture input focus |
 | Certificate warning | Expected with self-signed certificate, click proceed |
 | Kicked message | Another client connected (single client only) |
-| Monitor switch issues | Frames from previous monitor are automatically discarded |
-| Codec grayed out | Either client browser or server GPU doesn't support that codec |
+| Monitor switch issues | Frames from previous monitor generations are automatically discarded |
+| Codec grayed out | Either client browser or server encoder path does not support that codec |
 
 ## Known Limitations
 
 - Windows server only
 - Single client connection (new client kicks existing)
-- Hardware GPU required for encoding (NVIDIA, Intel, or AMD)
-- No custom cursor image sync (standard cursors only)
-- Microphone requires VB-Cable for full functionality
-- WebCodecs AudioEncoder required for client microphone
+- Hardware GPU encoding path required for video
+- No custom cursor bitmap sync (standard cursor type sync only)
+- WebCodecs AudioEncoder required in browser for client microphone uplink
 
 ## Codec Support Detection
 
@@ -724,4 +752,3 @@ Personal use permitted. Commercial use requires separate license.
 ## Copyright
 
 (c) 2026 Daniel Chrobak. All rights reserved.
-

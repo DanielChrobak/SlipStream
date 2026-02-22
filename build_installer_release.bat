@@ -2,7 +2,7 @@
 setlocal
 echo.
 echo ========================================
-echo        SlipStream Installer Build
+echo   SlipStream Release Installer Build
 echo ========================================
 echo.
 
@@ -45,23 +45,14 @@ cmake --build . --config Release || (cd .. & goto :err)
 cd ..
 
 echo.
-echo [4/4] Creating installer...
-"%ISCC%" /Q SlipStream.iss || goto :err
+echo [4/4] Creating release installer...
+"%ISCC%" /Q /DBuildConfig=Release /DOutputSuffix=Release SlipStream.iss || goto :err
 
 echo.
 echo ========================================
-echo          Build Complete!
+echo       Release Build Complete!
 echo ========================================
-echo.
-set "APPVER="
-for /f "tokens=3" %%v in ('findstr /b /c:"#define MyAppVersion" SlipStream.iss') do set "APPVER=%%~v"
-set "APPVER=%APPVER:"=%"
-
-if defined APPVER if exist "build\SlipStream-%APPVER%-Setup.exe" (
-    echo Installer: build\SlipStream-%APPVER%-Setup.exe
-) else (
-    dir /b build\SlipStream-*-Setup.exe 2>nul
-)
+dir /b build\SlipStream-*-Release-Setup.exe 2>nul
 echo.
 pause
 exit /b 0

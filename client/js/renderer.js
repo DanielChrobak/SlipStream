@@ -1,7 +1,7 @@
 
 import { C, S, CURSOR_TYPES, serverFrameAgeMs, recordRenderTime, logVideoDrop, log, safe } from './state.js';
 
-export const canvas = document.getElementById('c');
+export const canvas = document.querySelector('#c');
 export let canvasW = 0, canvasH = 0;
 const gl = canvas?.getContext('webgl2', {
     alpha: false,

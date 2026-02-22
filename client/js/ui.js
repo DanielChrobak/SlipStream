@@ -235,13 +235,15 @@ const updateFullscreen = () => {
 
 updateFullscreen();
 
-$('fs').onclick = () => {
+$('fs').onclick = async () => {
     if (document.fullscreenElement) {
         document.exitFullscreen();
     } else {
-        document.documentElement.requestFullscreen?.().catch(e => {
+        try {
+            await document.documentElement.requestFullscreen?.();
+        } catch (e) {
             log.warn('UI', 'Fullscreen request failed', { error: e.message });
-        });
+        }
     }
 };
 

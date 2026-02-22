@@ -110,11 +110,13 @@ export const detectCodecs = async () => {
     return codecCache;
 };
 export const C = {
-    HEADER: 21, AUDIO_HEADER: 16, PING_MS: 200, MAX_FRAMES: 8, FRAME_TIMEOUT_MS: 200,
+    HEADER: 31, AUDIO_HEADER: 16, PING_MS: 200, MAX_FRAMES: 20, FRAME_TIMEOUT_MS: 900,
+    KEY_REQ_MIN_INTERVAL_MS: 350, KEY_RETRY_INTERVAL_MS: 700,
+    FEC_GROUP_SIZE: 4,
     AUDIO_RATE: 48000, AUDIO_CH: 2,
     MIC_HEADER: 16, MIC_RATE: 48000, MIC_CH: 1, MIC_FRAME_MS: 10,
     DC_CONTROL: { ordered: 1, maxRetransmits: 3 },
-    DC_VIDEO:   { ordered: 1, maxRetransmits: 1 },
+    DC_VIDEO:   { ordered: 1, maxRetransmits: 0 },
     DC_AUDIO:   { ordered: 1, maxRetransmits: 1 },
     DC_INPUT:   { ordered: 1, maxRetransmits: 3 },
     DC_MIC:     { ordered: 1, maxRetransmits: 1 },
@@ -152,7 +154,7 @@ export const S = {
     micMetrics: mkMic(), micEnabled: 0, micStream: null,
     hostVersion: null
 };
-export const $ = id => document.getElementById(id);
+export const $ = id => document.querySelector(`#${id}`);
 export const mkBuf = (sz, fn) => { const b = new ArrayBuffer(sz); fn(new DataView(b)); return b; };
 export const clientTimeUs = () => Math.floor((performance.timeOrigin + performance.now()) * 1000);
 

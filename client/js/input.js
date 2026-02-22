@@ -174,14 +174,18 @@ const handleKey = (e, down) => {
             if (S.clipboardSyncEnabled && clipboardPushFn && !pendingClipboardPaste) {
                 pendingClipboardPaste = { keyUpQueued: false };
 
-                clipboardPushFn()
-                    .catch(err => log.debug('INPUT', 'Clipboard push failed before paste', { error: err?.message }))
-                    .finally(() => {
+                void (async () => {
+                    try {
+                        await clipboardPushFn();
+                    } catch (err) {
+                        log.debug('INPUT', 'Clipboard push failed before paste', { error: err?.message });
+                    } finally {
                         sendNow('key', vk, 0, 1, mods);
                         if (pendingClipboardPaste?.keyUpQueued) sendNow('key', vk, 0, 0, mods);
                         pendingClipboardPaste = null;
                         log.debug('INPUT', 'Clipboard paste shortcut handled');
-                    });
+                    }
+                })();
                 return;
             }
 

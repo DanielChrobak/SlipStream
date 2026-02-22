@@ -105,7 +105,7 @@ bool InitAppTray() {
         return false;
     }
 
-    HICON icon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+    HICON icon = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
     if(!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
 
     NOTIFYICONDATAW nid{};
