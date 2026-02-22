@@ -13,11 +13,11 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 |                              SERVER (Windows)                                |
 +------------------------------------------------------------------------------+
 |  Screen Capture         Encoder             WebRTC              Audio        |
-|  +--------------+    +--------------+    +--------------+    +----------+    |
-|  | WGC API      |--->| NVENC/QSV/   |--->| Data Channel |<-->| WASAPI   |    |
-|  | D3D11 Fence  |    | AMF          |    | libdatachannel |    | Opus     |    |
-|  | 6-tex pool   |    | AV1/H265/264 |    | 5 channels   |    | 96 kbps  |    |
-|  +--------------+    +--------------+    +--------------+    +----------+    |
+|  +--------------+    +--------------+    +----------------+    +----------+  |
+|  | WGC API      |--->| NVENC/QSV/   |--->| Data Channel   |<-->| WASAPI   |  |
+|  | D3D11 Fence  |    | AMF          |    | libdatachannel |  | Opus       |  |
+|  | 6-tex pool   |    | AV1/H265/264 |    | 5 channels     |    | 96 kbps  |  |
+|  +--------------+    +--------------+    +----------------+    +----------+  |
 |                                                 |                  |         |
 |                                                 |            +----------+    |
 |                                                 |            | VB-Cable |    |
