@@ -29,6 +29,77 @@ let lastFrameCompletedAt = 0;
 const MAX_SERVER_BUSY_RETRIES = 5;
 const TEXT_DECODER = new TextDecoder();
 let lastChunkCleanupAt = 0;
+const AUDIO_PKT_DATA = 0;
+const AUDIO_PKT_FEC = 1;
+const audioFecGroups = new Map();
+const seenAudioPacketIds = new Set();
+let lastAudioFecCleanupAt = 0;
+
+const trimSeenAudioPacketIds = () => {
+    if (seenAudioPacketIds.size <= 4096) return;
+    while (seenAudioPacketIds.size > 2048) {
+        const first = seenAudioPacketIds.values().next().value;
+        if (first === undefined) break;
+        seenAudioPacketIds.delete(first);
+    }
+};
+
+const getAudioGroupStart = (packetId, groupSize) => packetId - (packetId % groupSize);
+
+const cleanupAudioFecGroups = now => {
+    if (now - lastAudioFecCleanupAt < 250 && audioFecGroups.size < 96) return;
+    lastAudioFecCleanupAt = now;
+    for (const [groupStart, group] of audioFecGroups) {
+        if (now - group.updatedAt > 1500) audioFecGroups.delete(groupStart);
+    }
+};
+
+const deliverAudioPacket = packet => {
+    const buffer = packet instanceof ArrayBuffer ? packet : packet.buffer.slice(packet.byteOffset, packet.byteOffset + packet.byteLength);
+    recordPacket(buffer.byteLength, 'audio');
+    handleAudioPacket(buffer);
+};
+
+const tryRecoverAudioGroup = groupStart => {
+    const group = audioFecGroups.get(groupStart);
+    if (!group?.hasFec || !group.fecPayload?.length) return false;
+
+    const missing = [];
+    for (let i = 0; i < group.groupSize; i++) {
+        const packetId = groupStart + i;
+        if (!group.dataPackets.has(packetId)) missing.push(packetId);
+    }
+
+    if (missing.length !== 1 || group.dataPackets.size < group.groupSize - 1) return false;
+
+    const recovered = group.fecPayload.slice();
+    for (let i = 0; i < group.groupSize; i++) {
+        const packetId = groupStart + i;
+        const packet = group.dataPackets.get(packetId);
+        if (!packet) continue;
+        const limit = Math.min(recovered.length, packet.length);
+        for (let j = 0; j < limit; j++) recovered[j] ^= packet[j];
+    }
+
+    if (recovered.byteLength < C.AUDIO_HEADER) return false;
+    const recoveredView = new DataView(recovered.buffer, recovered.byteOffset, recovered.byteLength);
+    const msgType = recoveredView.getUint32(0, true);
+    const packetId = recoveredView.getUint32(12, true);
+    const dataLength = recoveredView.getUint16(18, true);
+    const packetType = recoveredView.getUint8(20);
+    const expectedLen = C.AUDIO_HEADER + dataLength;
+
+    if (msgType !== MSG.AUDIO_DATA || packetType !== AUDIO_PKT_DATA) return false;
+    if (packetId !== missing[0] || expectedLen > recovered.byteLength || dataLength === 0) return false;
+    if (seenAudioPacketIds.has(packetId)) return false;
+
+    const recoveredPacket = recovered.slice(0, expectedLen);
+    seenAudioPacketIds.add(packetId);
+    trimSeenAudioPacketIds();
+    deliverAudioPacket(recoveredPacket);
+    log.info('NET', 'Audio FEC recovered packet', { packetId, groupStart });
+    return true;
+};
 
 const abortPendingConnect = reason => {
     if (!activeConnectAbort) return;
@@ -374,11 +445,74 @@ const handleAudio = e => {
     const view = new DataView(e.data);
     const length = e.data.byteLength;
     const msgType = view.getUint32(0, true);
-    if (msgType === MSG.AUDIO_DATA && length >= C.AUDIO_HEADER) {
-        const dataLen = view.getUint16(14, true);
-        if (length === C.AUDIO_HEADER + dataLen && dataLen > 0) { recordPacket(length, 'audio'); return handleAudioPacket(e.data); }
-        logAudioDrop('Size mismatch', { expected: C.AUDIO_HEADER + dataLen, got: length });
-    } else logAudioDrop('Unknown audio message', { type: msgType });
+    if (msgType !== MSG.AUDIO_DATA || length < C.AUDIO_HEADER) {
+        logAudioDrop('Unknown audio message', { type: msgType });
+        return;
+    }
+
+    const packetId = view.getUint32(12, true);
+    const dataLen = view.getUint16(18, true);
+    const packetType = view.getUint8(20);
+    const groupSize = Math.max(1, view.getUint8(21) || C.AUDIO_FEC_GROUP_SIZE || 4);
+    const expectedLen = C.AUDIO_HEADER + dataLen;
+
+    if (dataLen === 0 || expectedLen !== length) {
+        logAudioDrop('Size mismatch', { packetId, expected: expectedLen, got: length, packetType });
+        return;
+    }
+    if (packetType !== AUDIO_PKT_DATA && packetType !== AUDIO_PKT_FEC) {
+        logAudioDrop('Unknown audio packet type', { packetType, packetId });
+        return;
+    }
+
+    const now = performance.now();
+    cleanupAudioFecGroups(now);
+
+    if (packetType === AUDIO_PKT_DATA) {
+        if (seenAudioPacketIds.has(packetId)) {
+            log.debug('NET', 'Duplicate audio packet', { packetId });
+            return;
+        }
+
+        seenAudioPacketIds.add(packetId);
+        trimSeenAudioPacketIds();
+        deliverAudioPacket(e.data);
+
+        const groupStart = getAudioGroupStart(packetId, groupSize);
+        const group = audioFecGroups.get(groupStart) || {
+            groupSize,
+            dataPackets: new Map(),
+            hasFec: false,
+            fecPayload: null,
+            updatedAt: now
+        };
+        group.groupSize = groupSize;
+        group.updatedAt = now;
+        group.dataPackets.set(packetId, new Uint8Array(e.data));
+        audioFecGroups.set(groupStart, group);
+
+        if (tryRecoverAudioGroup(groupStart)) audioFecGroups.delete(groupStart);
+        else if (group.dataPackets.size >= group.groupSize && group.hasFec) audioFecGroups.delete(groupStart);
+        return;
+    }
+
+    const groupStart = packetId;
+    const group = audioFecGroups.get(groupStart) || {
+        groupSize,
+        dataPackets: new Map(),
+        hasFec: false,
+        fecPayload: null,
+        updatedAt: now
+    };
+    group.groupSize = groupSize;
+    group.hasFec = true;
+    group.updatedAt = now;
+    group.fecPayload = new Uint8Array(e.data, C.AUDIO_HEADER, dataLen);
+    audioFecGroups.set(groupStart, group);
+
+    if (tryRecoverAudioGroup(groupStart) || (group.dataPackets.size >= group.groupSize && group.hasFec)) {
+        audioFecGroups.delete(groupStart);
+    }
 };
 
 // --- Channel lifecycle ---
@@ -450,6 +584,8 @@ const cleanup = () => {
     stopKeyframeRetry();
     resetClockSync();
     closeDataChannels();
+    audioFecGroups.clear();
+    seenAudioPacketIds.clear();
     channelsReady = 0;
     stopMic();
 };
@@ -467,6 +603,7 @@ const resetState = () => {
     S.lastFrameId = 0;
     S.frameMeta.clear();
     lastChunkCleanupAt = 0;
+    lastAudioFecCleanupAt = 0;
     log.debug('NET', 'State reset');
 };
 

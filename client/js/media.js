@@ -446,12 +446,12 @@ export const handleAudioPacket = data => {
     recordAudioPacket();
 
     const view = new DataView(data);
-    const length = view.getUint16(14, true);
     const timestamp = Number(view.getBigUint64(4, true));
-    const samples = view.getUint16(12, true);
+    const samples = view.getUint16(16, true);
+    const payloadLength = view.getUint16(18, true);
 
-    if (length > data.byteLength - C.AUDIO_HEADER) {
-        logAudioDrop('Invalid packet length', { length, total: data.byteLength });
+    if (payloadLength > data.byteLength - C.AUDIO_HEADER) {
+        logAudioDrop('Invalid packet length', { length: payloadLength, total: data.byteLength });
         return;
     }
 
@@ -468,7 +468,7 @@ export const handleAudioPacket = data => {
             type: 'key',
             timestamp,
             duration: Math.round((samples / C.AUDIO_RATE) * 1e6),
-            data: new Uint8Array(data, C.AUDIO_HEADER, length)
+            data: new Uint8Array(data, C.AUDIO_HEADER, payloadLength)
         });
         S.audioDecoder.decode(chunk);
         return true;
@@ -476,7 +476,7 @@ export const handleAudioPacket = data => {
 
     if (!result) {
         logAudioDrop('Decode failed', {
-            timestamp, samples, length,
+            timestamp, samples, length: payloadLength,
             decoderState: S.audioDecoder?.state,
             queueSize: S.audioDecoder?.decodeQueueSize || 0
         });

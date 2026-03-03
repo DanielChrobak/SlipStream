@@ -311,17 +311,145 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
         }
         return;
     }
-    uint32_t magic = ReadPod<uint32_t>(reinterpret_cast<const uint8_t*>(message.data()));
-    if (magic == MSG_MIC_DATA) {
-        micRecv++;
-        if (callbacks_.onMicData) {
-            callbacks_.onMicData(reinterpret_cast<const uint8_t*>(message.data()), message.size());
-        } else {
-            DBG("WebRTC: HandleMic - no mic callback registered, dropping packet (%zu bytes)", message.size());
-        }
-    } else {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(message.data());
+    const auto* header = reinterpret_cast<const MicPacketHeader*>(bytes);
+    if (header->magic != MSG_MIC_DATA) {
         WARN("WebRTC: HandleMic - unexpected magic 0x%08X (expected 0x%08X, size=%zu)",
-            magic, MSG_MIC_DATA, message.size());
+            header->magic, MSG_MIC_DATA, message.size());
+        return;
+    }
+
+    const size_t expectedLen = sizeof(MicPacketHeader) + header->dataLength;
+    if (header->dataLength == 0 || expectedLen != message.size()) {
+        WARN("WebRTC: HandleMic - invalid packet size (type=%u id=%u expected=%zu got=%zu)",
+            static_cast<unsigned>(header->packetType), header->packetId, expectedLen, message.size());
+        return;
+    }
+
+    if (header->packetType != PKT_DATA && header->packetType != PKT_FEC) {
+        WARN("WebRTC: HandleMic - unknown packet type=%u (id=%u)",
+            static_cast<unsigned>(header->packetType), header->packetId);
+        return;
+    }
+
+    if (!callbacks_.onMicData) {
+        DBG("WebRTC: HandleMic - no mic callback registered, dropping packet (%zu bytes)", message.size());
+        return;
+    }
+
+    std::vector<uint8_t> dataPacketToDeliver;
+    std::vector<uint8_t> recoveredPacketToDeliver;
+    const uint8_t groupSize = std::clamp<uint8_t>(
+        header->fecGroupSize ? header->fecGroupSize : MIC_FEC_GROUP_SIZE,
+        1,
+        16);
+    const int64_t nowMs = GetTimestamp() / 1000;
+
+    {
+        std::lock_guard<std::mutex> lk(micFecMutex_);
+
+        auto tryRecoverGroup = [&](uint32_t groupStart, MicFecGroupState& group) -> std::vector<uint8_t> {
+            if (!group.hasFec || group.fecPayload.empty()) return {};
+
+            std::vector<uint32_t> missing;
+            missing.reserve(group.groupSize);
+            for (uint32_t i = 0; i < group.groupSize; i++) {
+                uint32_t packetId = groupStart + i;
+                if (!group.dataPackets.contains(packetId)) missing.push_back(packetId);
+            }
+
+            if (missing.size() != 1 || group.dataPackets.size() < static_cast<size_t>(group.groupSize - 1)) {
+                return {};
+            }
+
+            std::vector<uint8_t> recovered = group.fecPayload;
+            for (uint32_t i = 0; i < group.groupSize; i++) {
+                uint32_t packetId = groupStart + i;
+                auto it = group.dataPackets.find(packetId);
+                if (it == group.dataPackets.end()) continue;
+                const auto& pkt = it->second;
+                const size_t limit = std::min(recovered.size(), pkt.size());
+                for (size_t j = 0; j < limit; j++) recovered[j] ^= pkt[j];
+            }
+
+            if (recovered.size() < sizeof(MicPacketHeader)) return {};
+
+            const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
+            if (recHeader->magic != MSG_MIC_DATA || recHeader->packetType != PKT_DATA) return {};
+            if (recHeader->packetId != missing[0]) return {};
+
+            const size_t recLen = sizeof(MicPacketHeader) + recHeader->dataLength;
+            if (recHeader->dataLength == 0 || recLen > recovered.size()) return {};
+
+            recovered.resize(recLen);
+            return recovered;
+        };
+
+        if (header->packetType == PKT_DATA) {
+            if (micSeenPacketIds_.contains(header->packetId)) return;
+
+            micSeenPacketIds_.insert(header->packetId);
+            if (micSeenPacketIds_.size() > 4096) {
+                while (micSeenPacketIds_.size() > 2048) {
+                    auto it = micSeenPacketIds_.begin();
+                    if (it == micSeenPacketIds_.end()) break;
+                    micSeenPacketIds_.erase(it);
+                }
+            }
+
+            const uint32_t groupStart = header->packetId - (header->packetId % groupSize);
+            auto& group = micFecGroups_[groupStart];
+            group.groupSize = groupSize;
+            group.updatedMs = nowMs;
+            group.dataPackets[header->packetId] = std::vector<uint8_t>(bytes, bytes + message.size());
+
+            dataPacketToDeliver = group.dataPackets[header->packetId];
+
+            auto recovered = tryRecoverGroup(groupStart, group);
+            if (!recovered.empty()) {
+                const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
+                if (!micSeenPacketIds_.contains(recHeader->packetId)) {
+                    micSeenPacketIds_.insert(recHeader->packetId);
+                    recoveredPacketToDeliver = std::move(recovered);
+                    LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);
+                }
+                micFecGroups_.erase(groupStart);
+            }
+        } else {
+            const uint32_t groupStart = header->packetId;
+            auto& group = micFecGroups_[groupStart];
+            group.groupSize = groupSize;
+            group.updatedMs = nowMs;
+            group.hasFec = true;
+            group.fecPayload.assign(bytes + sizeof(MicPacketHeader), bytes + message.size());
+
+            auto recovered = tryRecoverGroup(groupStart, group);
+            if (!recovered.empty()) {
+                const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
+                if (!micSeenPacketIds_.contains(recHeader->packetId)) {
+                    micSeenPacketIds_.insert(recHeader->packetId);
+                    recoveredPacketToDeliver = std::move(recovered);
+                    LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);
+                }
+                micFecGroups_.erase(groupStart);
+            }
+        }
+
+        if (micFecGroups_.size() > 128) {
+            for (auto it = micFecGroups_.begin(); it != micFecGroups_.end();) {
+                if (nowMs - it->second.updatedMs > 2000) it = micFecGroups_.erase(it);
+                else ++it;
+            }
+        }
+    }
+
+    if (!dataPacketToDeliver.empty()) {
+        callbacks_.onMicData(dataPacketToDeliver.data(), dataPacketToDeliver.size());
+        micRecv++;
+    }
+    if (!recoveredPacketToDeliver.empty()) {
+        callbacks_.onMicData(recoveredPacketToDeliver.data(), recoveredPacketToDeliver.size());
+        micRecv++;
     }
 }
 
@@ -415,9 +543,22 @@ void WebRTCServer::Reset() {
 
     conn = false; fpsRecv = false; gathered = false; hasDesc = false;
     chRdy = 0; overflow = 0; lastPing = 0;
+    audioPktId = 0;
 
     { std::lock_guard<std::mutex> lk(descriptionMutex_); localDescription_.clear(); }
-    { std::lock_guard<std::mutex> lk(sendMutex_); while (!videoPacketQueue_.empty()) videoPacketQueue_.pop(); while (!audioPacketQueue_.empty()) audioPacketQueue_.pop(); }
+    {
+        std::lock_guard<std::mutex> lk(sendMutex_);
+        while (!videoPacketQueue_.empty()) videoPacketQueue_.pop();
+        while (!audioPacketQueue_.empty()) audioPacketQueue_.pop();
+        audioFecCount_ = 0;
+        audioFecGroupStart_ = 0;
+        for (auto& pkt : audioFecPackets_) pkt.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(micFecMutex_);
+        micFecGroups_.clear();
+        micSeenPacketIds_.clear();
+    }
 
     // Close old channels/PC in a detached thread to avoid blocking the caller
     std::thread([controlChannel = std::move(controlChannel),
@@ -656,7 +797,7 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
     const size_t bufferedNow = (videoChannel && videoChannel->isOpen()) ? videoChannel->bufferedAmount() : 0;
     const bool bypassFec = !frame.isKey &&
         (queuedBefore >= kVideoQueueFecBypassThreshold || bufferedNow >= VID_BUF / 2);
-    const uint8_t fecGroupSize = frame.isKey ? static_cast<uint8_t>(4) : static_cast<uint8_t>(8);
+    const uint8_t fecGroupSize = static_cast<uint8_t>(10);
 
     DBG("WebRTC: Send frame=%u ts=%lld key=%d size=%zu chunks=%zu encUs=%lld q=%zu buf=%zu fec=%s gsz=%u",
         frameId, frame.ts, frame.isKey ? 1 : 0, frameSizeBytes, chunkCount, frame.encUs,
@@ -749,38 +890,70 @@ bool WebRTCServer::SendAudio(const std::vector<uint8_t>& data, int64_t ts, int s
         return false;
     }
 
-    std::vector<uint8_t> packet(sizeof(AudioPacketHeader) + data.size());
-    auto* header = reinterpret_cast<AudioPacketHeader*>(packet.data());
-    header->magic = MSG_AUDIO_DATA;
-    header->timestamp = ts;
-    header->samples = static_cast<uint16_t>(samples);
-    header->dataLength = static_cast<uint16_t>(data.size());
-    memcpy(packet.data() + sizeof(AudioPacketHeader), data.data(), data.size());
+    std::vector<std::vector<uint8_t>> outgoing;
+    outgoing.reserve(2);
 
-    std::shared_ptr<rtc::DataChannel> audioChannel;
     {
-        std::lock_guard<std::mutex> lk(channelMutex_);
-        audioChannel = audioDataChannel_;
-    }
+        std::lock_guard<std::mutex> lk(sendMutex_);
 
-    if (audioChannel && audioChannel->isOpen() && audioChannel->bufferedAmount() <= AUD_BUF / 2) {
-        try {
-            audioChannel->send((const std::byte*)packet.data(), packet.size());
-            audioSent++;
-            return true;
-        } catch (const std::exception& e) {
-            audioErr++;
-            WARN("WebRTC: SendAudio direct send failed: %s (size=%zu, buffered=%zu)",
-                e.what(), packet.size(), audioChannel->bufferedAmount());
-        } catch (...) {
-            audioErr++;
-            WARN("WebRTC: SendAudio direct send failed with unknown exception");
+        AudioPacketHeader dataHeader{};
+        dataHeader.magic = MSG_AUDIO_DATA;
+        dataHeader.timestamp = ts;
+        dataHeader.packetId = audioPktId.fetch_add(1, std::memory_order_acq_rel);
+        dataHeader.samples = static_cast<uint16_t>(samples);
+        dataHeader.dataLength = static_cast<uint16_t>(data.size());
+        dataHeader.packetType = PKT_DATA;
+        dataHeader.fecGroupSize = AUDIO_FEC_GROUP_SIZE;
+        dataHeader.reserved = 0;
+
+        std::vector<uint8_t> dataPacket(sizeof(AudioPacketHeader) + data.size());
+        memcpy(dataPacket.data(), &dataHeader, sizeof(AudioPacketHeader));
+        memcpy(dataPacket.data() + sizeof(AudioPacketHeader), data.data(), data.size());
+        outgoing.push_back(dataPacket);
+
+        static_assert(AUDIO_FEC_GROUP_SIZE > 0, "AUDIO_FEC_GROUP_SIZE must be > 0");
+
+        if (audioFecCount_ == 0) audioFecGroupStart_ = dataHeader.packetId;
+        audioFecPackets_[audioFecCount_++] = std::move(dataPacket);
+
+        if (audioFecCount_ == AUDIO_FEC_GROUP_SIZE) {
+            size_t parityLen = 0;
+            for (const auto& packet : audioFecPackets_) parityLen = std::max(parityLen, packet.size());
+
+            if (parityLen > 0 && parityLen <= 65535) {
+                std::vector<uint8_t> parity(parityLen, 0);
+                for (const auto& packet : audioFecPackets_) {
+                    const size_t limit = std::min(parity.size(), packet.size());
+                    for (size_t i = 0; i < limit; i++) parity[i] ^= packet[i];
+                }
+
+                AudioPacketHeader fecHeader{};
+                fecHeader.magic = MSG_AUDIO_DATA;
+                fecHeader.timestamp = 0;
+                fecHeader.packetId = audioFecGroupStart_;
+                fecHeader.samples = 0;
+                fecHeader.dataLength = static_cast<uint16_t>(parity.size());
+                fecHeader.packetType = PKT_FEC;
+                fecHeader.fecGroupSize = AUDIO_FEC_GROUP_SIZE;
+                fecHeader.reserved = 0;
+
+                std::vector<uint8_t> fecPacket(sizeof(AudioPacketHeader) + parity.size());
+                memcpy(fecPacket.data(), &fecHeader, sizeof(AudioPacketHeader));
+                memcpy(fecPacket.data() + sizeof(AudioPacketHeader), parity.data(), parity.size());
+                outgoing.push_back(std::move(fecPacket));
+            }
+
+            for (auto& packet : audioFecPackets_) packet.clear();
+            audioFecCount_ = 0;
+        }
+
+        for (auto& packet : outgoing) {
+            PushBoundedQueue(audioPacketQueue_, static_cast<size_t>(6), std::move(packet));
         }
     }
 
-    std::lock_guard<std::mutex> lk(sendMutex_);
-    PushBoundedQueue(audioPacketQueue_, static_cast<size_t>(3), std::move(packet));
     DrainAudio();
+    audioSent++;
     return true;
 }
 

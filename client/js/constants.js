@@ -21,11 +21,12 @@ export const CODECS = {
 export const CODEC_KEYS = ['av1', 'h265', 'h264'];
 
 export const C = {
-    HEADER: 31, AUDIO_HEADER: 16, PING_MS: 200, MAX_FRAMES: 64, FRAME_TIMEOUT_MS: 900,
+    HEADER: 31, AUDIO_HEADER: 24, PING_MS: 200, MAX_FRAMES: 64, FRAME_TIMEOUT_MS: 900,
     KEY_REQ_MIN_INTERVAL_MS: 350, KEY_RETRY_INTERVAL_MS: 700,
-    FEC_GROUP_SIZE: 4,
+    FEC_GROUP_SIZE: 10,
     AUDIO_RATE: 48000, AUDIO_CH: 2,
-    MIC_HEADER: 16, MIC_RATE: 48000, MIC_CH: 1, MIC_FRAME_MS: 10,
+    MIC_HEADER: 24, MIC_RATE: 48000, MIC_CH: 1, MIC_FRAME_MS: 10,
+    AUDIO_FEC_GROUP_SIZE: 10, MIC_FEC_GROUP_SIZE: 10,
     DC_CONTROL: { ordered: 1, maxRetransmits: 3 },
     DC_VIDEO: { ordered: 0, maxRetransmits: 0 },
     DC_AUDIO: { ordered: 0, maxRetransmits: 0 },

@@ -7,29 +7,87 @@ let micContext = null;
 let micWorklet = null;
 let micEncoder = null;
 let frameCounter = 0;
+let micPacketId = 0;
+let micFecGroupStart = 0;
+let micFecPackets = [];
+const MIC_PKT_DATA = 0;
+const MIC_PKT_FEC = 1;
 const MIC_WORKLET_URL = new URL('./mic-worklet.js', import.meta.url).href;
-const sendMicPacket = (opusData, timestamp, samples) => {
+const sendRawMicPacket = packet => {
     if (!S.dcMic || S.dcMic.readyState !== 'open') {
         log.debug('MIC', 'Channel not open, packet dropped');
         return false;
     }
 
     return safe(() => {
-        const payload = opusData instanceof Uint8Array ? opusData : new Uint8Array(opusData);
-        const packet = new ArrayBuffer(C.MIC_HEADER + payload.byteLength);
-        const view = new DataView(packet);
-
-        view.setUint32(0, MSG.MIC_DATA, true);
-        view.setBigUint64(4, BigInt(timestamp), true);
-        view.setUint16(12, samples, true);
-        view.setUint16(14, payload.byteLength, true);
-        new Uint8Array(packet, C.MIC_HEADER).set(payload);
-
         S.dcMic.send(packet);
         recordMicPacket(packet.byteLength);
         return true;
     }, false, 'MIC');
 };
+
+const buildMicPacket = ({ payload, timestamp, samples, packetId, packetType, groupSize }) => {
+    const packet = new ArrayBuffer(C.MIC_HEADER + payload.byteLength);
+    const view = new DataView(packet);
+    view.setUint32(0, MSG.MIC_DATA, true);
+    view.setBigUint64(4, BigInt(timestamp), true);
+    view.setUint32(12, packetId, true);
+    view.setUint16(16, samples, true);
+    view.setUint16(18, payload.byteLength, true);
+    view.setUint8(20, packetType);
+    view.setUint8(21, groupSize);
+    view.setUint16(22, 0, true);
+    new Uint8Array(packet, C.MIC_HEADER).set(payload);
+    return new Uint8Array(packet);
+};
+
+const sendMicPacketWithFec = (opusData, timestamp, samples) => {
+    const payload = opusData instanceof Uint8Array ? opusData : new Uint8Array(opusData);
+    const groupSize = Math.max(1, C.MIC_FEC_GROUP_SIZE || 4);
+    const packetId = micPacketId++;
+    if (!micFecPackets.length) micFecGroupStart = packetId;
+
+    const dataPacket = buildMicPacket({
+        payload,
+        timestamp,
+        samples,
+        packetId,
+        packetType: MIC_PKT_DATA,
+        groupSize
+    });
+
+    const sent = sendRawMicPacket(dataPacket.buffer);
+    if (!sent) return false;
+
+    micFecPackets.push(dataPacket);
+    if (micFecPackets.length >= groupSize) {
+        let parityLen = 0;
+        micFecPackets.forEach(packet => { parityLen = Math.max(parityLen, packet.byteLength); });
+
+        if (parityLen > 0 && parityLen <= 65535) {
+            const parity = new Uint8Array(parityLen);
+            micFecPackets.forEach(packet => {
+                const limit = Math.min(parity.length, packet.byteLength);
+                for (let i = 0; i < limit; i++) parity[i] ^= packet[i];
+            });
+
+            const fecPacket = buildMicPacket({
+                payload: parity,
+                timestamp: 0,
+                samples: 0,
+                packetId: micFecGroupStart,
+                packetType: MIC_PKT_FEC,
+                groupSize
+            });
+            sendRawMicPacket(fecPacket.buffer);
+        }
+
+        micFecPackets = [];
+    }
+
+    return true;
+};
+
 const initEncoder = () => {
     if (!window.AudioEncoder) {
         log.error('MIC', 'AudioEncoder API not available');
@@ -42,7 +100,7 @@ const initEncoder = () => {
                 const data = new ArrayBuffer(chunk.byteLength);
                 chunk.copyTo(data);
                 const samples = C.MIC_RATE * C.MIC_FRAME_MS / 1000;
-                sendMicPacket(data, Math.floor(chunk.timestamp), samples);
+                sendMicPacketWithFec(data, Math.floor(chunk.timestamp), samples);
             },
             error: e => {
                 log.error('MIC', 'Encoder error', { error: e.message });
@@ -148,6 +206,9 @@ export const startMic = async () => {
 
         S.micEnabled = 1;
         frameCounter = 0;
+        micPacketId = 0;
+        micFecGroupStart = 0;
+        micFecPackets = [];
         sendMicEnable(1);
 
         log.info('MIC', 'Started', { sampleRate: C.MIC_RATE, channels: C.MIC_CH });
@@ -188,6 +249,9 @@ export const stopMic = () => {
     }
 
     frameCounter = 0;
+    micPacketId = 0;
+    micFecGroupStart = 0;
+    micFecPackets = [];
     sendMicEnable(0);
 
     log.info('MIC', 'Stopped');

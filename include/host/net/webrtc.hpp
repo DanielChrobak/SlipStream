@@ -2,6 +2,8 @@
 #include "host/core/common.hpp"
 #include "host/media/encoder.hpp"
 #include "host/io/input.hpp"
+#include <array>
+#include <unordered_set>
 
 #pragma pack(push,1)
 struct PacketHeader {
@@ -14,11 +16,6 @@ struct PacketHeader {
     uint8_t frameType;
     uint8_t packetType;
     uint8_t fecGroupSize;
-};
-struct AudioPacketHeader {
-    uint32_t magic;
-    int64_t timestamp;
-    uint16_t samples, dataLength;
 };
 #pragma pack(pop)
 
@@ -38,6 +35,14 @@ struct WebRTCCallbacks {
 };
 
 class WebRTCServer {
+    struct MicFecGroupState {
+        uint8_t groupSize = 4;
+        std::unordered_map<uint32_t, std::vector<uint8_t>> dataPackets;
+        std::vector<uint8_t> fecPayload;
+        bool hasFec = false;
+        int64_t updatedMs = 0;
+    };
+
     std::shared_ptr<rtc::PeerConnection> peerConnection_;
     std::shared_ptr<rtc::DataChannel> controlDataChannel_, videoDataChannel_, audioDataChannel_, inputDataChannel_, micDataChannel_;
     std::mutex channelMutex_;
@@ -45,19 +50,27 @@ class WebRTCServer {
     std::atomic<bool> conn{false}, needsKey{true}, fpsRecv{false}, gathered{false}, hasDesc{false};
     std::atomic<int> chRdy{0}, overflow{0};
     std::atomic<int64_t> lastPing{0}, lastStatLog{0}, lastKeyReqMs{0};
-    std::atomic<uint32_t> frmId{0};
+    std::atomic<uint32_t> frmId{0}, audioPktId{0};
     std::atomic<CodecType> curCodec{CODEC_AV1};
 
     std::string localDescription_;
-    std::mutex descriptionMutex_, sendMutex_;
+    std::mutex descriptionMutex_, sendMutex_, micFecMutex_;
     std::condition_variable descriptionCv_;
     rtc::Configuration rtcConfig_;
     WebRTCCallbacks callbacks_;
     std::queue<std::vector<uint8_t>> videoPacketQueue_, audioPacketQueue_;
+    std::unordered_map<uint32_t, MicFecGroupState> micFecGroups_;
+    std::unordered_set<uint32_t> micSeenPacketIds_;
 
     static constexpr size_t VID_BUF=262144, AUD_BUF=131072, CHUNK=1400;
     static constexpr size_t HDR_SZ=sizeof(PacketHeader), DATA_CHUNK=CHUNK-HDR_SZ, BUF_LOW=CHUNK*16;
     static constexpr int NUM_CH=5;
+    static constexpr uint8_t AUDIO_FEC_GROUP_SIZE = 10;
+    static constexpr uint8_t MIC_FEC_GROUP_SIZE = 10;
+
+    std::array<std::vector<uint8_t>, AUDIO_FEC_GROUP_SIZE> audioFecPackets_;
+    uint8_t audioFecCount_ = 0;
+    uint32_t audioFecGroupStart_ = 0;
 
     std::atomic<uint64_t> videoSent{0}, audioSent{0}, videoErr{0}, audioErr{0};
     std::atomic<uint64_t> ctrlSent{0}, ctrlRecv{0}, inputRecv{0}, micRecv{0}, connCount{0};

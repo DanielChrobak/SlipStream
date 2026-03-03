@@ -299,8 +299,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | Parameter | Value |
 |-----------|-------|
 | Algorithm | XOR parity per group |
-| Group Size (keyframes) | 4 data chunks per parity packet |
-| Group Size (non-keyframes) | 8 data chunks per parity packet |
+| Group Size (video) | 10 data chunks per parity packet |
 | Recovery | Single missing chunk per group (client-side XOR reconstruction) |
 | Bypass | Skipped when queue ≥ 128 packets or buffered ≥ 128 KB |
 
@@ -318,7 +317,7 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | 26 | 2 | dataChunkSize | Nominal data-chunk size |
 | 28 | 1 | frameType | 1=keyframe, 0=delta |
 | 29 | 1 | packetType | 0=data, 1=FEC parity |
-| 30 | 1 | fecGroupSize | FEC group size (4 for keyframes, 8 for non-keyframes) |
+| 30 | 1 | fecGroupSize | FEC group size (currently 10) |
 
 ## Audio Pipeline (Server to Client)
 
@@ -349,17 +348,22 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | Parameter | Value |
 |-----------|-------|
 | Audio Buffer | 128 KB threshold |
-| Max Queue | 3 packets (WebRTC send queue), 4 packets capture queue |
+| Max Queue | 6 packets (WebRTC send queue), 4 packets capture queue |
 | Delivery | Unordered, maxRetransmits=0 |
+| FEC | XOR parity packet every 10 audio packets |
 
-### Audio Packet Header (16 bytes)
+### Audio Packet Header (24 bytes)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | magic | 0x41554449 ("AUDI") |
 | 4 | 8 | timestamp | Capture timestamp |
-| 12 | 2 | samples | Sample count (480) |
-| 14 | 2 | dataLength | Opus payload size |
+| 12 | 4 | packetId | Monotonic packet sequence |
+| 16 | 2 | samples | Sample count (data packets only) |
+| 18 | 2 | dataLength | Payload size |
+| 20 | 1 | packetType | 0=data, 1=FEC parity |
+| 21 | 1 | fecGroupSize | FEC group size (currently 10) |
+| 22 | 2 | reserved | Reserved (0) |
 
 ### Client Playback
 
@@ -403,15 +407,20 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 |-----------|-------|
 | Delivery | Unordered, maxRetransmits=0 |
 | Max Queue | 20 packets |
+| FEC | XOR parity packet every 10 mic packets |
 
-### Microphone Packet Header (16 bytes)
+### Microphone Packet Header (24 bytes)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | magic | 0x4D494344 ("MICD") |
 | 4 | 8 | timestamp | Capture timestamp |
-| 12 | 2 | samples | Sample count (480) |
-| 14 | 2 | dataLength | Opus payload size |
+| 12 | 4 | packetId | Monotonic packet sequence |
+| 16 | 2 | samples | Sample count (data packets only) |
+| 18 | 2 | dataLength | Payload size |
+| 20 | 1 | packetType | 0=data, 1=FEC parity |
+| 21 | 1 | fecGroupSize | FEC group size (currently 10) |
+| 22 | 2 | reserved | Reserved (0) |
 
 ### Server Playback
 

@@ -14,6 +14,7 @@ enum MsgType : uint32_t {
 };
 
 enum CodecType : uint8_t { CODEC_AV1=0, CODEC_H265=1, CODEC_H264=2 };
+enum PacketType : uint8_t { PKT_DATA=0, PKT_FEC=1 };
 
 enum CursorType : uint8_t {
     CURSOR_DEFAULT=0, CURSOR_TEXT, CURSOR_POINTER, CURSOR_WAIT, CURSOR_PROGRESS, CURSOR_CROSSHAIR,
@@ -22,5 +23,24 @@ enum CursorType : uint8_t {
 };
 
 #pragma pack(push,1)
-struct MicPacketHeader { uint32_t magic; int64_t timestamp; uint16_t samples, dataLength; };
+struct AudioPacketHeader {
+    uint32_t magic;
+    int64_t timestamp;
+    uint32_t packetId;
+    uint16_t samples;
+    uint16_t dataLength;
+    uint8_t packetType;
+    uint8_t fecGroupSize;
+    uint16_t reserved;
+};
+struct MicPacketHeader {
+    uint32_t magic;
+    int64_t timestamp;
+    uint32_t packetId;
+    uint16_t samples;
+    uint16_t dataLength;
+    uint8_t packetType;
+    uint8_t fecGroupSize;
+    uint16_t reserved;
+};
 #pragma pack(pop)
