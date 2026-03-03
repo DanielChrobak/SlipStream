@@ -1,6 +1,6 @@
-#include "common.hpp"
-#include "app_support.hpp"
-#include "tray.hpp"
+#include "host/core/common.hpp"
+#include "host/core/app_support.hpp"
+#include "host/io/tray.hpp"
 #include <shellapi.h>
 
 namespace {
@@ -14,22 +14,20 @@ HWND g_trayWnd = nullptr;
 
 void RestoreFromTray() {
     if(!g_consoleWnd) return;
-    ShowWindow(g_consoleWnd, SW_SHOW);
     ShowWindow(g_consoleWnd, SW_RESTORE);
     SetForegroundWindow(g_consoleWnd);
 }
 
 void DisableConsoleCloseButton() {
     if(!g_consoleWnd) return;
-    HMENU sysMenu = GetSystemMenu(g_consoleWnd, FALSE);
-    if(!sysMenu) return;
-    EnableMenuItem(sysMenu, SC_CLOSE, MF_BYCOMMAND | MF_GRAYED);
-    DrawMenuBar(g_consoleWnd);
+    if(HMENU m = GetSystemMenu(g_consoleWnd, FALSE))
+        { EnableMenuItem(m, SC_CLOSE, MF_BYCOMMAND|MF_GRAYED); DrawMenuBar(g_consoleWnd); }
 }
 
 void RequestFullExit() {
-    g_exitRequested.store(true, std::memory_order_release);
-    g_running.store(false, std::memory_order_release);
+    auto& app = GetAppContext();
+    app.exitRequested.store(true, std::memory_order_release);
+    app.running.store(false, std::memory_order_release);
 }
 
 void ShowTrayMenu(HWND wnd) {
@@ -62,17 +60,9 @@ LRESULT CALLBACK TrayWindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam
             }
             break;
         case WM_TRAYICON:
-            {
-                UINT evt = LOWORD(lParam);
-                UINT idLegacy = LOWORD(wParam);
-                UINT idV4 = HIWORD(lParam);
-                if(idLegacy == TRAY_ICON_ID || idV4 == TRAY_ICON_ID) {
-                if(evt == WM_RBUTTONUP || evt == WM_CONTEXTMENU) {
-                    ShowTrayMenu(wnd);
-                    return 0;
-                }
-                }
-            }
+            if ((LOWORD(wParam) == TRAY_ICON_ID || HIWORD(lParam) == TRAY_ICON_ID) &&
+                (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
+                { ShowTrayMenu(wnd); return 0; }
             break;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -109,12 +99,9 @@ bool InitAppTray() {
     if(!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
 
     NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_trayWnd;
-    nid.uID = TRAY_ICON_ID;
+    nid.cbSize = sizeof(nid); nid.hWnd = g_trayWnd; nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = icon;
+    nid.uCallbackMessage = WM_TRAYICON; nid.hIcon = icon;
     wcscpy_s(nid.szTip, L"SlipStream");
 
     if(!Shell_NotifyIconW(NIM_ADD, &nid)) {
@@ -148,13 +135,10 @@ void HideAppToTray() {
 }
 
 void CleanupAppTray() {
-    if(g_trayWnd) {
-        NOTIFYICONDATAW nid{};
-        nid.cbSize = sizeof(nid);
-        nid.hWnd = g_trayWnd;
-        nid.uID = TRAY_ICON_ID;
-        Shell_NotifyIconW(NIM_DELETE, &nid);
-        DestroyWindow(g_trayWnd);
-        g_trayWnd = nullptr;
-    }
+    if(!g_trayWnd) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid); nid.hWnd = g_trayWnd; nid.uID = TRAY_ICON_ID;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    DestroyWindow(g_trayWnd);
+    g_trayWnd = nullptr;
 }

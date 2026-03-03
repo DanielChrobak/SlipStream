@@ -1,18 +1,44 @@
 
-import { C, S, $, mkBuf, MSG, CODECS, log, safe, safeAsync,
+import { C, MSG, CODECS } from './constants.js';
+import { S, $, mkBuf, log, safe, safeAsync,
     recordDecodeTime, recordAudioPacket, recordAudioDecoded, recordAudioBufferHealth,
     recordAudioUnderrun, recordAudioOverflow, logVideoDrop, logAudioDrop } from './state.js';
 import { queueFrameForPresentation, resetRenderer } from './renderer.js';
-let reqKeyFn = null;
-let sendAudioEnableFn = null;
+import { requestKeyframe, requestRecoveryKeyframe, sendAudioEnable, handleDecodePressure } from './protocol.js';
 let kfRetryInterval = null;
 let lastCaptureTs = 0;
 let workletNode = null;
 let workletReady = false;
 let lastWaitingKeyLogAt = 0;
+let decodeQueuePressureCount = 0;
+let lastDecodeQueuePressureAt = 0;
 
-export const setReqKeyFn = fn => { reqKeyFn = fn; };
-export const setSendAudioEnableFn = fn => { sendAudioEnableFn = fn; };
+const notifyDecodeQueuePressure = queueSize => {
+    const now = performance.now();
+    if (now - lastDecodeQueuePressureAt > 1500) {
+        decodeQueuePressureCount = 0;
+    }
+    lastDecodeQueuePressureAt = now;
+    decodeQueuePressureCount++;
+
+    log.warn('MEDIA', 'Decode queue pressure', {
+        queueSize, pressureCount: decodeQueuePressureCount, threshold: 12
+    });
+
+    if (decodeQueuePressureCount >= 3 && !S.needKey) {
+        log.warn('MEDIA', 'Sustained decode pressure - requesting recovery keyframe', {
+            queueSize, pressureCount: decodeQueuePressureCount
+        });
+        requestRecoveryKeyframe('decode-pressure');
+    }
+
+    if (decodeQueuePressureCount >= 12) {
+        decodeQueuePressureCount = 0;
+        log.error('MEDIA', 'Decode queue pressure threshold exceeded - triggering adaptive quality');
+        handleDecodePressure({ reason: 'decode-queue-full', queueSize });
+    }
+};
+
 const stopKeyframeRetry = () => {
     if (kfRetryInterval) {
         clearInterval(kfRetryInterval);
@@ -24,13 +50,13 @@ const stopKeyframeRetry = () => {
 const startKeyframeRetry = () => {
     if (kfRetryInterval) return;
     kfRetryInterval = setInterval(() => {
-        if (S.needKey && S.ready && reqKeyFn) {
+        if (S.needKey && S.ready) {
             log.debug('MEDIA', 'Requesting keyframe (retry)');
-            reqKeyFn('retry');
+            requestKeyframe('retry');
         } else if (!S.needKey) {
             stopKeyframeRetry();
         }
-    }, C.KEY_RETRY_INTERVAL_MS || 500);
+    }, C.KEY_RETRY_INTERVAL_MS);
     log.debug('MEDIA', 'Keyframe retry started');
 };
 const tryReinitDecoder = () => {
@@ -54,6 +80,8 @@ export const initDecoder = async (force = false) => {
     S.ready = 0;
     S.needKey = 1;
     lastCaptureTs = 0;
+    decodeQueuePressureCount = 0;
+    lastDecodeQueuePressureAt = 0;
 
     if (force) {
         S.W = S.H = 0;
@@ -72,8 +100,22 @@ export const initDecoder = async (force = false) => {
             const meta = S.frameMeta.get(frame.timestamp);
 
             if (meta?.decodeStartMs) {
-                recordDecodeTime(now - meta.decodeStartMs, S.decoder?.decodeQueueSize || 0);
+                const decodeTime = now - meta.decodeStartMs;
+                recordDecodeTime(decodeTime, S.decoder?.decodeQueueSize || 0);
+                if (decodeTime > 50) {
+                    log.warn('MEDIA', 'Slow decode', {
+                        decodeMs: decodeTime.toFixed(1),
+                        queueSize: S.decoder?.decodeQueueSize || 0,
+                        w: frame.displayWidth, h: frame.displayHeight,
+                        ts: frame.timestamp
+                    });
+                }
             }
+
+            log.debug('MEDIA', 'Frame decoded', {
+                ts: frame.timestamp, w: frame.displayWidth, h: frame.displayHeight,
+                queueSize: S.decoder?.decodeQueueSize || 0
+            });
 
             queueFrameForPresentation({
                 frame,
@@ -84,11 +126,16 @@ export const initDecoder = async (force = false) => {
             });
         },
         error: e => {
-            logVideoDrop('Decoder error', { error: e.message, codec });
+            log.error('MEDIA', 'Decoder error', {
+                error: e.message, codec,
+                decoderState: S.decoder?.state,
+                queueSize: S.decoder?.decodeQueueSize || 0,
+                decodeErrors: S.stats.decodeErrors
+            });
             S.stats.decodeErrors++;
             S.ready = 1;
             S.needKey = 1;
-            reqKeyFn?.('decoder-error');
+            requestKeyframe('decoder-error');
             startKeyframeRetry();
             tryReinitDecoder();
         }
@@ -119,48 +166,60 @@ export const initDecoder = async (force = false) => {
 
     if (!configured || decoder.state !== 'configured') {
         S.hwAccel = 'NONE';
+        log.error('MEDIA', 'Decoder configuration failed', { codec, state: decoder.state });
         logVideoDrop('Decoder configuration failed', { codec });
         return;
     }
 
     S.ready = 1;
-    reqKeyFn?.('decoder-init');
+    requestKeyframe('decoder-init');
     startKeyframeRetry();
     resetRenderer();
 };
 
 export const decodeFrame = data => {
     if (!S.ready) {
-        logVideoDrop('Decoder not ready');
-        reqKeyFn?.('decoder-not-ready');
-        return;
+        logVideoDrop('Decoder not ready', { decoderState: S.decoder?.state, needKey: S.needKey });
+        requestKeyframe('decoder-not-ready');
+        return false;
     }
 
     if (!data.isKey && S.needKey) {
         const now = performance.now();
         if (now - lastWaitingKeyLogAt >= 1000) {
-            logVideoDrop('Waiting for keyframe');
+            logVideoDrop('Waiting for keyframe', {
+                capTs: data.capTs, timeSinceLastLog: (now - lastWaitingKeyLogAt).toFixed(0)
+            });
             lastWaitingKeyLogAt = now;
         }
         startKeyframeRetry();
-        return;
+        return false;
     }
 
     if (!S.decoder || S.decoder.state !== 'configured') {
-        logVideoDrop('Decoder not configured');
+        logVideoDrop('Decoder not configured', {
+            hasDecoder: !!S.decoder, state: S.decoder?.state,
+            needKey: S.needKey, ready: S.ready
+        });
         tryReinitDecoder();
-        return;
+        return false;
     }
 
     const queueSize = S.decoder.decodeQueueSize || 0;
     if (queueSize > 6 && !data.isKey) {
-        logVideoDrop('Decode queue full', { queueSize });
-        return;
+        logVideoDrop('Decode queue full', {
+            queueSize, isKey: data.isKey ? 1 : 0, capTs: data.capTs
+        });
+        notifyDecodeQueuePressure(queueSize);
+        return false;
     }
 
     if (!Number.isFinite(data.capTs) || data.capTs < 0) {
-        logVideoDrop('Invalid timestamp', { capTs: data.capTs });
-        return;
+        logVideoDrop('Invalid timestamp', {
+            capTs: data.capTs, isKey: data.isKey ? 1 : 0,
+            bufSize: data.buf?.byteLength
+        });
+        return false;
     }
     S.frameMeta.set(data.capTs, {
         capTs: data.capTs,
@@ -168,8 +227,11 @@ export const decodeFrame = data => {
         arrivalMs: data.arrivalMs
     });
     if (S.frameMeta.size > 30) {
-        const sorted = [...S.frameMeta.keys()].sort((a, b) => a - b);
-        sorted.slice(0, -20).forEach(k => S.frameMeta.delete(k));
+        while (S.frameMeta.size > 20) {
+            const oldest = S.frameMeta.keys().next().value;
+            if (oldest === undefined) break;
+            S.frameMeta.delete(oldest);
+        }
     }
     const duration = (lastCaptureTs > 0 && data.capTs > lastCaptureTs)
         ? data.capTs - lastCaptureTs
@@ -189,15 +251,30 @@ export const decodeFrame = data => {
             S.needKey = 0;
             lastWaitingKeyLogAt = 0;
             stopKeyframeRetry();
-            log.debug('MEDIA', 'Keyframe decoded');
+            log.info('MEDIA', 'Keyframe decoded', {
+                capTs: data.capTs, size: data.buf?.byteLength,
+                queueSize: S.decoder?.decodeQueueSize || 0
+            });
+        } else {
+            log.debug('MEDIA', 'Delta frame submitted', {
+                capTs: data.capTs, size: data.buf?.byteLength,
+                duration, queueSize: S.decoder?.decodeQueueSize || 0
+            });
         }
+        return true;
     } catch (e) {
-        logVideoDrop('Decode exception', { error: e.message });
+        logVideoDrop('Decode exception', {
+            error: e.message, isKey: data.isKey ? 1 : 0,
+            capTs: data.capTs, size: data.buf?.byteLength,
+            decoderState: S.decoder?.state,
+            queueSize: S.decoder?.decodeQueueSize || 0
+        });
         S.stats.decodeErrors++;
         S.needKey = 1;
         S.ready = 1;
-        reqKeyFn?.('decode-exception');
+        requestKeyframe('decode-exception');
         startKeyframeRetry();
+        return false;
     }
 };
 const resetAudioState = () => {
@@ -206,97 +283,7 @@ const resetAudioState = () => {
         log.debug('AUDIO', 'Worklet state cleared');
     }
 };
-const WORKLET_CODE = `
-class RingBuffer {
-    constructor(channels, capacity) {
-        this.ch = channels; this.cap = capacity;
-        this.bufs = []; for (let i = 0; i < channels; i++) this.bufs.push(new Float32Array(capacity));
-        this.rp = 0; this.wp = 0; this.avail = 0;
-    }
-    write(channelData, frames) {
-        if (frames <= 0) return { written: 0, overflow: 0 };
-        let overflow = 0;
-        const space = this.cap - this.avail;
-        if (frames > space) { overflow = frames - space; this.rp = (this.rp + overflow) % this.cap; this.avail -= overflow; }
-        const toWrite = Math.min(frames, this.cap - this.avail);
-        if (toWrite <= 0) return { written: 0, overflow };
-        for (let c = 0; c < this.ch; c++) {
-            const src = channelData[c] || channelData[0];
-            for (let i = 0; i < toWrite; i++) this.bufs[c][(this.wp + i) % this.cap] = src[i] || 0;
-        }
-        this.wp = (this.wp + toWrite) % this.cap; this.avail += toWrite;
-        return { written: toWrite, overflow };
-    }
-    read(output, frames) {
-        const toRead = Math.min(frames, this.avail);
-        for (let c = 0; c < this.ch; c++) {
-            const out = output[c];
-            for (let i = 0; i < frames; i++) out[i] = i < toRead ? this.bufs[c][(this.rp + i) % this.cap] : 0;
-        }
-        if (toRead > 0) { this.rp = (this.rp + toRead) % this.cap; this.avail -= toRead; }
-        return toRead;
-    }
-    skip(n) { const toSkip = Math.min(n, this.avail); if (toSkip > 0) { this.rp = (this.rp + toSkip) % this.cap; this.avail -= toSkip; } return toSkip; }
-    get length() { return this.avail; }
-    clear() { this.rp = 0; this.wp = 0; this.avail = 0; }
-}
-
-class StreamAudioProcessor extends AudioWorkletProcessor {
-    constructor() {
-        super();
-        this.rb = new RingBuffer(2, 4800);
-        this.target = 960; this.max = 1920; this.prebufThreshold = 480;
-        this.prebuffering = true; this.volume = 1; this.muted = false;
-        this.samplesProcessed = 0; this.underruns = 0; this.overflows = 0;
-        this.lastReport = 0; this.consecutiveUnderruns = 0;
-        this.port.onmessage = e => {
-            const { type, data } = e.data;
-            if (type === 'audio') {
-                const bufLen = this.rb.length;
-                if (bufLen > this.max) {
-                    const toSkip = bufLen - this.target;
-                    if (toSkip > 0) { this.rb.skip(toSkip); this.overflows++; this.port.postMessage({ type: 'drop', reason: 'Overflow' }); }
-                }
-                const result = this.rb.write(data.channels, data.frames);
-                if (result.overflow > 0) { this.overflows++; this.port.postMessage({ type: 'drop', reason: 'Write overflow' }); }
-                if (result.written > 0) this.consecutiveUnderruns = 0;
-                if (this.prebuffering && this.rb.length >= this.prebufThreshold) this.prebuffering = false;
-            } else if (type === 'volume') this.volume = Math.max(0, Math.min(1, data));
-            else if (type === 'mute') this.muted = data;
-            else if (type === 'clear') { this.rb.clear(); this.underruns = 0; this.overflows = 0; this.consecutiveUnderruns = 0; this.prebuffering = true; }
-        };
-        this.port.postMessage({ type: 'ready' });
-    }
-    process(inputs, outputs) {
-        const out = outputs[0];
-        if (!out || !out.length) return true;
-        const frames = out[0].length;
-        if (!this.prebuffering && this.rb.length > this.max) {
-            const skipped = this.rb.skip(this.rb.length - this.target);
-            if (skipped > 0) {
-                this.overflows++;
-                this.port.postMessage({ type: 'drop', reason: 'Catch-up' });
-            }
-        }
-        const bufferMs = (this.rb.length / 48000) * 1000;
-        if (this.muted || this.prebuffering) { for (let c = 0; c < out.length; c++) out[c].fill(0); this.samplesProcessed += frames; return true; }
-        const read = this.rb.read(out, frames);
-        if (this.volume !== 1) for (let c = 0; c < out.length; c++) for (let i = 0; i < frames; i++) out[c][i] *= this.volume;
-        if (read < frames) {
-            this.underruns++; this.consecutiveUnderruns++;
-            this.port.postMessage({ type: 'drop', reason: 'Underrun' });
-            if (this.consecutiveUnderruns >= 5) { this.prebuffering = true; this.consecutiveUnderruns = 0; }
-        } else this.consecutiveUnderruns = 0;
-        this.samplesProcessed += frames;
-        if (this.samplesProcessed - this.lastReport >= 4800) {
-            this.port.postMessage({ type: 'stats', bufferMs, underruns: this.underruns, overflows: this.overflows });
-            this.lastReport = this.samplesProcessed; this.underruns = 0; this.overflows = 0;
-        }
-        return true;
-    }
-}
-registerProcessor('stream-audio-processor', StreamAudioProcessor);
-`;
+const AUDIO_WORKLET_URL = new URL('./audio-worklet.js', import.meta.url).href;
 
 export const initAudio = async () => {
     if (S.audioCtx && workletNode) {
@@ -320,14 +307,8 @@ export const initAudio = async () => {
             await ctx.resume();
             log.debug('AUDIO', 'Context resumed');
         }
-        const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
-        const url = URL.createObjectURL(blob);
-        try {
-            await ctx.audioWorklet.addModule(url);
-            log.debug('AUDIO', 'Worklet module loaded');
-        } finally {
-            URL.revokeObjectURL(url);
-        }
+        await ctx.audioWorklet.addModule(AUDIO_WORKLET_URL);
+        log.debug('AUDIO', 'Worklet module loaded');
         workletNode = new AudioWorkletNode(ctx, 'stream-audio-processor', {
             numberOfInputs: 0,
             numberOfOutputs: 1,
@@ -338,13 +319,25 @@ export const initAudio = async () => {
             const { type } = e.data;
             if (type === 'ready') {
                 workletReady = true;
-                log.debug('AUDIO', 'Worklet ready');
+                log.info('AUDIO', 'Worklet ready');
             } else if (type === 'stats') {
                 recordAudioBufferHealth(e.data.bufferMs);
+                if (e.data.underruns > 0) {
+                    log.warn('AUDIO', 'Worklet underruns', {
+                        count: e.data.underruns, bufferMs: e.data.bufferMs
+                    });
+                }
                 for (let i = 0; i < e.data.underruns; i++) recordAudioUnderrun();
+                if ((e.data.overflows || 0) > 0) {
+                    log.warn('AUDIO', 'Worklet overflows', {
+                        count: e.data.overflows, bufferMs: e.data.bufferMs
+                    });
+                }
                 for (let i = 0; i < (e.data.overflows || 0); i++) recordAudioOverflow();
             } else if (type === 'drop') {
                 logAudioDrop(e.data.reason);
+            } else {
+                log.warn('AUDIO', 'Unknown worklet message type', { type });
             }
         };
 
@@ -361,6 +354,11 @@ export const initAudio = async () => {
                     }
                 },
                 error: e => {
+                    log.error('AUDIO', 'AudioDecoder error', {
+                        error: e.message,
+                        decoderState: S.audioDecoder?.state,
+                        queueSize: S.audioDecoder?.decodeQueueSize || 0
+                    });
                     logAudioDrop('Decoder error', { error: e.message });
                 }
             });
@@ -438,7 +436,12 @@ const sendToWorklet = audioData => {
 };
 
 export const handleAudioPacket = data => {
-    if (!S.audioEnabled || !S.audioCtx) return;
+    if (!S.audioEnabled || !S.audioCtx) {
+        log.debug('AUDIO', 'Packet dropped - audio not enabled', {
+            enabled: S.audioEnabled, hasCtx: !!S.audioCtx
+        });
+        return;
+    }
 
     recordAudioPacket();
 
@@ -453,7 +456,10 @@ export const handleAudioPacket = data => {
     }
 
     if (S.audioDecoder?.state !== 'configured') {
-        logAudioDrop('Decoder not configured');
+        logAudioDrop('Decoder not configured', {
+            state: S.audioDecoder?.state,
+            hasDecoder: !!S.audioDecoder
+        });
         return;
     }
 
@@ -469,7 +475,11 @@ export const handleAudioPacket = data => {
     }, false, 'AUDIO');
 
     if (!result) {
-        logAudioDrop('Decode failed');
+        logAudioDrop('Decode failed', {
+            timestamp, samples, length,
+            decoderState: S.audioDecoder?.state,
+            queueSize: S.audioDecoder?.decodeQueueSize || 0
+        });
     }
 };
 
@@ -484,7 +494,7 @@ export const toggleAudio = async () => {
                 S.audioEnabled = 1;
                 btn.classList.add('on');
                 txt.textContent = 'Mute';
-                sendAudioEnableFn?.(1);
+                sendAudioEnable(1);
                 log.info('MEDIA', 'Audio enabled');
             } else {
                 log.error('MEDIA', 'Failed to enable audio');
@@ -497,7 +507,7 @@ export const toggleAudio = async () => {
         btn.classList.remove('on');
         txt.textContent = 'Enable';
         resetAudioState();
-        sendAudioEnableFn?.(0);
+        sendAudioEnable(0);
         log.info('MEDIA', 'Audio disabled');
     }
 };
@@ -515,4 +525,4 @@ export const closeAudio = () => {
     log.info('MEDIA', 'Audio closed');
 };
 
-export const stopKeyframeRetryTimer = stopKeyframeRetry;
+export { stopKeyframeRetry };

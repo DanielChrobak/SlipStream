@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <noscript><p style="color:#fff;text-align:center;margin-top:20vh">JavaScript is required for SlipStream.</p></noscript>
     <canvas id="c"></canvas>
 
     <aside class="stats-overlay" id="statsOverlay">
@@ -46,42 +47,42 @@
     </section>
 
     <button class="edge" id="edge"></button>
-    <div class="bk" id="bk"></div>
+    <div class="backdrop" id="backdrop"></div>
 
-    <aside class="pnl" id="pnl">
-        <header class="ph">
-            <span class="pt">Settings</span>
-            <button class="px" id="pnlX">&times;</button>
+    <aside class="panel" id="panel">
+        <header class="panel-header">
+            <span class="panel-title">Settings</span>
+            <button class="panel-close" id="panelClose">&times;</button>
         </header>
-        <div class="pc">
-            <div class="sec">
+        <div class="panel-content">
+            <div class="section">
                 <div class="btn-row">
                     <button class="btn" id="disconnectBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg><span>Logout</span></button>
                     <button class="btn" id="fs"><svg id="fsi" viewBox="0 0 24 24"><path id="fsp"/></svg><span id="fst">Fullscreen</span></button>
                 </div>
             </div>
-            <div class="sec">
-                <div class="sl">Audio</div>
+            <div class="section">
+                <div class="section-label">Audio</div>
                 <button class="btn bf" id="aBtn"><svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg><span id="aTxt">Enable</span></button>
                 <button class="btn bf" id="micBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg><span id="micTxt">Mic</span></button>
                 <p class="input-hint" id="micHint"></p>
             </div>
-            <div class="sec">
-                <div class="sl">Capture</div>
-                <div class="sw"><span class="sla">Monitor</span><select class="sel" id="monSel"><option value="0">Waiting...</option></select></div>
-                <div class="sw"><span class="sla">Frame Rate</span><select class="sel" id="fpsSel"><option value="15">15</option><option value="30">30</option><option value="60" selected>60</option><option value="120">120</option><option value="144">144</option><option value="custom">Custom</option></select></div>
-                <div class="sw custom-fps-row" id="customFpsRow" style="display:none"><span class="sla">Custom FPS</span><div class="custom-fps-input"><input type="number" id="customFpsInput" class="fps-input" min="1" max="240" value="60"><button class="btn-small" id="customFpsApply">Apply</button></div></div>
-                <div class="sw"><span class="sla">Codec</span><select class="sel" id="codecSel"><option value="0">AV1</option><option value="1">H.265</option><option value="2">H.264</option></select></div>
+            <div class="section">
+                <div class="section-label">Capture</div>
+                <div class="setting-row"><span class="setting-label">Monitor</span><select class="sel" id="monSel"><option value="0">Waiting...</option></select></div>
+                <div class="setting-row"><span class="setting-label">Frame Rate</span><select class="sel" id="fpsSel"><option value="15">15</option><option value="30">30</option><option value="60" selected>60</option><option value="120">120</option><option value="144">144</option><option value="custom">Custom</option></select></div>
+                <div class="sw custom-fps-row" id="customFpsRow" style="display:none"><span class="setting-label">Custom FPS</span><div class="custom-fps-input"><input type="number" id="customFpsInput" class="fps-input" min="1" max="240" value="60"><button class="btn-small" id="customFpsApply">Apply</button></div></div>
+                <div class="setting-row"><span class="setting-label">Codec</span><select class="sel" id="codecSel"><option value="0">AV1</option><option value="1">H.265</option><option value="2">H.264</option></select></div>
             </div>
-            <div class="sec">
-                <div class="sl">Display</div>
-                <div class="sw"><span class="sla">Tabbed mode</span><button class="tog" id="tabbedModeBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
-                <div class="sw"><span class="sla">Debug stats</span><button class="tog" id="statsToggleBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+            <div class="section">
+                <div class="section-label">Display</div>
+                <div class="setting-row"><span class="setting-label">Tabbed mode</span><button class="toggle" id="tabbedModeBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+                <div class="setting-row"><span class="setting-label">Debug stats</span><button class="toggle" id="statsToggleBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
             </div>
-            <div class="sec">
-                <div class="sl">Input</div>
-                <div class="sw"><span class="sla">Relative mouse</span><button class="tog" id="relativeMouseBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
-                <div class="sw"><span class="sla">Clipboard sync</span><button class="tog" id="clipboardSyncBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+            <div class="section">
+                <div class="section-label">Input</div>
+                <div class="setting-row"><span class="setting-label">Relative mouse</span><button class="toggle" id="relativeMouseBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+                <div class="setting-row"><span class="setting-label">Clipboard sync</span><button class="toggle" id="clipboardSyncBtn"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
             </div>
         </div>
     </aside>

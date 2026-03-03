@@ -1,5 +1,10 @@
-#include "capture.hpp"
-#include "app_support.hpp"
+#include "host/media/capture.hpp"
+#include "host/core/app_support.hpp"
+
+using std::chrono::duration_cast;
+using std::chrono::milliseconds;
+using std::chrono::steady_clock;
+using namespace std::chrono_literals;
 
 FrameSlot::FrameSlot() {
     InitializeCriticalSection(&cs);
@@ -70,37 +75,6 @@ void FrameSlot::Reset() {
     LeaveCriticalSection(&cs);
 }
 
-bool GPUSync::Init(ID3D11Device* d, ID3D11DeviceContext* c) {
-    if (FAILED(d->QueryInterface(IID_PPV_ARGS(&d5)))) return true;
-    if (FAILED(c->QueryInterface(IID_PPV_ARGS(&c4)))) { SafeRelease(d5); return true; }
-    if (FAILED(d5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&f)))) { SafeRelease(d5, c4); return true; }
-    evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!evt) { SafeRelease(f, c4, d5); return false; }
-    use = true;
-    return true;
-}
-
-GPUSync::~GPUSync() {
-    if (evt) CloseHandle(evt);
-    SafeRelease(f, c4, d5);
-}
-
-uint64_t GPUSync::Signal(bool& sync) {
-    sync = true;
-    if (use && c4 && f && SUCCEEDED(c4->Signal(f, ++val))) return val;
-    return 0;
-}
-
-bool GPUSync::Wait(uint64_t v, ID3D11DeviceContext* ctx, ID3D11Multithread* mt, DWORD ms) {
-    if (use && f && evt) {
-        if (f->GetCompletedValue() >= v) return true;
-        if (FAILED(f->SetEventOnCompletion(v, evt))) return false;
-        return WaitForSingleObject(evt, ms) == WAIT_OBJECT_0 || f->GetCompletedValue() >= v;
-    }
-    if (mt) { MTLock lk(mt); ctx->Flush(); } else ctx->Flush();
-    return true;
-}
-
 int ScreenCapture::FindTex() {
     for (int i = 0; i < POOL; i++) {
         int idx = (texIdx + i) % POOL;
@@ -114,7 +88,8 @@ int ScreenCapture::FindTex() {
         if (!slot->IsInFlight(idx)) {
             if (texFences[idx] > 0 && !sync.Complete(texFences[idx])) {
                 MTLock lk(mt);
-                [[maybe_unused]] const bool waited = sync.Wait(texFences[idx], ctx, mt, 4);
+                const bool waited = sync.Wait(texFences[idx], ctx, mt, 4);
+                if (!waited) WARN("Capture: GPU fence wait timeout in FindTex for slot %d", idx);
             }
             texIdx = idx + 1;
             return idx;
@@ -129,7 +104,7 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
     struct Guard { std::atomic<int>& c; ~Guard() { c.fetch_sub(1); } } g{cbActive};
 
     WGC::Direct3D11CaptureFrame f{nullptr};
-    try { f = s.TryGetNextFrame(); } catch (...) { return; }
+    try { f = s.TryGetNextFrame(); } catch (...) { WARN("Capture: TryGetNextFrame exception"); return; }
     if (!f) return;
 
     if (!running.load() || !capturing.load()) return;
@@ -142,14 +117,14 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
 
     int64_t ts = GetTimestamp();
     WGD::Direct3D11::IDirect3DSurface surf{nullptr};
-    try { surf = f.Surface(); } catch (...) { return; }
+    try { surf = f.Surface(); } catch (...) { WARN("Capture: Surface() exception"); return; }
     if (!surf) return;
 
     winrt::com_ptr<ID3D11Texture2D> src;
     try {
         auto acc = surf.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         if (FAILED(acc->GetInterface(IID_PPV_ARGS(src.put())))) return;
-    } catch (...) { return; }
+    } catch (...) { WARN("Capture: DXGIInterface exception"); return; }
 
     D3D11_TEXTURE2D_DESC srcDesc;
     src->GetDesc(&srcDesc);
@@ -158,16 +133,14 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
     int ti = FindTex();
     if (ti < 0 || ti >= POOL || !texPool[ti]) return;
 
-    bool ns = false;
     uint64_t fv = 0;
     {
         MTLock l(mt);
         ctx->CopyResource(texPool[ti], src.get());
-        ctx->Flush();
-        fv = sync.Signal(ns);
+        fv = sync.Signal();
     }
     texFences[ti] = fv;
-    slot->Push(texPool[ti], ts, fv, ns, ti);
+    slot->Push(texPool[ti], ts, fv, true, ti);
 }
 
 void ScreenCapture::WaitCB(int ms) {
@@ -210,8 +183,8 @@ void ScreenCapture::InitMon(HMONITOR mon, bool keepFps) {
     pool.FrameArrived({this, &ScreenCapture::OnFrame});
     sess = pool.CreateCaptureSession(item);
     sess.IsCursorCaptureEnabled(cursorCapture);
-    try { sess.IsBorderRequired(false); } catch (...) {}
-    try { sess.MinUpdateInterval(duration<int64_t, std::ratio<1, 10000000>>(0)); } catch (...) {}
+    try { sess.IsBorderRequired(false); } catch (...) { DBG("Capture: IsBorderRequired not supported"); }
+    try { sess.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{0}); } catch (...) { DBG("Capture: MinUpdateInterval not supported"); }
 
     started = false;
     curMon = mon;
@@ -232,7 +205,7 @@ ScreenCapture::ScreenCapture(FrameSlot* s) : slot(s) {
         throw std::runtime_error("D3D11 device failed");
 
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&mt)))) mt->SetMultithreadProtected(TRUE);
-    if (!sync.Init(dev, ctx)) throw std::runtime_error("GPU sync failed");
+    if (!sync.Init(dev, ctx, D3D11_FENCE_FLAG_SHARED)) throw std::runtime_error("GPU sync failed");
 
     winrt::com_ptr<IDXGIDevice> dxgi;
     winrt::com_ptr<::IInspectable> insp;
@@ -254,8 +227,8 @@ ScreenCapture::~ScreenCapture() {
 
     {
         std::lock_guard<std::recursive_mutex> lk(mtx);
-        try { if (sess) sess.Close(); } catch (...) {}
-        try { if (pool) pool.Close(); } catch (...) {}
+        try { if (sess) sess.Close(); } catch (...) { DBG("Capture: ~sess.Close exception"); }
+        try { if (pool) pool.Close(); } catch (...) { DBG("Capture: ~pool.Close exception"); }
         sess = nullptr;
         pool = nullptr;
         item = nullptr;
@@ -265,7 +238,7 @@ ScreenCapture::~ScreenCapture() {
 
     for (auto& t : texPool) SafeRelease(t);
     SafeRelease(mt, ctx, dev);
-    try { winrt::uninit_apartment(); } catch (...) {}
+    try { winrt::uninit_apartment(); } catch (...) { DBG("Capture: uninit_apartment exception"); }
 }
 
 void ScreenCapture::StartCapture() {
@@ -276,7 +249,7 @@ void ScreenCapture::StartCapture() {
     for (auto& f : texFences) f = 0;
 
     if (!started.exchange(true)) {
-        try { sess.StartCapture(); } catch (...) { started = false; return; }
+        try { sess.StartCapture(); } catch (...) { ERR("Capture: StartCapture failed"); started = false; return; }
     }
     capturing = true;
     LOG("ScreenCapture: Capture started");
@@ -306,8 +279,8 @@ bool ScreenCapture::SwitchMonitor(int i) {
         slot->SetGeneration(captureGen.fetch_add(1) + 1);
         slot->Wake();
 
-        try { if (sess) sess.Close(); } catch (...) {}
-        try { if (pool) pool.Close(); } catch (...) {}
+        try { if (sess) sess.Close(); } catch (...) { DBG("Capture: SwitchMonitor sess.Close exception"); }
+        try { if (pool) pool.Close(); } catch (...) { DBG("Capture: SwitchMonitor pool.Close exception"); }
         sess = nullptr;
         pool = nullptr;
         item = nullptr;
@@ -358,5 +331,5 @@ int ScreenCapture::RefreshHostFPS() {
 void ScreenCapture::SetCursorCapture(bool en) {
     std::lock_guard<std::recursive_mutex> lk(mtx);
     cursorCapture = en;
-    if (sess) try { sess.IsCursorCaptureEnabled(en); } catch (...) {}
+    if (sess) try { sess.IsCursorCaptureEnabled(en); } catch (...) { WARN("Capture: SetCursorCapture exception"); }
 }

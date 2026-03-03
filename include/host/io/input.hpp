@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "host/core/common.hpp"
 
 #pragma pack(push,1)
 struct MouseMoveMsg    { uint32_t magic; float x, y; };

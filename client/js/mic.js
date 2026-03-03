@@ -1,56 +1,31 @@
 
-import { C, S, MSG, mkBuf, log, safe, safeAsync, recordMicPacket, recordMicEncodeError } from './state.js';
+import { C, MSG } from './constants.js';
+import { S, mkBuf, log, safe, safeAsync, recordMicPacket, recordMicEncodeError } from './state.js';
+import { sendMicEnable } from './protocol.js';
 let micStream = null;
 let micContext = null;
 let micWorklet = null;
 let micEncoder = null;
-let dcMicRef = null;
-let micEnableCallback = null;
 let frameCounter = 0;
-
-export const setDcMic = dc => { dcMicRef = dc; };
-export const setMicEnableCallback = cb => { micEnableCallback = cb; };
-const MIC_WORKLET_CODE = `
-class MicProcessor extends AudioWorkletProcessor {
-    constructor() {
-        super();
-        this.bufferSize = 480;
-        this.buffer = new Float32Array(this.bufferSize);
-        this.bufferIndex = 0;
-    }
-    process(inputs) {
-        const samples = inputs[0]?.[0];
-        if (!samples) return true;
-        for (let i = 0; i < samples.length; i++) {
-            this.buffer[this.bufferIndex++] = samples[i];
-            if (this.bufferIndex >= this.bufferSize) {
-                this.port.postMessage({ type: 'samples', data: this.buffer.slice() });
-                this.bufferIndex = 0;
-            }
-        }
-        return true;
-    }
-}
-registerProcessor('mic-processor', MicProcessor);
-`;
+const MIC_WORKLET_URL = new URL('./mic-worklet.js', import.meta.url).href;
 const sendMicPacket = (opusData, timestamp, samples) => {
-    if (!dcMicRef || dcMicRef.readyState !== 'open') {
+    if (!S.dcMic || S.dcMic.readyState !== 'open') {
         log.debug('MIC', 'Channel not open, packet dropped');
         return false;
     }
 
     return safe(() => {
-        const packet = new ArrayBuffer(C.MIC_HEADER + opusData.byteLength);
+        const payload = opusData instanceof Uint8Array ? opusData : new Uint8Array(opusData);
+        const packet = new ArrayBuffer(C.MIC_HEADER + payload.byteLength);
         const view = new DataView(packet);
 
         view.setUint32(0, MSG.MIC_DATA, true);
         view.setBigUint64(4, BigInt(timestamp), true);
         view.setUint16(12, samples, true);
-        view.setUint16(14, opusData.byteLength, true);
+        view.setUint16(14, payload.byteLength, true);
+        new Uint8Array(packet, C.MIC_HEADER).set(payload);
 
-        new Uint8Array(packet, C.MIC_HEADER).set(new Uint8Array(opusData));
-
-        dcMicRef.send(packet);
+        S.dcMic.send(packet);
         recordMicPacket(packet.byteLength);
         return true;
     }, false, 'MIC');
@@ -149,14 +124,8 @@ export const startMic = async () => {
             sampleRate: C.MIC_RATE,
             latencyHint: 'interactive'
         });
-        const blob = new Blob([MIC_WORKLET_CODE], { type: 'application/javascript' });
-        const url = URL.createObjectURL(blob);
-        try {
-            await micContext.audioWorklet.addModule(url);
-            log.debug('MIC', 'Worklet loaded');
-        } finally {
-            URL.revokeObjectURL(url);
-        }
+        await micContext.audioWorklet.addModule(MIC_WORKLET_URL);
+        log.debug('MIC', 'Worklet loaded');
         micWorklet = new AudioWorkletNode(micContext, 'mic-processor', {
             numberOfInputs: 1,
             numberOfOutputs: 0,
@@ -165,7 +134,7 @@ export const startMic = async () => {
 
         micWorklet.port.onmessage = e => {
             if (e.data.type === 'samples' && S.micEnabled) {
-                processSamples(e.data.data);
+                processSamples(new Float32Array(e.data.data));
             }
         };
         micEncoder = initEncoder();
@@ -179,7 +148,7 @@ export const startMic = async () => {
 
         S.micEnabled = 1;
         frameCounter = 0;
-        micEnableCallback?.(1);
+        sendMicEnable(1);
 
         log.info('MIC', 'Started', { sampleRate: C.MIC_RATE, channels: C.MIC_CH });
         return true;
@@ -219,7 +188,7 @@ export const stopMic = () => {
     }
 
     frameCounter = 0;
-    micEnableCallback?.(0);
+    sendMicEnable(0);
 
     log.info('MIC', 'Stopped');
 };
@@ -249,5 +218,3 @@ export const isMicSupported = () => {
 
     return supported;
 };
-
-export const closeMic = stopMic;

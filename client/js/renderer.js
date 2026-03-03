@@ -1,5 +1,6 @@
 
-import { C, S, CURSOR_TYPES, serverFrameAgeMs, recordRenderTime, logVideoDrop, log, safe } from './state.js';
+import { C, CURSOR_TYPES } from './constants.js';
+import { S, serverFrameAgeMs, recordRenderTime, logVideoDrop, log, safe } from './state.js';
 
 export const canvas = document.querySelector('#c');
 export let canvasW = 0, canvasH = 0;
@@ -169,7 +170,6 @@ const renderFrame = (frame, meta) => {
             logVideoDrop('GL texture upload error', { code: glError, w: vW, h: vH });
             S.stats.renderErrors++;
         } else {
-            gl.flush();
             success = true;
             hasValidTexture = true;
             lastViewport = { ...vp };
@@ -196,7 +196,7 @@ const renderFrame = (frame, meta) => {
     frame.close();
 };
 export const setCursorStyle = type => {
-    const cursor = (S.relativeMouseMode || S.pointerLocked) ? '' : (CURSOR_TYPES[type] || 'default');
+    const cursor = S.pointerLocked ? '' : (CURSOR_TYPES[type] || 'default');
     canvas.style.cursor = cursor;
     log.debug('RENDER', 'Cursor set', { type, cursor });
 };

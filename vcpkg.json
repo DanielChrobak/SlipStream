@@ -9,6 +9,7 @@
         "opus",
         "openssl",
         {"name": "ffmpeg", "features": ["nvcodec", "avcodec"]},
-        "jwt-cpp"
+        "jwt-cpp",
+        "speexdsp"
     ]
 }

@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "host/core/common.hpp"
 
 struct FrameData {
     ID3D11Texture2D* tex = nullptr;
@@ -33,22 +33,6 @@ public:
     void Reset();
 };
 
-class GPUSync {
-    ID3D11Device5* d5 = nullptr;
-    ID3D11DeviceContext4* c4 = nullptr;
-    ID3D11Fence* f = nullptr;
-    HANDLE evt = nullptr;
-    uint64_t val = 0;
-    bool use = false;
-
-public:
-    [[nodiscard]] bool Init(ID3D11Device* d, ID3D11DeviceContext* c);
-    ~GPUSync();
-    uint64_t Signal(bool& sync);
-    [[nodiscard]] bool Wait(uint64_t v, ID3D11DeviceContext* ctx, ID3D11Multithread* mt = nullptr, DWORD ms = 16);
-    [[nodiscard]] bool Complete(uint64_t v) const { return !use || !f || f->GetCompletedValue() >= v; }
-};
-
 class ScreenCapture {
     static constexpr int POOL = 6;
 
@@ -68,7 +52,7 @@ class ScreenCapture {
     std::atomic<int> targetFps{60}, monIdx{0};
     std::atomic<uint64_t> captureGen{0};
 
-    GPUSync sync;
+    D3D11FenceSync sync;
     FrameSlot* slot;
     std::atomic<bool> running{true}, capturing{false}, started{false};
     std::atomic<int> cbActive{0};

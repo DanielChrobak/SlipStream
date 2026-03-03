@@ -1,7 +1,7 @@
 #pragma once
-#include "common.hpp"
-#include "encoder.hpp"
-#include "input.hpp"
+#include "host/core/common.hpp"
+#include "host/media/encoder.hpp"
+#include "host/io/input.hpp"
 
 #pragma pack(push,1)
 struct PacketHeader {
@@ -38,9 +38,9 @@ struct WebRTCCallbacks {
 };
 
 class WebRTCServer {
-    std::shared_ptr<rtc::PeerConnection> pc;
-    std::shared_ptr<rtc::DataChannel> dcCtrl, dcVid, dcAud, dcIn, dcMic;
-    std::mutex chMtx;
+    std::shared_ptr<rtc::PeerConnection> peerConnection_;
+    std::shared_ptr<rtc::DataChannel> controlDataChannel_, videoDataChannel_, audioDataChannel_, inputDataChannel_, micDataChannel_;
+    std::mutex channelMutex_;
 
     std::atomic<bool> conn{false}, needsKey{true}, fpsRecv{false}, gathered{false}, hasDesc{false};
     std::atomic<int> chRdy{0}, overflow{0};
@@ -48,12 +48,12 @@ class WebRTCServer {
     std::atomic<uint32_t> frmId{0};
     std::atomic<CodecType> curCodec{CODEC_AV1};
 
-    std::string localDesc;
-    std::mutex descMtx, sendMtx;
-    std::condition_variable descCv;
-    rtc::Configuration cfg;
-    WebRTCCallbacks cb;
-    std::queue<std::vector<uint8_t>> vidQ, audQ;
+    std::string localDescription_;
+    std::mutex descriptionMutex_, sendMutex_;
+    std::condition_variable descriptionCv_;
+    rtc::Configuration rtcConfig_;
+    WebRTCCallbacks callbacks_;
+    std::queue<std::vector<uint8_t>> videoPacketQueue_, audioPacketQueue_;
 
     static constexpr size_t VID_BUF=262144, AUD_BUF=131072, CHUNK=1400;
     static constexpr size_t HDR_SZ=sizeof(PacketHeader), DATA_CHUNK=CHUNK-HDR_SZ, BUF_LOW=CHUNK*16;
@@ -94,6 +94,7 @@ public:
 
     [[nodiscard]] bool IsStreaming() const { return conn && fpsRecv && chRdy == NUM_CH; }
     [[nodiscard]] bool NeedsKey() { return needsKey.exchange(false); }
+    [[nodiscard]] bool IsCongested() const;
     [[nodiscard]] bool SendCursorShape(CursorType ct);
     [[nodiscard]] bool Send(const EncodedFrame& f);
     [[nodiscard]] bool SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples);

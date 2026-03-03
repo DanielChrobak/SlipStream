@@ -1,4 +1,4 @@
-#include "common.hpp"
+#include "host/core/common.hpp"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -26,15 +26,7 @@ void InitLogging() {
     if (g_loggingInit) return;
     g_loggingInit = true;
 
-    const char* appData = std::getenv("APPDATA");
-    std::filesystem::path dir = appData && *appData
-        ? std::filesystem::path(appData) / "SlipStream"
-        : std::filesystem::path(".") / "SlipStream";
-
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    std::string logPath = (dir / "slipstream.log").string();
-
+    std::string logPath = GetSlipStreamDataFilePath("slipstream.log");
     g_logFile = fopen(logPath.c_str(), "a");
     if (g_logFile) {
         setvbuf(g_logFile, nullptr, _IONBF, 0);
@@ -85,10 +77,10 @@ std::string GetSlipStreamDataFilePath(const char* fileName) {
 }
 
 std::string BytesToHex(const unsigned char* d, size_t n) {
-    std::ostringstream o;
-    for (size_t i = 0; i < n; i++)
-        o << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(d[i]);
-    return o.str();
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out(n * 2, '\0');
+    for (size_t i = 0; i < n; i++) { out[i*2] = hex[d[i]>>4]; out[i*2+1] = hex[d[i]&0xf]; }
+    return out;
 }
 
 std::string GenerateSalt(size_t n) {
@@ -101,12 +93,14 @@ std::string GenerateSalt(size_t n) {
 }
 
 std::string HashPassword(const std::string& pw, const std::string& salt) {
+    auto hexToByte = [](char c) -> unsigned char {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+        return 10 + c - 'A';
+    };
     std::vector<unsigned char> sb(salt.size() / 2);
-    for (size_t i = 0; i < sb.size(); i++) {
-        unsigned int b;
-        std::sscanf(salt.c_str() + i * 2, "%02x", &b);
-        sb[i] = static_cast<unsigned char>(b);
-    }
+    for (size_t i = 0; i < sb.size(); i++)
+        sb[i] = (hexToByte(salt[i*2]) << 4) | hexToByte(salt[i*2+1]);
     unsigned char h[32];
     if (PKCS5_PBKDF2_HMAC(pw.c_str(), static_cast<int>(pw.size()), sb.data(), static_cast<int>(sb.size()),
                           600000, EVP_sha256(), 32, h) != 1) {
@@ -152,8 +146,8 @@ std::string JWTAuth::CreateToken(const std::string& u) {
         return jwt::create()
             .set_issuer("slipstream")
             .set_subject(u)
-            .set_issued_at(system_clock::now())
-            .set_expires_at(system_clock::now() + hours(24))
+            .set_issued_at(std::chrono::system_clock::now())
+            .set_expires_at(std::chrono::system_clock::now() + std::chrono::hours(24))
             .sign(jwt::algorithm::hs256{sec});
     } catch (const std::exception& e) {
         ERR("Failed to create JWT token: %s", e.what());
@@ -178,21 +172,21 @@ bool RateLimiter::IsAllowed(const std::string& ip) {
     std::lock_guard<std::mutex> lk(mtx);
     auto it = lim.find(ip);
     if (it == lim.end()) return true;
-    auto now = steady_clock::now();
-    if (it->second.lockout > steady_clock::time_point{} && now < it->second.lockout) return false;
-    if (now - it->second.first > minutes(15)) { lim.erase(it); return true; }
+    auto now = std::chrono::steady_clock::now();
+    if (it->second.lockout > std::chrono::steady_clock::time_point{} && now < it->second.lockout) return false;
+    if (now - it->second.first > std::chrono::minutes(15)) { lim.erase(it); return true; }
     return it->second.att < MAX;
 }
 
 void RateLimiter::RecordAttempt(const std::string& ip, bool ok) {
     std::lock_guard<std::mutex> lk(mtx);
     if (ok) { lim.erase(ip); return; }
-    auto now = steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
     auto& r = lim[ip];
-    if (r.att == 0 || now - r.first > minutes(15)) {
+    if (r.att == 0 || now - r.first > std::chrono::minutes(15)) {
         r = {1, now, {}};
     } else if (++r.att >= MAX) {
-        r.lockout = now + minutes(30);
+        r.lockout = now + std::chrono::minutes(30);
         WARN("Rate limit: IP %s locked out for 30 minutes", ip.c_str());
     }
 }
@@ -206,15 +200,14 @@ int RateLimiter::RemainingAttempts(const std::string& ip) {
 int RateLimiter::LockoutSeconds(const std::string& ip) {
     std::lock_guard<std::mutex> lk(mtx);
     auto it = lim.find(ip);
-    if (it == lim.end() || it->second.lockout <= steady_clock::now()) return 0;
-    return static_cast<int>(duration_cast<seconds>(it->second.lockout - steady_clock::now()).count());
+    if (it == lim.end() || it->second.lockout <= std::chrono::steady_clock::now()) return 0;
+    return static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(it->second.lockout - std::chrono::steady_clock::now()).count());
 }
 
 std::string GetSSLCertFilePath() { return GetSlipStreamDataFilePath("server.crt"); }
 std::string GetSSLKeyFilePath() { return GetSlipStreamDataFilePath("server.key"); }
 
-namespace {
-std::vector<std::string> GetLocalIPs() {
+std::vector<std::string> GetLocalIPv4Addresses() {
     std::vector<std::string> ips;
     char hostname[256]{};
     if (gethostname(hostname, sizeof(hostname)) != 0) return ips;
@@ -238,77 +231,49 @@ std::vector<std::string> GetLocalIPs() {
     return ips;
 }
 
+namespace {
 std::string BuildCertSAN() {
     std::string san = "DNS:localhost,IP:127.0.0.1";
     char hostname[256]{};
     if (gethostname(hostname, sizeof(hostname)) == 0 && hostname[0] && _stricmp(hostname, "localhost") != 0)
         san += std::string(",DNS:") + hostname;
-    for (const auto& ip : GetLocalIPs()) san += ",IP:" + ip;
+    for (const auto& ip : GetLocalIPv4Addresses()) san += ",IP:" + ip;
     return san;
 }
 }
 
 bool EnsureSSLCert() {
-    auto certPath = GetSSLCertFilePath();
-    auto keyPath = GetSSLKeyFilePath();
-
-    std::ifstream c(certPath), k(keyPath);
-    if (c.good() && k.good()) {
-        LOG("Using existing SSL certificates");
-        return true;
-    }
-
+    auto certPath = GetSSLCertFilePath(), keyPath = GetSSLKeyFilePath();
+    if (std::ifstream c(certPath), k(keyPath); c.good() && k.good()) { LOG("Using existing SSL certificates"); return true; }
     LOG("Generating self-signed SSL certificate...");
 
-    EVP_PKEY* pkey = nullptr;
-    X509* x509 = nullptr;
+    EVP_PKEY* pkey = nullptr; X509* x509 = nullptr;
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-    bool ok = false;
-
     auto cleanup = [&] { if (x509) X509_free(x509); if (pkey) EVP_PKEY_free(pkey); if (ctx) EVP_PKEY_CTX_free(ctx); };
 
     if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0 || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0 ||
-        EVP_PKEY_keygen(ctx, &pkey) <= 0) {
-        ERR("Key generation failed");
-        cleanup();
-        return false;
-    }
+        EVP_PKEY_keygen(ctx, &pkey) <= 0) { ERR("Key generation failed"); cleanup(); return false; }
 
     x509 = X509_new();
     if (!x509 || X509_set_version(x509, 2) != 1) { cleanup(); return false; }
 
     unsigned char sb[16];
     if (RAND_bytes(sb, sizeof(sb)) == 1) {
-        if (BIGNUM* bn = BN_bin2bn(sb, sizeof(sb), nullptr)) {
-            ASN1_INTEGER* s = ASN1_INTEGER_new();
-            BN_to_ASN1_INTEGER(bn, s);
-            X509_set_serialNumber(x509, s);
-            ASN1_INTEGER_free(s);
-            BN_free(bn);
-        }
+        BIGNUM* bn = BN_bin2bn(sb, sizeof(sb), nullptr);
+        if (bn) { ASN1_INTEGER* s = ASN1_INTEGER_new(); BN_to_ASN1_INTEGER(bn, s); X509_set_serialNumber(x509, s); ASN1_INTEGER_free(s); BN_free(bn); }
     }
 
     X509_gmtime_adj(X509_getm_notBefore(x509), 0);
-    constexpr int CERT_VALIDITY_SECONDS = 3650 * 24 * 3600;
-    X509_gmtime_adj(X509_getm_notAfter(x509), CERT_VALIDITY_SECONDS);
+    X509_gmtime_adj(X509_getm_notAfter(x509), 3650 * 24 * 3600);
     X509_set_pubkey(x509, pkey);
 
     X509_NAME* n = X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(n, "C", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("US"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(n, "O", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("SlipStream"), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(n, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+    for (auto [f, v] : std::initializer_list<std::pair<const char*, const char*>>{{"C","US"},{"O","SlipStream"},{"CN","localhost"}})
+        X509_NAME_add_entry_by_txt(n, f, MBSTRING_ASC, reinterpret_cast<const unsigned char*>(v), -1, -1, 0);
     X509_set_issuer_name(x509, n);
 
-    X509V3_CTX v3;
-    X509V3_set_ctx_nodb(&v3);
-    X509V3_set_ctx(&v3, x509, x509, nullptr, nullptr, 0);
-
-    auto addExt = [&](int nid, const char* val) {
-        if (auto e = X509V3_EXT_conf_nid(nullptr, &v3, nid, val)) {
-            X509_add_ext(x509, e, -1);
-            X509_EXTENSION_free(e);
-        }
-    };
+    X509V3_CTX v3; X509V3_set_ctx_nodb(&v3); X509V3_set_ctx(&v3, x509, x509, nullptr, nullptr, 0);
+    auto addExt = [&](int nid, const char* val) { if (auto e = X509V3_EXT_conf_nid(nullptr, &v3, nid, val)) { X509_add_ext(x509, e, -1); X509_EXTENSION_free(e); } };
     addExt(NID_basic_constraints, "CA:FALSE");
     addExt(NID_key_usage, "digitalSignature,keyEncipherment");
     addExt(NID_ext_key_usage, "serverAuth");
@@ -316,16 +281,10 @@ bool EnsureSSLCert() {
 
     if (!X509_sign(x509, pkey, EVP_sha256())) { cleanup(); return false; }
 
-    BIO* kb = BIO_new_file(keyPath.c_str(), "wb");
-    BIO* cb = BIO_new_file(certPath.c_str(), "wb");
-    if (kb && cb) {
-        ok = PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr) &&
-             PEM_write_bio_X509(cb, x509);
-    }
-    if (kb) BIO_free(kb);
-    if (cb) BIO_free(cb);
+    BIO* kb = BIO_new_file(keyPath.c_str(), "wb"), *cb = BIO_new_file(certPath.c_str(), "wb");
+    bool ok = kb && cb && PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr) && PEM_write_bio_X509(cb, x509);
+    if (kb) BIO_free(kb); if (cb) BIO_free(cb);
     cleanup();
-
     if (ok) LOG("SSL certificate generated: %s, %s", certPath.c_str(), keyPath.c_str());
     return ok;
 }

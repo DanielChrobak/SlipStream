@@ -1,4 +1,6 @@
-#include "encoder.hpp"
+#include "host/media/encoder.hpp"
+
+using std::chrono::steady_clock;
 
 namespace {
     constexpr const char* ENC_NAMES[3][3] = {
@@ -127,39 +129,6 @@ bool VideoEncoder::InitHwCtx() {
     return true;
 }
 
-void VideoEncoder::InitSync() {
-    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&d5)))) return;
-    if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&c4)))) { SafeRelease(d5); return; }
-    if (FAILED(d5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
-        SafeRelease(d5, c4);
-        return;
-    }
-    fEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!fEvt) { SafeRelease(fence, c4, d5); return; }
-    useFence = true;
-    DBG("VideoEncoder: Using D3D11 fence-based GPU sync");
-}
-
-uint64_t VideoEncoder::Signal() {
-    if (useFence && c4 && fence && SUCCEEDED(c4->Signal(fence, ++fVal))) {
-        lastSig = fVal;
-        return fVal;
-    }
-    return 0;
-}
-
-bool VideoEncoder::WaitGPU(uint64_t v, DWORD ms) {
-    if (useFence && fence) {
-        if (fence->GetCompletedValue() >= v) return true;
-        if (FAILED(fence->SetEventOnCompletion(v, fEvt))) return false;
-        DWORD result = WaitForSingleObject(fEvt, ms);
-        return result == WAIT_OBJECT_0 || fence->GetCompletedValue() >= v;
-    }
-    MTLock lk(mt);
-    ctx->Flush();
-    return true;
-}
-
 void VideoEncoder::Configure() {
     auto set = [this](const char* k, const char* v) {
         if (av_opt_set(cctx->priv_data, k, v, 0) < 0)
@@ -242,10 +211,25 @@ bool VideoEncoder::TryInit(GPUVendor v, CodecType cc) {
 
 bool VideoEncoder::DrainPackets(bool& gotKey) {
     int ret;
+    int packetCount = 0;
     while ((ret = avcodec_receive_packet(cctx, pkt)) == 0) {
+        packetCount++;
         if (pkt->flags & AV_PKT_FLAG_KEY) gotKey = true;
+        if (!pkt->data || pkt->size <= 0) {
+            ERR("VideoEncoder: DrainPackets got empty/null packet (pkt #%d, size=%d)", packetCount, pkt->size);
+            av_packet_unref(pkt);
+            continue;
+        }
+        DBG("VideoEncoder: DrainPackets pkt #%d size=%d key=%d pts=%lld dts=%lld",
+            packetCount, pkt->size, (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0, pkt->pts, pkt->dts);
         out.data.insert(out.data.end(), pkt->data, pkt->data + pkt->size);
         av_packet_unref(pkt);
+    }
+    if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+        ERR("VideoEncoder: DrainPackets unexpected error: %s (after %d packets)", AvErr(ret), packetCount);
+    }
+    if (packetCount == 0) {
+        DBG("VideoEncoder: DrainPackets produced no packets (ret=%s)", AvErr(ret));
     }
     return !out.data.empty();
 }
@@ -260,7 +244,7 @@ VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
     if (mt) mt->AddRef();
 
     lastKey = steady_clock::now() - KEY_INT;
-    InitSync();
+    sync.Init(dev, ctx);
 
     for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
         if (TryInit(v, cc)) break;
@@ -288,8 +272,7 @@ VideoEncoder::~VideoEncoder() {
     av_buffer_unref(&hwFrCtx);
     av_buffer_unref(&hwDev);
     if (cctx) avcodec_free_context(&cctx);
-    if (fEvt) CloseHandle(fEvt);
-    SafeRelease(fence, c4, d5, mt, ctx, dev);
+    SafeRelease(mt, ctx, dev);
 }
 
 bool VideoEncoder::UpdateFPS(int fps) {
@@ -308,12 +291,22 @@ bool VideoEncoder::UpdateFPS(int fps) {
 }
 
 void VideoEncoder::Flush() {
-    DBG("VideoEncoder: Flushing");
-    avcodec_send_frame(cctx, nullptr);
+    LOG("VideoEncoder: Flushing encoder (frame=%d, total=%llu, failed=%llu)",
+        frameNum, totalFrames.load(), failedFrames.load());
+    int flushRet = avcodec_send_frame(cctx, nullptr);
+    if (flushRet < 0 && flushRet != AVERROR_EOF) {
+        WARN("VideoEncoder: Flush send_frame error: %s", AvErr(flushRet));
+    }
     int ret;
-    while ((ret = avcodec_receive_packet(cctx, pkt)) == 0) av_packet_unref(pkt);
+    int flushedPackets = 0;
+    while ((ret = avcodec_receive_packet(cctx, pkt)) == 0) {
+        flushedPackets++;
+        av_packet_unref(pkt);
+    }
+    DBG("VideoEncoder: Flush drained %d packets", flushedPackets);
     avcodec_flush_buffers(cctx);
     lastKey = steady_clock::now() - KEY_INT;
+    LOG("VideoEncoder: Flush complete");
 }
 
 EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceKey) {
@@ -334,8 +327,11 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
     const char* keyReason = nullptr;
     if (needKey) keyReason = forceKey ? "client-requested" : "first-frame";
 
-    if (av_hwframe_get_buffer(cctx->hw_frames_ctx, hwFr, 0) < 0) {
-        ERR("VideoEncoder: av_hwframe_get_buffer failed");
+    DBG("VideoEncoder: Encode start frame=%d ts=%lld forceKey=%d needKey=%d", frameNum, ts, forceKey ? 1 : 0, needKey ? 1 : 0);
+
+    int hwBufRet = av_hwframe_get_buffer(cctx->hw_frames_ctx, hwFr, 0);
+    if (hwBufRet < 0) {
+        ERR("VideoEncoder: av_hwframe_get_buffer failed: %s (frame=%d)", AvErr(hwBufRet), frameNum);
         failedFrames++;
         return nullptr;
     }
@@ -345,11 +341,11 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
         MTLock lk(mt);
         ctx->CopySubresourceRegion(reinterpret_cast<ID3D11Texture2D*>(hwFr->data[0]),
             static_cast<UINT>(reinterpret_cast<intptr_t>(hwFr->data[1])), 0, 0, 0, tex, 0, nullptr);
-        ctx->Flush();
-        sig = Signal();
+        sig = sync.Signal();
     }
 
-    if (!WaitGPU(sig, 16)) {
+    if (!sync.Wait(sig, ctx, mt, 16)) {
+        WARN("VideoEncoder: GPU sync timeout (frame=%d, sig=%llu, ts=%lld) - frame dropped", frameNum, sig, ts);
         av_frame_unref(hwFr);
         failedFrames++;
         return nullptr;
@@ -382,7 +378,11 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
     DrainPackets(gotKey);
     av_frame_unref(hwFr);
 
-    if (out.data.empty()) return nullptr;
+    if (out.data.empty()) {
+        WARN("VideoEncoder: Encode produced empty output (frame=%d, ts=%lld, needKey=%d) - frame dropped", frameNum - 1, ts, needKey ? 1 : 0);
+        failedFrames++;
+        return nullptr;
+    }
 
     QueryPerformanceCounter(&t1);
     static const int64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
@@ -391,5 +391,38 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
     out.encUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / freq;
     out.isKey = gotKey;
     totalFrames++;
+
+    if (needKey && !gotKey) {
+        WARN("VideoEncoder: Requested keyframe but encoder did not produce one (frame=%d, ts=%lld, size=%zu)",
+            frameNum - 1, ts, out.data.size());
+    }
+
+    // Stream corruption check: verify frame starts with valid NAL/OBU header
+    if (out.data.size() >= 4) {
+        const uint8_t* d = out.data.data();
+        bool validStart = false;
+        if (codec == CODEC_H264 || codec == CODEC_H265) {
+            // Check for Annex B start code (0x00000001 or 0x000001)
+            validStart = (d[0] == 0x00 && d[1] == 0x00 && d[2] == 0x00 && d[3] == 0x01) ||
+                         (d[0] == 0x00 && d[1] == 0x00 && d[2] == 0x01);
+        } else if (codec == CODEC_AV1) {
+            // AV1 OBU: check OBU type (top 4 bits of first byte should be 1-8 for valid types)
+            uint8_t obuType = (d[0] >> 3) & 0x0F;
+            validStart = (obuType >= 1 && obuType <= 8);
+        }
+        if (!validStart) {
+            ERR("VideoEncoder: STREAM CORRUPTION - invalid bitstream header [%02X %02X %02X %02X] "
+                "(frame=%d, key=%d, size=%zu, codec=%s)",
+                d[0], d[1], d[2], d[3], frameNum - 1, gotKey ? 1 : 0, out.data.size(), CodecName(codec));
+        }
+    } else if (out.data.size() > 0) {
+        WARN("VideoEncoder: Suspiciously small encoded frame: %zu bytes (frame=%d, key=%d)",
+            out.data.size(), frameNum - 1, gotKey ? 1 : 0);
+    }
+
+    DBG("VideoEncoder: Encoded frame=%d ts=%lld key=%d size=%zu encUs=%lld total=%llu failed=%llu",
+        frameNum - 1, ts, gotKey ? 1 : 0, out.data.size(), out.encUs,
+        totalFrames.load(), failedFrames.load());
+
     return &out;
 }

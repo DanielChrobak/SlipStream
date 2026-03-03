@@ -1,22 +1,22 @@
 
-import { MSG, S, mkBuf, log, safe } from './state.js';
+import { MSG } from './constants.js';
+import { S, mkBuf, log, safe } from './state.js';
 import { canvas, canvasW, canvasH, calcVp, resetCursorStyle } from './renderer.js';
+import { requestClipboard, pushClipboardToHost, sendCursorCapture } from './protocol.js';
 const BUTTON_MAP = { 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 };
 const mAbsBuf = new ArrayBuffer(12), mAbsView = new DataView(mAbsBuf);
 const mRelBuf = new ArrayBuffer(8), mRelView = new DataView(mRelBuf);
 mAbsView.setUint32(0, MSG.MOUSE_MOVE, 1);
 mRelView.setUint32(0, MSG.MOUSE_MOVE_REL, 1);
+const ESC_HOLD_TO_EXIT_MS = 450;
 let pendingAbs = null;
 let pendingRel = { dx: 0, dy: 0 };
 let rafId = null;
-let clipboardRequestFn = null;
-let clipboardPushFn = null;
-let cursorCaptureFn = null;
 let pendingClipboardPaste = null;
-
-export const setClipboardRequestFn = fn => { clipboardRequestFn = fn; };
-export const setClipboardPushFn = fn => { clipboardPushFn = fn; };
-export const setCursorCaptureFn = fn => { cursorCaptureFn = fn; };
+let escapeDown = false;
+let escapeDownAt = 0;
+let pendingEscapeUnlock = false;
+const pressedKeys = new Map();
 const CODE_MAP = {
     Backspace:8, Tab:9, Enter:13, ShiftLeft:16, ShiftRight:16,
     ControlLeft:17, ControlRight:17, AltLeft:18, AltRight:18,
@@ -131,6 +131,10 @@ const queueRelMove = (dx, dy) => {
     pendingRel.dy = Math.max(-32768, Math.min(32767, pendingRel.dy + dy));
     scheduleFlush();
 };
+const isInVideoViewport = (clientX, clientY) => {
+    if (S.W <= 0 || S.H <= 0 || !canvas) return true;
+    return toNormalized(clientX, clientY) !== null;
+};
 const toNormalized = (clientX, clientY) => {
     if (S.W <= 0 || S.H <= 0 || !canvas) return null;
 
@@ -148,20 +152,84 @@ const toNormalized = (clientX, clientY) => {
     };
 };
 const getModifiers = e => (e.ctrlKey ? 1 : 0) | (e.altKey ? 2 : 0) | (e.shiftKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+const isSystemKey = code => code === 'MetaLeft' || code === 'MetaRight' || code === 'ContextMenu';
 const isInputFocused = () => {
     const el = document.activeElement;
     return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
 };
+const releasePressedKeys = reason => {
+    if (!pressedKeys.size) return;
+
+    for (const vk of pressedKeys.values()) {
+        sendNow('key', vk, 0, 0, 0);
+    }
+    const count = pressedKeys.size;
+    pressedKeys.clear();
+    log.warn('INPUT', 'Released pressed keys', { reason, count });
+};
+const dispatchPointerLockState = relativeMouseDisabled => {
+    window.dispatchEvent(new CustomEvent('pointerlockchange', {
+        detail: { locked: S.pointerLocked, relativeMouseDisabled }
+    }));
+};
+
+const onEscapeReleased = () => {
+    if (!pendingEscapeUnlock) return;
+
+    pendingEscapeUnlock = false;
+    const heldMs = escapeDownAt ? performance.now() - escapeDownAt : 0;
+    const heldToExit = heldMs >= ESC_HOLD_TO_EXIT_MS;
+
+    if (heldToExit) {
+        S.relativeMouseMode = 0;
+        log.info('INPUT', 'Escape hold exited relative mouse mode', { heldMs: Math.round(heldMs) });
+        dispatchPointerLockState(true);
+        return;
+    }
+
+    log.debug('INPUT', 'Escape tap released pointer lock; relative mouse remains enabled', { heldMs: Math.round(heldMs) });
+    dispatchPointerLockState(false);
+};
+
 const handleKey = (e, down) => {
     if (!S.controlEnabled || isInputFocused()) return;
-    if (!e.metaKey) e.preventDefault();
+    e.preventDefault();
+
+    if (down && e.repeat) return;
+
+    if (e.code === 'Escape') {
+        if (down) {
+            escapeDown = true;
+            escapeDownAt = performance.now();
+        } else {
+            escapeDown = false;
+            onEscapeReleased();
+            escapeDownAt = 0;
+        }
+    }
 
     const mods = getModifiers(e);
-    const vk = codeToVK(e.code);
+    let vk = codeToVK(e.code);
 
     if (!vk) {
         log.debug('INPUT', 'Unknown key code', { code: e.code });
         return;
+    }
+
+    if (isSystemKey(e.code) && !S.keyboardLockActive) {
+        if (!down && pressedKeys.has(e.code)) {
+            sendNow('key', pressedKeys.get(e.code), 0, 0, 0);
+            pressedKeys.delete(e.code);
+        }
+        log.debug('INPUT', 'Ignoring system key without keyboard lock', { code: e.code });
+        return;
+    }
+
+    if (down) {
+        pressedKeys.set(e.code, vk);
+    } else if (pressedKeys.has(e.code)) {
+        vk = pressedKeys.get(e.code);
+        pressedKeys.delete(e.code);
     }
 
     if (!down && e.code === 'KeyV' && pendingClipboardPaste) {
@@ -171,17 +239,20 @@ const handleKey = (e, down) => {
 
     if (down && e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
         if (e.code === 'KeyV') {
-            if (S.clipboardSyncEnabled && clipboardPushFn && !pendingClipboardPaste) {
+            if (S.clipboardSyncEnabled && !pendingClipboardPaste) {
                 pendingClipboardPaste = { keyUpQueued: false };
 
                 void (async () => {
                     try {
-                        await clipboardPushFn();
+                        await pushClipboardToHost();
                     } catch (err) {
                         log.debug('INPUT', 'Clipboard push failed before paste', { error: err?.message });
                     } finally {
                         sendNow('key', vk, 0, 1, mods);
-                        if (pendingClipboardPaste?.keyUpQueued) sendNow('key', vk, 0, 0, mods);
+                        if (pendingClipboardPaste?.keyUpQueued) {
+                            sendNow('key', vk, 0, 0, mods);
+                            pressedKeys.delete(e.code);
+                        }
                         pendingClipboardPaste = null;
                         log.debug('INPUT', 'Clipboard paste shortcut handled');
                     }
@@ -195,8 +266,8 @@ const handleKey = (e, down) => {
 
         if (e.code === 'KeyC') {
             sendNow('key', vk, 0, 1, mods);
-            if (S.clipboardSyncEnabled && clipboardRequestFn) {
-                setTimeout(clipboardRequestFn, 150);
+            if (S.clipboardSyncEnabled) {
+                setTimeout(requestClipboard, 150);
                 log.debug('INPUT', 'Clipboard shortcut', { action: 'copy' });
             }
             return;
@@ -214,13 +285,33 @@ const exitPointerLock = () => {
 };
 document.addEventListener('pointerlockchange', () => {
     S.pointerLocked = isPointerLocked();
-    if (!S.pointerLocked) S.relativeMouseMode = 0;
 
+    if (S.pointerLocked) {
+        pendingEscapeUnlock = false;
+        log.info('INPUT', 'Pointer lock changed', { locked: S.pointerLocked });
+        dispatchPointerLockState(false);
+        return;
+    }
+
+    if (S.relativeMouseMode && escapeDown) {
+        pendingEscapeUnlock = true;
+        log.debug('INPUT', 'Pointer lock lost while Escape held; waiting for release decision');
+        dispatchPointerLockState(false);
+        return;
+    }
+    releasePressedKeys('pointer-lock-lost');
     log.info('INPUT', 'Pointer lock changed', { locked: S.pointerLocked });
+    dispatchPointerLockState(false);
+});
 
-    window.dispatchEvent(new CustomEvent('pointerlockchange', {
-        detail: { locked: S.pointerLocked, relativeMouseDisabled: !S.pointerLocked }
-    }));
+window.addEventListener('blur', () => {
+    releasePressedKeys('window-blur');
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') {
+        releasePressedKeys('visibility-hidden');
+    }
 });
 const handlers = {
     move: e => {
@@ -238,9 +329,16 @@ const handlers = {
 
     down: e => {
         if (!S.controlEnabled) return;
+
+        const inVideoViewport = isInVideoViewport(e.clientX, e.clientY);
+        if (!S.pointerLocked && !inVideoViewport) {
+            return;
+        }
+
         e.preventDefault();
         if (rafId !== null) { cancelAnimationFrame(rafId); flush(); }
         if (S.relativeMouseMode && !S.pointerLocked) {
+            if (!inVideoViewport) return;
             safe(() => canvas.requestPointerLock?.(), undefined, 'INPUT');
         }
 
@@ -249,6 +347,12 @@ const handlers = {
 
     up: e => {
         if (!S.controlEnabled) return;
+
+        const inVideoViewport = isInVideoViewport(e.clientX, e.clientY);
+        if (!S.pointerLocked && !inVideoViewport) {
+            return;
+        }
+
         e.preventDefault();
 
         if (rafId !== null) { cancelAnimationFrame(rafId); flush(); }
@@ -285,15 +389,20 @@ const toggleControl = enable => {
     log.info('INPUT', enable ? 'Control enabled' : 'Control disabled');
 
     if (!enable) {
+        releasePressedKeys('control-disabled');
         if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
         pendingAbs = null;
         pendingRel.dx = pendingRel.dy = 0;
+        escapeDown = false;
+        escapeDownAt = 0;
+        pendingEscapeUnlock = false;
+        pendingClipboardPaste = null;
         if (S.pointerLocked) exitPointerLock();
     }
 };
 export const setRelativeMouseMode = enable => {
     S.relativeMouseMode = enable;
-    cursorCaptureFn?.(enable);
+    sendCursorCapture(enable);
 
     if (enable) {
         resetCursorStyle();

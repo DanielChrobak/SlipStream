@@ -1,6 +1,10 @@
-#include "input.hpp"
+#include "host/io/input.hpp"
 #include <array>
 #include <cstring>
+
+using std::chrono::duration_cast;
+using std::chrono::milliseconds;
+using std::chrono::steady_clock;
 
 namespace {
     const std::unordered_map<uint16_t, WORD> JS_VK_MAP = {
@@ -43,6 +47,12 @@ namespace {
                vk == VK_UP || vk == VK_DOWN || vk == VK_LWIN || vk == VK_RWIN ||
                vk == VK_APPS || vk == VK_DIVIDE || vk == VK_NUMLOCK;
     }
+
+    bool SendMouse(DWORD flags, LONG dx = 0, LONG dy = 0, DWORD data = 0) {
+        INPUT in{INPUT_MOUSE};
+        in.mi = {dx, dy, data, flags, 0, 0};
+        return SendInput(1, &in, sizeof(INPUT)) != 0;
+    }
 }
 
 WORD JsKeyToVK(uint16_t k) {
@@ -71,7 +81,7 @@ void InputHandler::ToAbsolute(float nx, float ny, LONG& ax, LONG& ay) {
 bool InputHandler::IsBlocked(WORD vk, bool down) {
     if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) ctrlDown = down;
     if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) altDown = down;
-    bool blocked = (vk == VK_LWIN || vk == VK_RWIN || (ctrlDown && altDown && vk == VK_DELETE));
+    bool blocked = (ctrlDown && altDown && vk == VK_DELETE);
     if (blocked && down) blockedKeys++;
     return blocked;
 }
@@ -102,30 +112,19 @@ bool InputHandler::GetCurrentCursor(CursorType& out) {
 
 void InputHandler::WiggleCenter() {
     if (!enabled) return;
-    LONG ax, ay;
-    ToAbsolute(0.5f, 0.5f, ax, ay);
-    INPUT in{INPUT_MOUSE};
-    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-    in.mi.dx = ax; in.mi.dy = ay;
-    SendInput(1, &in, sizeof(INPUT));
+    LONG ax, ay; ToAbsolute(0.5f, 0.5f, ax, ay);
+    SendMouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, ax, ay);
 }
 
 void InputHandler::MouseMove(float nx, float ny) {
     if (!enabled || !CheckLimit(moveCnt, MAX_MV, droppedMoves)) return;
-    LONG ax, ay;
-    ToAbsolute(nx, ny, ax, ay);
-    INPUT in{INPUT_MOUSE};
-    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-    in.mi.dx = ax; in.mi.dy = ay;
-    if (SendInput(1, &in, sizeof(INPUT))) totalMoves++;
+    LONG ax, ay; ToAbsolute(nx, ny, ax, ay);
+    if (SendMouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, ax, ay)) totalMoves++;
 }
 
 void InputHandler::MouseMoveRel(int16_t dx, int16_t dy) {
     if (!enabled || !CheckLimit(moveCnt, MAX_MV, droppedMoves) || (dx == 0 && dy == 0)) return;
-    INPUT in{INPUT_MOUSE};
-    in.mi.dwFlags = MOUSEEVENTF_MOVE;
-    in.mi.dx = dx; in.mi.dy = dy;
-    if (SendInput(1, &in, sizeof(INPUT))) totalMoves++;
+    if (SendMouse(MOUSEEVENTF_MOVE, dx, dy)) totalMoves++;
 }
 
 void InputHandler::MouseButton(uint8_t btn, bool down) {
@@ -135,24 +134,20 @@ void InputHandler::MouseButton(uint8_t btn, bool down) {
         {MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MIDDLEDOWN}, {MOUSEEVENTF_XUP, MOUSEEVENTF_XDOWN},
         {MOUSEEVENTF_XUP, MOUSEEVENTF_XDOWN}
     };
-    INPUT in{INPUT_MOUSE};
-    in.mi.dwFlags = flags[btn][down ? 1 : 0];
-    if (btn >= 3) in.mi.mouseData = btn == 3 ? XBUTTON1 : XBUTTON2;
-    if (SendInput(1, &in, sizeof(INPUT))) totalClicks++;
+    DWORD data = btn >= 3 ? (btn == 3 ? XBUTTON1 : XBUTTON2) : 0;
+    if (SendMouse(flags[btn][down ? 1 : 0], 0, 0, data)) totalClicks++;
 }
 
 void InputHandler::MouseWheel(int16_t dx, int16_t dy) {
     if (!enabled || !CheckLimit(clickCnt, MAX_CL, droppedClicks)) return;
-    INPUT in{INPUT_MOUSE};
-    if (dy) { in.mi.dwFlags = MOUSEEVENTF_WHEEL; in.mi.mouseData = static_cast<DWORD>(-dy * WHEEL_DELTA / 100); SendInput(1, &in, sizeof(INPUT)); }
-    if (dx) { in.mi.dwFlags = MOUSEEVENTF_HWHEEL; in.mi.mouseData = static_cast<DWORD>(dx * WHEEL_DELTA / 100); SendInput(1, &in, sizeof(INPUT)); }
+    if (dy) SendMouse(MOUSEEVENTF_WHEEL, 0, 0, static_cast<DWORD>(-dy * WHEEL_DELTA / 100));
+    if (dx) SendMouse(MOUSEEVENTF_HWHEEL, 0, 0, static_cast<DWORD>(dx * WHEEL_DELTA / 100));
 }
 
 void InputHandler::Key(uint16_t jsKey, uint16_t scan, bool down) {
     if (!enabled || !CheckLimit(keyCnt, MAX_KY, droppedKeys)) return;
     WORD vk = JsKeyToVK(jsKey);
-    if (!vk) return;
-    if (IsBlocked(vk, down)) return;
+    if (!vk || IsBlocked(vk, down)) return;
     INPUT in{INPUT_KEYBOARD};
     in.ki.wVk = vk;
     in.ki.wScan = scan ? scan : static_cast<WORD>(MapVirtualKey(vk, MAPVK_VK_TO_VSC));
@@ -164,24 +159,15 @@ bool InputHandler::HandleMessage(const uint8_t* data, size_t len) {
     if (len < 4) return false;
     uint32_t magic = 0;
     if (!ReadPod(data, len, magic)) return false;
-
+    #define DISPATCH(msg, type, ...) case msg: if (type m{}; ReadPod(data, len, m)) { __VA_ARGS__; return true; } break
     switch (magic) {
-        case MSG_MOUSE_MOVE:
-            if (MouseMoveMsg m{}; ReadPod(data, len, m)) { MouseMove(m.x, m.y); return true; }
-            break;
-        case MSG_MOUSE_MOVE_REL:
-            if (MouseMoveRelMsg m{}; ReadPod(data, len, m)) { MouseMoveRel(m.dx, m.dy); return true; }
-            break;
-        case MSG_MOUSE_BTN:
-            if (MouseBtnMsg m{}; ReadPod(data, len, m)) { MouseButton(m.button, m.action != 0); return true; }
-            break;
-        case MSG_MOUSE_WHEEL:
-            if (MouseWheelMsg m{}; ReadPod(data, len, m)) { MouseWheel(m.deltaX, m.deltaY); return true; }
-            break;
-        case MSG_KEY:
-            if (KeyMsg m{}; ReadPod(data, len, m)) { Key(m.keyCode, m.scanCode, m.action != 0); return true; }
-            break;
+        DISPATCH(MSG_MOUSE_MOVE,     MouseMoveMsg,    MouseMove(m.x, m.y));
+        DISPATCH(MSG_MOUSE_MOVE_REL, MouseMoveRelMsg, MouseMoveRel(m.dx, m.dy));
+        DISPATCH(MSG_MOUSE_BTN,      MouseBtnMsg,     MouseButton(m.button, m.action != 0));
+        DISPATCH(MSG_MOUSE_WHEEL,    MouseWheelMsg,   MouseWheel(m.deltaX, m.deltaY));
+        DISPATCH(MSG_KEY,            KeyMsg,           Key(m.keyCode, m.scanCode, m.action != 0));
     }
+    #undef DISPATCH
     return false;
 }
 

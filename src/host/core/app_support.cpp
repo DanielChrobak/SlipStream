@@ -1,24 +1,27 @@
-#include "app_support.hpp"
-#include "tray.hpp"
+#include "host/core/app_support.hpp"
+#include "host/io/tray.hpp"
 #include <conio.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-std::atomic<bool> g_running{true};
-std::atomic<bool> g_exitRequested{false};
-Config g_config;
-JWTAuth g_jwt;
-RateLimiter g_rateLimiter;
+namespace {
+AppContext g_appContext;
+}
+
+AppContext& GetAppContext() {
+    return g_appContext;
+}
 
 BOOL WINAPI ConsoleHandler(DWORD sig) {
-    if (sig == CTRL_CLOSE_EVENT && !g_exitRequested.load(std::memory_order_acquire)) {
+    auto& app = GetAppContext();
+    if (sig == CTRL_CLOSE_EVENT && !app.exitRequested.load(std::memory_order_acquire)) {
         HideAppToTray();
         return TRUE;
     }
     if (sig == CTRL_C_EVENT || sig == CTRL_BREAK_EVENT || sig == CTRL_CLOSE_EVENT ||
         sig == CTRL_LOGOFF_EVENT || sig == CTRL_SHUTDOWN_EVENT) {
         printf("\n[Shutting down...]\n");
-        g_running = false;
+        app.running = false;
         return TRUE;
     }
     return FALSE;
@@ -67,18 +70,24 @@ bool LoadConfig() {
         json c = json::parse(f);
         if (!c.contains("username") || !c.contains("passwordHash") || !c.contains("salt")) return false;
 
-        g_config = {c["username"], c["passwordHash"], c["salt"]};
-        return g_config.username.size() >= 3 && g_config.passwordHash.size() == 64 && g_config.salt.size() == 32;
+        auto& config = GetAppContext().config;
+        config = {c["username"], c["passwordHash"], c["salt"]};
+        return config.username.size() >= 3 && config.passwordHash.size() == 64 && config.salt.size() == 32;
+    } catch (const std::exception& e) {
+        ERR("LoadConfig failed: %s", e.what());
+        return false;
     } catch (...) {
+        ERR("LoadConfig failed: unknown exception");
         return false;
     }
 }
 
 bool SaveConfig() {
+    const auto& config = GetAppContext().config;
     auto authPath = GetSlipStreamDataFilePath("auth.json");
     std::ofstream f(authPath);
     if (!f) return false;
-    f << json{{"username", g_config.username}, {"passwordHash", g_config.passwordHash}, {"salt", g_config.salt}}.dump(2);
+    f << json{{"username", config.username}, {"passwordHash", config.passwordHash}, {"salt", config.salt}}.dump(2);
     return f.good();
 }
 
@@ -170,7 +179,7 @@ std::function<void(const httplib::Request&, httplib::Response&)> AuthRequired(
     std::function<void(const httplib::Request&, httplib::Response&, const std::string&)> h) {
     return [h](const httplib::Request& req, httplib::Response& res) {
         std::string token = ExtractSessionCookie(req), user;
-        if (token.empty() || !g_jwt.ValidateToken(token, user)) {
+        if (token.empty() || !GetAppContext().jwt.ValidateToken(token, user)) {
             JsonError(res, 401, token.empty() ? "Authentication required" : "Invalid token");
             return;
         }
@@ -217,47 +226,36 @@ void RefreshMonitorList() {
 }
 
 std::string LoadFile(const char* path) {
+    static const std::filesystem::path baseDir = [] {
+        char mp[MAX_PATH] = {};
+        if (GetModuleFileNameA(nullptr, mp, MAX_PATH) <= 0) return std::filesystem::path(".");
+        auto exe = std::filesystem::path(mp).parent_path();
+        for (auto d : {exe, exe / "client", exe.parent_path() / "client",
+                       exe.parent_path().parent_path() / "client",
+                       exe.parent_path().parent_path().parent_path() / "client"})
+            if (std::filesystem::exists(d / "index.html")) return d;
+        return exe;
+    }();
     auto readText = [](const std::filesystem::path& p) -> std::string {
         std::ifstream f(p, std::ios::binary);
         return f ? std::string(std::istreambuf_iterator<char>(f), {}) : "";
     };
-
-    std::filesystem::path requested(path);
-
-    if (auto direct = readText(requested); !direct.empty()) return direct;
-
-    char modulePath[MAX_PATH] = {};
-    if (GetModuleFileNameA(nullptr, modulePath, MAX_PATH) > 0) {
-        std::filesystem::path exeDir = std::filesystem::path(modulePath).parent_path();
-        std::vector<std::filesystem::path> candidates = {
-            exeDir / requested,
-            exeDir / "client" / requested,
-            exeDir.parent_path() / requested,
-            exeDir.parent_path() / "client" / requested,
-            exeDir.parent_path().parent_path() / requested,
-            exeDir.parent_path().parent_path() / "client" / requested,
-            exeDir.parent_path().parent_path().parent_path() / "client" / requested
-        };
-
-        for (const auto& candidate : candidates) {
-            if (auto content = readText(candidate); !content.empty()) return content;
-        }
-    }
-
-    return "";
+    if (auto r = readText(baseDir / path); !r.empty()) return r;
+    return readText(path);
 }
 
 void SetupConfig() {
+    auto& config = GetAppContext().config;
     if (LoadConfig()) {
-        printf("Loaded config (user: %s)\n", g_config.username.c_str());
+        printf("Loaded config (user: %s)\n", config.username.c_str());
         return;
     }
     printf("\n=== First Time Setup ===\n");
 
     while (true) {
         printf("Username (3-32 chars): ");
-        std::getline(std::cin, g_config.username);
-        if (ValidateUsername(g_config.username)) break;
+        std::getline(std::cin, config.username);
+        if (ValidateUsername(config.username)) break;
         printf("Invalid username\n");
     }
 
@@ -267,9 +265,9 @@ void SetupConfig() {
         if (!ValidatePassword(pw)) { printf("Invalid password\n"); continue; }
         printf("Confirm password: ");
         if (pw == GetPasswordInput()) {
-            g_config.salt = GenerateSalt();
-            g_config.passwordHash = HashPassword(pw, g_config.salt);
-            if (!g_config.passwordHash.empty() && SaveConfig()) {
+            config.salt = GenerateSalt();
+            config.passwordHash = HashPassword(pw, config.salt);
+            if (!config.passwordHash.empty() && SaveConfig()) {
                 printf("Configuration saved\n\n");
                 return;
             }
@@ -279,39 +277,48 @@ void SetupConfig() {
 }
 
 void HandleAuth(const httplib::Request& req, httplib::Response& res) {
+    auto& app = GetAppContext();
+    auto& config = app.config;
+    auto& rateLimiter = app.rateLimiter;
+
     json body;
     try {
         body = json::parse(req.body);
+    } catch (const std::exception& e) {
+        WARN("Auth: Invalid JSON in request body: %s", e.what());
+        JsonError(res, 400, "Invalid JSON");
+        return;
     } catch (...) {
+        WARN("Auth: Invalid JSON in request body");
         JsonError(res, 400, "Invalid JSON");
         return;
     }
 
     std::string ip = GetClientIP(req);
-    if (!g_rateLimiter.IsAllowed(ip)) {
+    if (!rateLimiter.IsAllowed(ip)) {
         res.status = 429;
-        res.set_content(json{{"error", "Too many attempts"}, {"lockoutSeconds", g_rateLimiter.LockoutSeconds(ip)}}.dump(),
+        res.set_content(json{{"error", "Too many attempts"}, {"lockoutSeconds", rateLimiter.LockoutSeconds(ip)}}.dump(),
                         "application/json");
         return;
     }
 
     std::string u = body.value("username", ""), p = body.value("password", "");
     if (u.empty() || p.empty()) {
-        g_rateLimiter.RecordAttempt(ip, false);
+        rateLimiter.RecordAttempt(ip, false);
         JsonError(res, 400, "Credentials required");
         return;
     }
 
-    if (u != g_config.username || !VerifyPassword(p, g_config.salt, g_config.passwordHash)) {
-        g_rateLimiter.RecordAttempt(ip, false);
+    if (u != config.username || !VerifyPassword(p, config.salt, config.passwordHash)) {
+        rateLimiter.RecordAttempt(ip, false);
         res.status = 401;
         res.set_content(json{{"error", "Invalid credentials"},
-                             {"remainingAttempts", g_rateLimiter.RemainingAttempts(ip)}}.dump(), "application/json");
+                             {"remainingAttempts", rateLimiter.RemainingAttempts(ip)}}.dump(), "application/json");
         return;
     }
 
-    g_rateLimiter.RecordAttempt(ip, true);
-    std::string token = g_jwt.CreateToken(u);
+    rateLimiter.RecordAttempt(ip, true);
+    std::string token = app.jwt.CreateToken(u);
     if (token.empty()) {
         JsonError(res, 500, "Internal error");
         return;
@@ -345,31 +352,4 @@ void SetupCORS(const httplib::Request& req, httplib::Response& r) {
         r.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
         r.set_header("Access-Control-Allow-Credentials", "true");
     }
-}
-
-std::vector<std::string> GetLocalIPAddresses() {
-    std::vector<std::string> results;
-    char hostname[256];
-    if (gethostname(hostname, sizeof(hostname)) != 0) return results;
-
-    addrinfo hints{}, *info = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(hostname, nullptr, &hints, &info) != 0 || !info) return results;
-
-    std::unordered_set<std::string> seen;
-    for (auto* p = info; p; p = p->ai_next) {
-        if (p->ai_family != AF_INET) continue;
-        char ip[INET_ADDRSTRLEN];
-        const auto* addr = reinterpret_cast<const sockaddr_in*>(p->ai_addr);
-        if (!inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip))) continue;
-        std::string ipStr(ip);
-        if (ipStr.rfind("127.", 0) == 0 || ipStr == "0.0.0.0" || ipStr.rfind("169.254.", 0) == 0) continue;
-        if (!seen.count(ipStr)) {
-            seen.insert(ipStr);
-            results.push_back(ipStr);
-        }
-    }
-    freeaddrinfo(info);
-    return results;
 }

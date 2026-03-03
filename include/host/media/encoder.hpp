@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "host/core/common.hpp"
 
 enum class GPUVendor : uint8_t { NVIDIA=0, INTEL=1, AMD=2, UNKNOWN=255 };
 
@@ -23,26 +23,17 @@ class VideoEncoder {
     ID3D11Device* dev=nullptr;
     ID3D11DeviceContext* ctx=nullptr;
     ID3D11Multithread* mt=nullptr;
-    ID3D11Device5* d5=nullptr;
-    ID3D11DeviceContext4* c4=nullptr;
-    ID3D11Fence* fence=nullptr;
-    HANDLE fEvt=nullptr;
-
-    uint64_t fVal=0, lastSig=0;
-    bool useFence=false;
+    D3D11FenceSync sync;
     int w, h, frameNum=0, curFps;
     CodecType codec;
     GPUVendor vendor=GPUVendor::UNKNOWN;
-    steady_clock::time_point lastKey;
+    std::chrono::steady_clock::time_point lastKey;
     EncodedFrame out;
     std::atomic<uint64_t> totalFrames{0}, failedFrames{0};
 
-    static constexpr auto KEY_INT = 2000ms;
+    static constexpr auto KEY_INT = std::chrono::milliseconds{2000};
 
     bool InitHwCtx();
-    void InitSync();
-    uint64_t Signal();
-    bool WaitGPU(uint64_t v, DWORD ms=16);
     void Configure();
     bool TryInit(GPUVendor v, CodecType cc);
     bool DrainPackets(bool& gotKey);
@@ -60,6 +51,6 @@ public:
     [[nodiscard]] GPUVendor GetVendor() const { return vendor; }
     bool UpdateFPS(int fps);
     void Flush();
-    [[nodiscard]] bool IsEncodeComplete() const { return !useFence || !fence || fence->GetCompletedValue() >= lastSig; }
+    [[nodiscard]] bool IsEncodeComplete() const { return sync.IsLastComplete(); }
     [[nodiscard]] EncodedFrame* Encode(ID3D11Texture2D* tex, int64_t ts, bool forceKey=false);
 };

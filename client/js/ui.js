@@ -1,8 +1,10 @@
 
-import { S, $, CODECS, detectCodecs, subscribeToMetrics, safe, log } from './state.js';
+import { CODECS, CODEC_KEYS } from './constants.js';
+import { S, $, detectCodecs, subscribeToMetrics, safe, log, bus } from './state.js';
 import { toggleAudio } from './media.js';
 import { setRelativeMouseMode } from './input.js';
 import { toggleMic, isMicSupported } from './mic.js';
+import { applyFps, sendMonitor, applyCodec } from './protocol.js';
 const loadEl = $('loadingOverlay');
 const statusEl = $('loadingStatus');
 const subStatusEl = $('loadingSubstatus');
@@ -27,15 +29,7 @@ export const hideLoading = () => {
     setTimeout(() => loadEl.classList.add('hidden'), 300);
     log.debug('UI', 'Loading hidden');
 };
-let applyFpsFn = null;
-let sendMonFn = null;
-let applyCodecFn = null;
-
-export const setNetCbs = (fps, mon, codec) => {
-    applyFpsFn = fps;
-    sendMonFn = mon;
-    applyCodecFn = codec;
-};
+bus.on('fps:applied', fps => updateFpsDropdown(fps));
 const fpsSel = $('fpsSel');
 const monSel = $('monSel');
 const codecSel = $('codecSel');
@@ -67,15 +61,15 @@ const savePref = (key, val) => {
 export const getStoredFps = () => loadPref(STORAGE_KEYS.FPS, v => v >= 1 && v <= 240, null);
 export const getStoredCodec = () => loadPref(STORAGE_KEYS.CODEC, v => v >= 0 && v <= 2, null) ?? defaultCodec ?? 0;
 const togglePanel = show => {
-    ['pnl', 'bk', 'edge'].forEach(id => $(id).classList.toggle('on', show));
+    ['panel', 'backdrop', 'edge'].forEach(id => $(id).classList.toggle('on', show));
     log.debug('UI', 'Panel toggled', { show });
 };
 
 $('edge').onclick = () => togglePanel(true);
-$('pnlX').onclick = $('bk').onclick = () => togglePanel(false);
+$('panelClose').onclick = $('backdrop').onclick = () => togglePanel(false);
 
 document.onkeydown = e => {
-    if (e.key === 'Escape' && $('pnl').classList.contains('on') && !S.controlEnabled) {
+    if (e.key === 'Escape' && $('panel').classList.contains('on') && !S.controlEnabled) {
         togglePanel(false);
     }
 };
@@ -100,7 +94,7 @@ fpsSel.onchange = () => {
         customFpsRow.style.display = 'none';
         const fps = +fpsSel.value;
         savePref(STORAGE_KEYS.FPS, fps);
-        applyFpsFn?.(fps);
+        applyFps(fps);
         log.info('UI', 'FPS changed', { fps });
     }
 };
@@ -109,7 +103,7 @@ customFpsApply.onclick = () => {
     const fps = parseInt(customFpsInput.value, 10);
     if (fps >= 1 && fps <= 240) {
         savePref(STORAGE_KEYS.FPS, fps);
-        applyFpsFn?.(fps);
+        applyFps(fps);
         log.info('UI', 'Custom FPS applied', { fps });
     } else {
         log.warn('UI', 'Invalid FPS value', { fps });
@@ -145,8 +139,6 @@ export const initCodecDetection = async () => {
         return { codecId: 1, hardwareAccel: 0, codecName: 'H.265' };
     }
 };
-
-const CODEC_KEYS = ['av1', 'h265', 'h264'];
 
 export const updateCodecOpts = async () => {
     const { support } = await detectCodecs();
@@ -184,12 +176,12 @@ export const updateCodecOpts = async () => {
 codecSel.onchange = () => {
     const codec = +codecSel.value;
     savePref(STORAGE_KEYS.CODEC, codec);
-    applyCodecFn?.(codec);
+    applyCodec(codec);
     log.info('UI', 'Codec changed', { codec });
 };
 monSel.onchange = () => {
     const idx = +monSel.value;
-    sendMonFn?.(idx);
+    sendMonitor(idx);
     log.info('UI', 'Monitor changed', { index: idx });
 };
 $('aBtn').onclick = toggleAudio;
@@ -252,13 +244,34 @@ const hasKeyboardLock = 'keyboard' in navigator && 'lock' in navigator.keyboard;
 document.addEventListener('fullscreenchange', async () => {
     updateFullscreen();
 
-    if (!hasKeyboardLock) return;
+    if (!hasKeyboardLock) {
+        S.keyboardLockActive = 0;
+        return;
+    }
 
     if (document.fullscreenElement) {
-        safe(() => navigator.keyboard.lock(['Escape']), undefined, 'UI');
+        let lockOk = false;
+        try {
+            await navigator.keyboard.lock();
+            lockOk = true;
+        } catch {
+            const escLocked = await safe(() => navigator.keyboard.lock(['Escape']), undefined, 'UI');
+            lockOk = escLocked !== undefined;
+        }
+        if (lockOk) {
+            S.keyboardLockActive = 1;
+        } else {
+            S.keyboardLockActive = 0;
+            log.warn('UI', 'Keyboard lock unavailable; system keys may affect local OS');
+        }
     } else {
-        navigator.keyboard.unlock();
+        safe(() => navigator.keyboard.unlock(), undefined, 'UI');
+        S.keyboardLockActive = 0;
     }
+});
+
+window.addEventListener('blur', () => {
+    if (!document.fullscreenElement) S.keyboardLockActive = 0;
 });
 const tabStrip = $('tabStrip');
 const tabContainer = $('tabContainer');
@@ -271,7 +284,8 @@ const STAR_ICON = `<svg class="primary-star" viewBox="0 0 24 24" fill="currentCo
 const getMonitorNames = () => {
     try {
         return JSON.parse(localStorage.getItem(STORAGE_KEYS.MON_NAMES)) || {};
-    } catch {
+    } catch (e) {
+        log.warn('UI', 'Failed to parse monitor names from storage', { error: e?.message });
         return {};
     }
 };
@@ -310,8 +324,8 @@ const renderTabs = () => {
         const idx = +tab.dataset.index;
 
         tab.onclick = () => {
-            if (idx !== S.currentMon && sendMonFn) {
-                sendMonFn(idx);
+            if (idx !== S.currentMon) {
+                sendMonitor(idx);
             }
         };
 
