@@ -338,7 +338,7 @@ std::thread StartEncoderThread(
                 try {
                     std::lock_guard<std::mutex> lock(encoderMutex);
                     if (encoder && webrtcServer->IsStreaming()) {
-                        auto* encoded = encoder->Encode(frame.tex, frame.ts, forceKey);
+                        auto* encoded = encoder->Encode(frame.tex, frame.ts, frame.sourceTs, forceKey);
                         if (encoded) {
                             if (webrtcServer->Send(*encoded)) {
                                 lastEncodeTs.store(frame.ts, std::memory_order_release);
@@ -649,6 +649,11 @@ int RunHostApp(int argc, char* argv[]) {
         std::unique_ptr<VideoEncoder> encoder;
         std::atomic<bool> encoderReady{false};
         std::atomic<CodecType> currentCodec{CODEC_AV1};
+        std::atomic<bool> softwareEncodeRequested{false};
+        std::atomic<bool> softwareEncodeEffective{false};
+        std::atomic<bool> softwareEncodeForced{false};
+        std::mutex encoderInfoMutex;
+        std::string activeEncoderName;
 
         InputHandler input;
         input.Enable();
@@ -657,6 +662,7 @@ int RunHostApp(int argc, char* argv[]) {
         WiggleManager wiggle(app.running, input);
 
         const uint8_t codecCaps = VideoEncoder::ProbeSupport(capture.GetDev());
+        const uint8_t hardwareCodecCaps = VideoEncoder::ProbeHardwareSupport(capture.GetDev());
         LOG("Codec support: AV1=%d H265=%d H264=%d", (codecCaps & 1) ? 1 : 0, (codecCaps & 2) ? 1 : 0, (codecCaps & 4) ? 1 : 0);
 
         std::unique_ptr<AudioCapture> audioCapture;
@@ -664,12 +670,33 @@ int RunHostApp(int argc, char* argv[]) {
         std::unique_ptr<MicPlayback> micPlayback;
         try { micPlayback = std::make_unique<MicPlayback>("CABLE Input"); } catch (...) { LOG("MicPlayback not available"); }
 
-        auto rebuildEncoder = [&](int width, int height, int fps, CodecType codec) {
+        auto updateSoftwareEncodeState = [&](CodecType codec, bool requested, const VideoEncoder* activeEncoder) {
+            const bool hardwareAvailable = (hardwareCodecCaps & (1 << static_cast<int>(codec))) != 0;
+            const bool usingHardware = activeEncoder ? activeEncoder->IsUsingHardware() : hardwareAvailable;
+            const bool activeSoftware = !usingHardware;
+            const bool forced = !hardwareAvailable;
+            softwareEncodeEffective.store(activeSoftware, std::memory_order_release);
+            softwareEncodeForced.store(forced, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(encoderInfoMutex);
+                activeEncoderName = activeEncoder ? activeEncoder->GetActiveEncoderName() : std::string{};
+            }
+            LOG("Software encode state: requested=%d activeSoftware=%d forced=%d usingHardware=%d codec=%s encoder=%s",
+                requested ? 1 : 0,
+                activeSoftware ? 1 : 0,
+                forced ? 1 : 0,
+                usingHardware ? 1 : 0,
+                VideoEncoder::CodecName(codec),
+                activeEncoder ? activeEncoder->GetActiveEncoderName().c_str() : "unknown");
+        };
+
+        auto rebuildEncoder = [&](int width, int height, int fps, CodecType codec) -> bool {
             std::lock_guard<std::mutex> lock(encoderMutex);
             encoderReady.store(false, std::memory_order_release);
             encoder.reset();
 
             try {
+                const bool preferSoftware = softwareEncodeRequested.load(std::memory_order_acquire);
                 encoder = std::make_unique<VideoEncoder>(
                     width,
                     height,
@@ -677,11 +704,15 @@ int RunHostApp(int argc, char* argv[]) {
                     capture.GetDev(),
                     capture.GetCtx(),
                     capture.GetMT(),
-                    codec);
+                    codec,
+                    preferSoftware);
                 currentCodec.store(codec, std::memory_order_release);
+                updateSoftwareEncodeState(codec, preferSoftware, encoder.get());
                 encoderReady.store(true, std::memory_order_release);
+                return true;
             } catch (const std::exception& ex) {
                 ERR("Encoder creation failed: %s", ex.what());
+                return false;
             }
         };
 
@@ -705,9 +736,11 @@ int RunHostApp(int argc, char* argv[]) {
                     encoder->UpdateFPS(fps);
                 } else {
                     try {
+                        const bool preferSoftware = softwareEncodeRequested.load(std::memory_order_acquire);
                         encoder = std::make_unique<VideoEncoder>(capture.GetW(), capture.GetH(), fps,
                             capture.GetDev(), capture.GetCtx(), capture.GetMT(),
-                            currentCodec.load(std::memory_order_acquire));
+                            currentCodec.load(std::memory_order_acquire), preferSoftware);
+                        updateSoftwareEncodeState(currentCodec.load(std::memory_order_acquire), preferSoftware, encoder.get());
                         encoderReady.store(true, std::memory_order_release);
                     } catch (const std::exception& e) {
                         ERR("Failed to create encoder: %s", e.what());
@@ -736,12 +769,39 @@ int RunHostApp(int argc, char* argv[]) {
             [&](CodecType codec) -> bool {
                 if (codec == currentCodec.load(std::memory_order_acquire)) return true;
                 if (!(codecCaps & (1 << static_cast<int>(codec)))) return false;
-                rebuildEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), codec);
+                if (!rebuildEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), codec)) return false;
                 lastEncodeTs.store(0, std::memory_order_release);
+                return true;
+            },
+            [&](bool enabled) -> bool {
+                CodecType codec = currentCodec.load(std::memory_order_acquire);
+                const bool forced = (hardwareCodecCaps & (1 << static_cast<int>(codec))) == 0;
+                const bool requested = forced ? true : enabled;
+
+                if (softwareEncodeRequested.load(std::memory_order_acquire) == requested &&
+                    softwareEncodeForced.load(std::memory_order_acquire) == forced) {
+                    updateSoftwareEncodeState(codec, requested, encoder.get());
+                    return true;
+                }
+
+                softwareEncodeRequested.store(requested, std::memory_order_release);
+                if (!rebuildEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), codec)) return false;
+                lastEncodeTs.store(0, std::memory_order_release);
+                frameSlot.Wake();
                 return true;
             },
             [&] { return currentCodec.load(std::memory_order_acquire); },
             [&] { return codecCaps; },
+            [&] {
+                uint8_t flags = 0;
+                if (softwareEncodeEffective.load(std::memory_order_acquire)) flags |= 0x01;
+                if (softwareEncodeForced.load(std::memory_order_acquire)) flags |= 0x02;
+                return flags;
+            },
+            [&] {
+                std::lock_guard<std::mutex> lock(encoderInfoMutex);
+                return activeEncoderName;
+            },
             [&] { return input.GetClipboardText(); },
             [&](const std::string& text) { return input.SetClipboardText(text); },
             [&](bool e) { cursorCapture.store(e, std::memory_order_release); capture.SetCursorCapture(e); },

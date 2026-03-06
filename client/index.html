@@ -73,6 +73,10 @@
                 <div class="setting-row"><span class="setting-label">Frame Rate</span><select class="sel" id="fpsSel"><option value="15">15</option><option value="30">30</option><option value="60" selected>60</option><option value="120">120</option><option value="144">144</option><option value="custom">Custom</option></select></div>
                 <div class="sw custom-fps-row" id="customFpsRow" style="display:none"><span class="setting-label">Custom FPS</span><div class="custom-fps-input"><input type="number" id="customFpsInput" class="fps-input" min="1" max="240" value="60"><button class="btn-small" id="customFpsApply">Apply</button></div></div>
                 <div class="setting-row"><span class="setting-label">Codec</span><select class="sel" id="codecSel"><option value="0">AV1</option><option value="1">H.265</option><option value="2">H.264</option></select></div>
+                <div class="setting-row"><span class="setting-label">Software encode</span><button class="toggle" id="softwareEncodeBtn" type="button"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+                <p class="input-hint" id="softwareEncodeHint"></p>
+                <div class="setting-row"><span class="setting-label">Software decode</span><button class="toggle" id="softwareDecodeBtn" type="button"><span class="tog-track"><span class="tog-thumb"></span></span></button></div>
+                <p class="input-hint" id="softwareDecodeHint"></p>
             </div>
             <div class="section">
                 <div class="section-label">Display</div>

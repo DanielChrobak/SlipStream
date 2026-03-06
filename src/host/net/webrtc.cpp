@@ -39,14 +39,29 @@ constexpr size_t kVideoQueueMaxPackets = 2048;
 constexpr size_t kVideoQueueTrimTargetPackets = 512;
 constexpr size_t kVideoQueueCongestionThreshold = 256;
 constexpr size_t kVideoQueueFecBypassThreshold = 128;
+constexpr size_t kVideoTransportFecBypassThreshold = 1400 * 16;
+constexpr size_t kLargeFrameChunkThreshold = 48;
+constexpr uint8_t kRelaxedVideoFecGroupSize = 20;
 
 void DrainQueuedChannel(
     const std::shared_ptr<rtc::DataChannel>& channel,
     std::queue<std::vector<uint8_t>>& queue,
+    std::mutex& queueMutex,
     size_t bufferLimit,
     std::atomic<uint64_t>& errorCounter,
+    std::atomic<bool>& drainActive,
     std::atomic<int>* overflowCounter = nullptr,
     std::atomic<bool>* requestKey = nullptr) {
+    bool expected = false;
+    if (!drainActive.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    struct DrainGuard {
+        std::atomic<bool>& active;
+        ~DrainGuard() { active.store(false, std::memory_order_release); }
+    } guard{drainActive};
+
     if (!channel || !channel->isOpen()) {
         if (!queue.empty()) {
             DBG("WebRTC: DrainQueuedChannel skipped - channel %s (queue=%zu)",
@@ -55,17 +70,42 @@ void DrainQueuedChannel(
         return;
     }
     size_t sent = 0, failed = 0;
-    const size_t queueBefore = queue.size();
-    const size_t bufferedBefore = channel->bufferedAmount();
-    while (!queue.empty() && channel->bufferedAmount() <= bufferLimit) {
+    size_t blockedBufferedAmount = 0;
+    size_t blockedQueueSize = 0;
+    while (true) {
+        std::vector<uint8_t> packet;
+        size_t queueRemaining = 0;
+
+        {
+            std::lock_guard<std::mutex> lk(queueMutex);
+            if (queue.empty()) {
+                break;
+            }
+            if (!channel->isOpen()) {
+                blockedQueueSize = queue.size();
+                break;
+            }
+
+            const size_t bufferedAmount = channel->bufferedAmount();
+            if (bufferedAmount > bufferLimit) {
+                blockedBufferedAmount = bufferedAmount;
+                blockedQueueSize = queue.size();
+                break;
+            }
+
+            packet = std::move(queue.front());
+            queue.pop();
+            queueRemaining = queue.size();
+        }
+
         try {
-            channel->send((const std::byte*)queue.front().data(), queue.front().size());
+            channel->send((const std::byte*)packet.data(), packet.size());
             sent++;
         } catch (const std::exception& e) {
             errorCounter++;
             failed++;
             ERR("WebRTC: DrainQueuedChannel send failed: %s (buffered=%zu, limit=%zu, queueRemaining=%zu)",
-                e.what(), channel->bufferedAmount(), bufferLimit, queue.size());
+                e.what(), channel->bufferedAmount(), bufferLimit, queueRemaining);
             if (overflowCounter) (*overflowCounter)++;
             if (requestKey) requestKey->store(true, std::memory_order_release);
         } catch (...) {
@@ -76,12 +116,17 @@ void DrainQueuedChannel(
             if (overflowCounter) (*overflowCounter)++;
             if (requestKey) requestKey->store(true, std::memory_order_release);
         }
-        queue.pop();
     }
-    const size_t bufferedAfter = channel->bufferedAmount();
-    const size_t queueAfter = queue.size();
+
     if (failed > 0) {
         WARN("WebRTC: DrainQueuedChannel completed: sent=%zu failed=%zu remaining=%zu", sent, failed, queue.size());
+    }
+    if (blockedBufferedAmount > 0) {
+        DBG("WebRTC: DrainQueuedChannel blocked by transport buffer (buffered=%zu limit=%zu queue=%zu sent=%zu)",
+            blockedBufferedAmount, bufferLimit, blockedQueueSize, sent);
+    } else if (blockedQueueSize > 0 && (!channel || !channel->isOpen())) {
+        DBG("WebRTC: DrainQueuedChannel stopped - channel unavailable (queue=%zu sent=%zu)",
+            blockedQueueSize, sent);
     }
 }
 
@@ -113,10 +158,28 @@ bool WebRTCServer::SendCtrl(const void* data, size_t byteCount) {
 }
 
 void WebRTCServer::SendHostInfo() {
-    uint8_t buf[6];
+    uint8_t buf[7]{};
     WritePod<uint32_t>(buf, MSG_HOST_INFO);
     WritePod<uint16_t>(buf + 4, static_cast<uint16_t>(callbacks_.getHostFps ? callbacks_.getHostFps() : 60));
+    buf[6] = callbacks_.getHostInfoFlags ? callbacks_.getHostInfoFlags() : 0;
     SendCtrl(buf, sizeof(buf));
+}
+
+void WebRTCServer::SendEncoderInfo() {
+    const CodecType codec = callbacks_.getCodec ? callbacks_.getCodec() : CODEC_H264;
+    const uint8_t flags = callbacks_.getHostInfoFlags ? callbacks_.getHostInfoFlags() : 0;
+    const std::string encoderName = callbacks_.getEncoderName ? callbacks_.getEncoderName() : std::string{};
+    const size_t nameLen = std::min<size_t>(encoderName.size(), 64);
+
+    std::vector<uint8_t> buf(7 + nameLen);
+    WritePod<uint32_t>(buf.data(), MSG_ENCODER_INFO);
+    buf[4] = static_cast<uint8_t>(codec);
+    buf[5] = flags;
+    buf[6] = static_cast<uint8_t>(nameLen);
+    if (nameLen > 0) {
+        memcpy(buf.data() + 7, encoderName.data(), nameLen);
+    }
+    SendCtrl(buf.data(), buf.size());
 }
 
 void WebRTCServer::SendMonitorList() {
@@ -226,6 +289,19 @@ void WebRTCServer::HandleCtrl(const rtc::binary& message) {
                 bool accepted = !callbacks_.onCodecChange || callbacks_.onCodecChange(requestedCodec);
                 if (accepted) { curCodec = requestedCodec; needsKey = true; }
                 sendAckU8(MSG_CODEC_ACK, static_cast<uint8_t>(curCodec.load()));
+                SendHostInfo();
+                SendEncoderInfo();
+            }
+            break;
+
+        case MSG_SOFTWARE_ENCODE:
+            if (message.size() == 5) {
+                if (callbacks_.onSoftwareEncodeChange) {
+                    callbacks_.onSoftwareEncodeChange(static_cast<uint8_t>(message[4]) != 0);
+                }
+                needsKey = true;
+                SendHostInfo();
+                SendEncoderInfo();
             }
             break;
 
@@ -454,6 +530,12 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
 }
 
 void WebRTCServer::OnChannelOpen(const std::string& label, uint64_t epoch) {
+    if (epoch != peerEpoch.load()) {
+        WARN("WebRTC: Stale channel open from previous peer (channel=%s epoch=%llu active=%llu) - ignoring",
+            label.c_str(), epoch, peerEpoch.load());
+        return;
+    }
+
     int ready = ++chRdy;
     LOG("WebRTC: Channel '%s' open (epoch=%llu active=%llu ready=%d/%d conn=%d fpsRecv=%d)",
         label.c_str(), epoch, peerEpoch.load(), ready, NUM_CH, conn.load() ? 1 : 0, fpsRecv.load() ? 1 : 0);
@@ -465,6 +547,7 @@ void WebRTCServer::OnChannelOpen(const std::string& label, uint64_t epoch) {
         connCount++;
         LOG("WebRTC: Connection #%llu established (epoch=%llu)", connCount.load(), epoch);
         SendHostInfo();
+        SendEncoderInfo();
         SendCodecCaps();
         SendMonitorList();
         SendVersion();
@@ -517,15 +600,27 @@ void WebRTCServer::SetupChannel(std::shared_ptr<rtc::DataChannel>& channel, bool
 void WebRTCServer::DrainVideo() {
     std::shared_ptr<rtc::DataChannel> videoChannel;
     { std::lock_guard<std::mutex> lk(channelMutex_); videoChannel = videoDataChannel_; }
-    std::lock_guard<std::mutex> lk(sendMutex_);
-    DrainQueuedChannel(videoChannel, videoPacketQueue_, VID_BUF, videoErr, &overflow, &needsKey);
+    const size_t bufferedBefore = (videoChannel && videoChannel->isOpen()) ? videoChannel->bufferedAmount() : 0;
+    DrainQueuedChannel(videoChannel, videoPacketQueue_, sendMutex_, VID_BUF, videoErr, videoDrainActive_, &overflow, &needsKey);
+
+    size_t queuedAfter = 0;
+    {
+        std::lock_guard<std::mutex> lk(sendMutex_);
+        queuedAfter = videoPacketQueue_.size();
+    }
+    const size_t bufferedAfter = (videoChannel && videoChannel->isOpen()) ? videoChannel->bufferedAmount() : 0;
+
+    if (queuedAfter > 0 || bufferedAfter >= VID_BUF / 2) {
+        DBG("WebRTC: DrainVideo state buffered=%zu->%zu queue=%zu congestion=%s",
+            bufferedBefore, bufferedAfter, queuedAfter,
+            bufferedAfter >= VID_BUF / 2 ? "transport" : queuedAfter > 0 ? "app-queue" : "none");
+    }
 }
 
 void WebRTCServer::DrainAudio() {
     std::shared_ptr<rtc::DataChannel> audioChannel;
     { std::lock_guard<std::mutex> lk(channelMutex_); audioChannel = audioDataChannel_; }
-    std::lock_guard<std::mutex> lk(sendMutex_);
-    DrainQueuedChannel(audioChannel, audioPacketQueue_, AUD_BUF, audioErr);
+    DrainQueuedChannel(audioChannel, audioPacketQueue_, sendMutex_, AUD_BUF, audioErr, audioDrainActive_);
 }
 
 void WebRTCServer::Reset() {
@@ -679,8 +774,16 @@ bool WebRTCServer::IsStale() {
 }
 
 bool WebRTCServer::IsCongested() const {
+    std::shared_ptr<rtc::DataChannel> videoChannel;
+    {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(channelMutex_));
+        videoChannel = videoDataChannel_;
+    }
+
     std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(sendMutex_));
-    return videoPacketQueue_.size() > kVideoQueueCongestionThreshold;
+    const size_t queuedPackets = videoPacketQueue_.size();
+    const size_t bufferedBytes = (videoChannel && videoChannel->isOpen()) ? videoChannel->bufferedAmount() : 0;
+    return queuedPackets > kVideoQueueCongestionThreshold || bufferedBytes >= VID_BUF / 2;
 }
 
 void WebRTCServer::LogStats() {
@@ -795,16 +898,26 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
     }
 
     const size_t bufferedNow = (videoChannel && videoChannel->isOpen()) ? videoChannel->bufferedAmount() : 0;
+    const bool heavyFrame = chunkCount >= kLargeFrameChunkThreshold;
     const bool bypassFec = !frame.isKey &&
-        (queuedBefore >= kVideoQueueFecBypassThreshold || bufferedNow >= VID_BUF / 2);
-    const uint8_t fecGroupSize = static_cast<uint8_t>(10);
+        (queuedBefore >= kVideoQueueFecBypassThreshold ||
+         bufferedNow >= kVideoTransportFecBypassThreshold ||
+         heavyFrame);
+    const uint8_t fecGroupSize = bypassFec ? static_cast<uint8_t>(0)
+        : (!frame.isKey && chunkCount >= kLargeFrameChunkThreshold / 2)
+            ? kRelaxedVideoFecGroupSize
+            : static_cast<uint8_t>(10);
+    const int64_t enqueueTs = GetTimestamp();
 
-    DBG("WebRTC: Send frame=%u ts=%lld key=%d size=%zu chunks=%zu encUs=%lld q=%zu buf=%zu fec=%s gsz=%u",
-        frameId, frame.ts, frame.isKey ? 1 : 0, frameSizeBytes, chunkCount, frame.encUs,
-        queuedBefore, bufferedNow, bypassFec ? "off" : "on", static_cast<unsigned>(fecGroupSize));
+    DBG("WebRTC: Send frame=%u ts=%lld sourceTs=%lld encodeEndTs=%lld enqueueTs=%lld key=%d size=%zu chunks=%zu encUs=%lld q=%zu buf=%zu fec=%s gsz=%u heavy=%d",
+        frameId, frame.ts, frame.sourceTs, frame.encodeEndTs, enqueueTs, frame.isKey ? 1 : 0, frameSizeBytes, chunkCount, frame.encUs,
+        queuedBefore, bufferedNow, bypassFec ? "off" : "on", static_cast<unsigned>(fecGroupSize), heavyFrame ? 1 : 0);
 
     PacketHeader header = {
         frame.ts,
+        frame.sourceTs > 0 ? frame.sourceTs : frame.ts,
+        frame.encodeEndTs > 0 ? frame.encodeEndTs : frame.ts,
+        enqueueTs,
         static_cast<uint32_t>(frame.encUs),
         frameId,
         static_cast<uint32_t>(frameSizeBytes),
@@ -838,9 +951,10 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
                 droppedPackets, frameId, frame.isKey ? 1 : 0, frameSizeBytes);
         }
 
-        for (size_t groupIndex = 0; groupIndex * static_cast<size_t>(fecGroupSize) < chunkCount; groupIndex++) {
-            size_t startChunkIndex = groupIndex * static_cast<size_t>(fecGroupSize);
-            size_t endChunkIndex = std::min(startChunkIndex + static_cast<size_t>(fecGroupSize), chunkCount);
+        const size_t packetGroupSize = std::max<size_t>(1, fecGroupSize);
+        for (size_t groupIndex = 0; groupIndex * packetGroupSize < chunkCount; groupIndex++) {
+            size_t startChunkIndex = groupIndex * packetGroupSize;
+            size_t endChunkIndex = std::min(startChunkIndex + packetGroupSize, chunkCount);
             size_t parityLen = 0;
             std::array<uint8_t, DATA_CHUNK> parity{};
 
@@ -862,7 +976,7 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
                 for (size_t j = 0; j < chunkLength; j++) parity[j] ^= source[j];
             }
 
-            if (!bypassFec && endChunkIndex - startChunkIndex == static_cast<size_t>(fecGroupSize) && parityLen > 0) {
+            if (!bypassFec && endChunkIndex - startChunkIndex == packetGroupSize && parityLen > 0) {
                 header.chunkIndex = static_cast<uint16_t>(groupIndex);
                 header.chunkBytes = static_cast<uint16_t>(parityLen);
                 header.packetType = PKT_FEC;
@@ -875,6 +989,19 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
         }
     }
     DrainVideo();
+
+    size_t queuedAfter = 0;
+    {
+        std::lock_guard<std::mutex> lk(sendMutex_);
+        queuedAfter = videoPacketQueue_.size();
+    }
+    const size_t bufferedAfter = (videoChannel && videoChannel->isOpen()) ? videoChannel->bufferedAmount() : 0;
+    if (queuedAfter > 0 || bufferedAfter >= VID_BUF / 2) {
+        DBG("WebRTC: Send post-drain frame=%u buffered=%zu queue=%zu pressure=%s",
+            frameId, bufferedAfter, queuedAfter,
+            bufferedAfter >= VID_BUF / 2 ? "transport" : queuedAfter > 0 ? "app-queue" : "none");
+    }
+
     videoSent++;
     LogStats();
     return true;

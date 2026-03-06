@@ -252,7 +252,7 @@ export const stopMic = () => {
     micPacketId = 0;
     micFecGroupStart = 0;
     micFecPackets = [];
-    sendMicEnable(0);
+    sendMicEnable(0, { suppressIfClosed: true });
 
     log.info('MIC', 'Stopped');
 };

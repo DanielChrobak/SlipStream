@@ -1,10 +1,48 @@
 #include "host/media/capture.hpp"
 #include "host/core/app_support.hpp"
 
+#include <cstdlib>
+
 using std::chrono::duration_cast;
 using std::chrono::milliseconds;
 using std::chrono::steady_clock;
 using namespace std::chrono_literals;
+
+namespace {
+    int64_t ConvertFrameSourceTimestampUs(winrt::Windows::Foundation::TimeSpan systemRelativeTime, int64_t captureTsUs) {
+        static const int64_t qpcFrequency = [] {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            return static_cast<int64_t>(f.QuadPart > 0 ? f.QuadPart : 1);
+        }();
+
+        const int64_t raw = systemRelativeTime.count();
+        if (raw <= 0) {
+            return captureTsUs;
+        }
+
+        const int64_t fromTimeSpanUs = raw / 10;
+        const int64_t fromQpcUs = static_cast<int64_t>((raw * 1000000LL) / qpcFrequency);
+        const int64_t deltaTimeSpanUs = std::llabs(captureTsUs - fromTimeSpanUs);
+        const int64_t deltaQpcUs = std::llabs(captureTsUs - fromQpcUs);
+        const int64_t sourceTsUs = deltaTimeSpanUs <= deltaQpcUs ? fromTimeSpanUs : fromQpcUs;
+
+        if (sourceTsUs <= 0) {
+            return captureTsUs;
+        }
+
+        // The compositor render time must not be newer than the later capture callback.
+        if (sourceTsUs > captureTsUs) {
+            return captureTsUs;
+        }
+
+        if (captureTsUs - sourceTsUs > 5000000) {
+            return captureTsUs;
+        }
+
+        return sourceTsUs;
+    }
+}
 
 FrameSlot::FrameSlot() {
     InitializeCriticalSection(&cs);
@@ -17,7 +55,7 @@ FrameSlot::~FrameSlot() {
     for (auto& frame : fr) frame.Release();
 }
 
-void FrameSlot::Push(ID3D11Texture2D* tex, int64_t ts, uint64_t fence, bool sync, int idx) {
+void FrameSlot::Push(ID3D11Texture2D* tex, int64_t ts, int64_t sourceTs, uint64_t fence, bool sync, int idx) {
     if (!tex) return;
     EnterCriticalSection(&cs);
     uint64_t gen = curGen.load(std::memory_order_acquire);
@@ -30,7 +68,7 @@ void FrameSlot::Push(ID3D11Texture2D* tex, int64_t ts, uint64_t fence, bool sync
     }
 
     tex->AddRef();
-    fr[head] = {tex, ts, fence, idx, sync, gen};
+    fr[head] = {tex, ts, sourceTs, fence, idx, sync, gen};
     if (idx >= 0) inFlight |= (1u << idx);
     head = (head + 1) % N;
     cnt++;
@@ -116,6 +154,7 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
     if (csz.Width != w || csz.Height != h) return;
 
     int64_t ts = GetTimestamp();
+    int64_t sourceTs = ConvertFrameSourceTimestampUs(f.SystemRelativeTime(), ts);
     WGD::Direct3D11::IDirect3DSurface surf{nullptr};
     try { surf = f.Surface(); } catch (...) { WARN("Capture: Surface() exception"); return; }
     if (!surf) return;
@@ -140,7 +179,7 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
         fv = sync.Signal();
     }
     texFences[ti] = fv;
-    slot->Push(texPool[ti], ts, fv, true, ti);
+    slot->Push(texPool[ti], ts, sourceTs, fv, true, ti);
 }
 
 void ScreenCapture::WaitCB(int ms) {

@@ -8,13 +8,125 @@ namespace {
         {"av1_qsv", "hevc_qsv", "h264_qsv"},
         {"av1_amf", "hevc_amf", "h264_amf"}
     };
+    constexpr const char* SW_AV1_ENC_NAMES[] = {"libsvtav1", "libaom-av1", "librav1e"};
+    constexpr const char* SW_H265_ENC_NAMES[] = {"libx265"};
+    constexpr const char* SW_H264_ENC_NAMES[] = {"libx264"};
 
-    inline int64_t CalcBitrate(int w, int h, int fps) {
-        return int64_t(0.18085 * w * h * fps);
+    inline int CalcEffectiveFps(int fps) {
+        if (fps <= 60) return fps;
+        if (fps <= 90) return 60 + ((fps - 60) * 2) / 3;
+        return 80 + ((fps - 90) / 3);
+    }
+
+    inline double CalcCodecBitrateFactor(CodecType codec) {
+        switch (codec) {
+            case CODEC_AV1: return 0.112;
+            case CODEC_H265: return 0.138;
+            case CODEC_H264: return 0.165;
+            default: return 0.145;
+        }
+    }
+
+    inline int64_t CalcBitrate(CodecType codec, int w, int h, int fps) {
+        const int effectiveFps = CalcEffectiveFps(fps);
+        const int64_t pixels = static_cast<int64_t>(w) * h;
+        const double factor = CalcCodecBitrateFactor(codec);
+        const int64_t bitrate = static_cast<int64_t>(factor * pixels * effectiveFps);
+        return std::max<int64_t>(6'000'000, bitrate);
+    }
+
+    inline int64_t CalcMaxRate(int64_t bitrate) {
+        return std::max<int64_t>(bitrate, (bitrate * 115) / 100);
+    }
+
+    inline int CalcBufferSize(int64_t bitrate) {
+        return static_cast<int>(std::max<int64_t>(4'000'000, bitrate / 3));
+    }
+
+    inline int CalcQualityValue(CodecType codec, int w, int h, int fps) {
+        int value = codec == CODEC_H264 ? 25 : codec == CODEC_H265 ? 28 : 31;
+        if (fps > 90) value += 2;
+        else if (fps > 60) value += 1;
+        if (static_cast<int64_t>(w) * h >= 2560LL * 1440LL) value += 1;
+        return value;
     }
 
     inline const char* GetEncName(CodecType c, GPUVendor v) {
         return v <= GPUVendor::AMD ? ENC_NAMES[static_cast<int>(v)][static_cast<int>(c)] : nullptr;
+    }
+
+    inline AVCodecID GetCodecId(CodecType codec) {
+        switch (codec) {
+            case CODEC_AV1: return AV_CODEC_ID_AV1;
+            case CODEC_H265: return AV_CODEC_ID_HEVC;
+            case CODEC_H264: return AV_CODEC_ID_H264;
+            default: return AV_CODEC_ID_NONE;
+        }
+    }
+
+    inline bool IsKnownHardwareEncoder(const char* name) {
+        if (!name) return false;
+        return strstr(name, "_nvenc") || strstr(name, "_qsv") || strstr(name, "_amf");
+    }
+
+    const char* const* GetSoftwareEncoderNames(CodecType codec, size_t& count) {
+        switch (codec) {
+            case CODEC_AV1:
+                count = std::size(SW_AV1_ENC_NAMES);
+                return SW_AV1_ENC_NAMES;
+            case CODEC_H265:
+                count = std::size(SW_H265_ENC_NAMES);
+                return SW_H265_ENC_NAMES;
+            case CODEC_H264:
+                count = std::size(SW_H264_ENC_NAMES);
+                return SW_H264_ENC_NAMES;
+            default:
+                count = 0;
+                return nullptr;
+        }
+    }
+
+    const AVCodec* FindSoftwareEncoder(CodecType codec, std::string& encoderName) {
+        size_t count = 0;
+        if (const char* const* names = GetSoftwareEncoderNames(codec, count)) {
+            for (size_t i = 0; i < count; ++i) {
+                if (const AVCodec* enc = avcodec_find_encoder_by_name(names[i])) {
+                    encoderName = names[i];
+                    return enc;
+                }
+            }
+        }
+
+        if (const AVCodec* enc = avcodec_find_encoder(GetCodecId(codec))) {
+            if (!IsKnownHardwareEncoder(enc->name)) {
+                encoderName = enc->name ? enc->name : "software";
+                return enc;
+            }
+        }
+
+        encoderName.clear();
+        return nullptr;
+    }
+
+    AVPixelFormat SelectSoftwarePixelFormat(const AVCodec* enc) {
+        if (!enc) return AV_PIX_FMT_YUV420P;
+
+        const void* rawFormats = nullptr;
+        int formatCount = 0;
+        if (avcodec_get_supported_config(nullptr, enc, AV_CODEC_CONFIG_PIX_FORMAT, 0, &rawFormats, &formatCount) < 0 ||
+            !rawFormats || formatCount <= 0) {
+            return AV_PIX_FMT_YUV420P;
+        }
+
+        const auto* formats = static_cast<const AVPixelFormat*>(rawFormats);
+
+        for (const AVPixelFormat preferred : {AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12}) {
+            for (int i = 0; i < formatCount; ++i) {
+                if (formats[i] == preferred) return preferred;
+            }
+        }
+
+        return AV_PIX_FMT_NONE;
     }
 
     std::vector<GPUVendor> GetVendorPriority(GPUVendor detected) {
@@ -68,19 +180,50 @@ uint8_t VideoEncoder::ProbeSupport(ID3D11Device* device) {
     GPUVendor detected = DetectGPU(device);
     LOG("VideoEncoder: Probing encoder support (detected GPU: %s)", VendorName(detected));
 
-    for (GPUVendor v : GetVendorPriority(detected)) {
-        for (int c = 0; c <= 2; c++) {
-            if (!(support & (1 << c))) {
-                if (auto* name = GetEncName(static_cast<CodecType>(c), v)) {
-                    if (avcodec_find_encoder_by_name(name)) {
-                        support |= (1 << c);
-                        DBG("VideoEncoder: Found encoder %s for %s", name, CodecName(static_cast<CodecType>(c)));
-                    }
+    for (int c = 0; c <= 2; c++) {
+        const CodecType codec = static_cast<CodecType>(c);
+
+        for (GPUVendor v : GetVendorPriority(detected)) {
+            if (auto* name = GetEncName(codec, v)) {
+                if (avcodec_find_encoder_by_name(name)) {
+                    support |= (1 << c);
+                    DBG("VideoEncoder: Found hardware encoder %s for %s", name, CodecName(codec));
+                    break;
+                }
+            }
+        }
+
+        if (!(support & (1 << c))) {
+            std::string encoderName;
+            if (FindSoftwareEncoder(codec, encoderName)) {
+                support |= (1 << c);
+                DBG("VideoEncoder: Found software encoder %s for %s", encoderName.c_str(), CodecName(codec));
+            }
+        }
+    }
+
+    LOG("VideoEncoder: Codec support: AV1=%d H265=%d H264=%d",
+        (support&1)?1:0, (support&2)?1:0, (support&4)?1:0);
+    return support;
+}
+
+uint8_t VideoEncoder::ProbeHardwareSupport(ID3D11Device* device) {
+    uint8_t support = 0;
+    GPUVendor detected = DetectGPU(device);
+
+    for (int c = 0; c <= 2; c++) {
+        const CodecType codec = static_cast<CodecType>(c);
+        for (GPUVendor v : GetVendorPriority(detected)) {
+            if (auto* name = GetEncName(codec, v)) {
+                if (avcodec_find_encoder_by_name(name)) {
+                    support |= (1 << c);
+                    break;
                 }
             }
         }
     }
-    LOG("VideoEncoder: Codec support: AV1=%d H265=%d H264=%d",
+
+    LOG("VideoEncoder: Hardware codec support: AV1=%d H265=%d H264=%d",
         (support&1)?1:0, (support&2)?1:0, (support&4)?1:0);
     return support;
 }
@@ -135,32 +278,166 @@ void VideoEncoder::Configure() {
             DBG("VideoEncoder: av_opt_set(%s=%s) failed", k, v);
     };
 
+    if (!usingHardware) {
+        DBG("VideoEncoder: Configuring software encoder %s", activeEncoderName.c_str());
+
+        if (activeEncoderName == "libx264") {
+            set("preset", "ultrafast");
+            set("tune", "zerolatency");
+            set("x264-params", "scenecut=0:open-gop=0");
+            set("annexb", "1");
+        } else if (activeEncoderName == "libx265") {
+            set("preset", "ultrafast");
+            set("tune", "zerolatency");
+            set("x265-params", "scenecut=0:open-gop=0:repeat-headers=1");
+            set("annexb", "1");
+        } else if (activeEncoderName == "libsvtav1") {
+            set("preset", "12");
+            set("tune", "0");
+        } else if (activeEncoderName == "libaom-av1") {
+            set("usage", "realtime");
+            set("cpu-used", "8");
+            set("lag-in-frames", "0");
+            set("row-mt", "1");
+        } else if (activeEncoderName == "librav1e") {
+            set("speed", "10");
+        }
+        return;
+    }
+
     DBG("VideoEncoder: Configuring for %s", VendorName(vendor));
-    const char* cq = codec == CODEC_H264 ? "23" : codec == CODEC_H265 ? "25" : "28";
+    const std::string qualityValue = std::to_string(CalcQualityValue(codec, w, h, curFps));
+    const char* quality = qualityValue.c_str();
 
     switch (vendor) {
         case GPUVendor::NVIDIA:
-            set("preset", "p1"); set("tune", "ull"); set("zerolatency", "1");
+            set("preset", "p2"); set("tune", "ull"); set("zerolatency", "1");
             set("rc-lookahead", "0"); set("rc", "vbr"); set("multipass", "disabled");
-            set("delay", "0"); set("surfaces", "4"); set("cq", cq);
+            set("delay", "0"); set("surfaces", "3"); set("cq", quality);
             set("no-scenecut", "1");
             if (codec != CODEC_AV1) { set("forced-idr", "1"); }
             break;
         case GPUVendor::INTEL:
             set("preset", "veryfast"); set("look_ahead", "0");
-            set("async_depth", "1"); set("low_power", "1"); set("global_quality", cq);
+            set("async_depth", "1"); set("low_power", "1"); set("global_quality", quality);
+            set("forced_idr", "1"); set("adaptive_i", "0"); set("adaptive_b", "0");
             break;
         case GPUVendor::AMD:
-            set("usage", "ultralowlatency"); set("quality", "speed");
+            set("usage", "ultralowlatency"); set("quality", "balanced");
             set("rc", "vbr_latency"); set("header_insertion_mode", "gop");
-            set("enforce_hrd", "0"); set("qp_i", cq); set("qp_p", cq);
+            set("enforce_hrd", "0"); set("qp_i", quality); set("qp_p", quality);
+            set("forced_idr", "1");
             break;
         default:
             WARN("VideoEncoder: Unknown GPU vendor");
     }
 }
 
-bool VideoEncoder::TryInit(GPUVendor v, CodecType cc) {
+bool VideoEncoder::InitSwFrame(const AVCodec* enc) {
+    swPixFmt = SelectSoftwarePixelFormat(enc);
+    if (swPixFmt == AV_PIX_FMT_NONE) {
+        ERR("VideoEncoder: No supported 8-bit software pixel format for %s", enc && enc->name ? enc->name : "unknown");
+        return false;
+    }
+
+    swFr = av_frame_alloc();
+    if (!swFr) {
+        ERR("VideoEncoder: av_frame_alloc failed for software frame");
+        return false;
+    }
+
+    swFr->format = swPixFmt;
+    swFr->width = w;
+    swFr->height = h;
+    if (av_frame_get_buffer(swFr, 32) < 0) {
+        ERR("VideoEncoder: av_frame_get_buffer failed for software frame");
+        av_frame_free(&swFr);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = static_cast<UINT>(w);
+    td.Height = static_cast<UINT>(h);
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, &stagingTex))) {
+        ERR("VideoEncoder: CreateTexture2D failed for software staging texture");
+        av_frame_free(&swFr);
+        return false;
+    }
+
+    swsCtx = sws_getCachedContext(
+        nullptr,
+        w,
+        h,
+        AV_PIX_FMT_BGRA,
+        w,
+        h,
+        swPixFmt,
+        SWS_BILINEAR,
+        nullptr,
+        nullptr,
+        nullptr);
+    if (!swsCtx) {
+        ERR("VideoEncoder: sws_getCachedContext failed");
+        SafeRelease(stagingTex);
+        av_frame_free(&swFr);
+        return false;
+    }
+
+    return true;
+}
+
+bool VideoEncoder::UploadSoftwareFrame(ID3D11Texture2D* tex, AVFrame* frame) {
+    if (!tex || !frame || !stagingTex || !swsCtx) return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        ERR("VideoEncoder: Unsupported software input texture format: %d", static_cast<int>(desc.Format));
+        return false;
+    }
+
+    int writableRet = av_frame_make_writable(frame);
+    if (writableRet < 0) {
+        ERR("VideoEncoder: av_frame_make_writable failed: %s", AvErr(writableRet));
+        return false;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    {
+        MTLock lk(mt);
+        ctx->CopyResource(stagingTex, tex);
+        HRESULT hr = ctx->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            ERR("VideoEncoder: Failed to map staging texture for software encode (hr=0x%08X)", hr);
+            return false;
+        }
+    }
+
+    const uint8_t* srcData[4] = {static_cast<const uint8_t*>(mapped.pData), nullptr, nullptr, nullptr};
+    const int srcLinesize[4] = {static_cast<int>(mapped.RowPitch), 0, 0, 0};
+    const int scaled = sws_scale(swsCtx, srcData, srcLinesize, 0, h, frame->data, frame->linesize);
+
+    {
+        MTLock lk(mt);
+        ctx->Unmap(stagingTex, 0);
+    }
+
+    if (scaled != h) {
+        ERR("VideoEncoder: sws_scale returned %d (expected %d)", scaled, h);
+        return false;
+    }
+
+    return true;
+}
+
+bool VideoEncoder::TryInitHardware(GPUVendor v, CodecType cc) {
     const char* encName = GetEncName(cc, v);
     if (!encName) return false;
 
@@ -172,16 +449,18 @@ bool VideoEncoder::TryInit(GPUVendor v, CodecType cc) {
     cctx = avcodec_alloc_context3(enc);
     if (!cctx) { ERR("VideoEncoder: avcodec_alloc_context3 failed"); return false; }
 
+    usingHardware = true;
+    activeEncoderName = encName;
     if (!InitHwCtx()) { avcodec_free_context(&cctx); return false; }
 
-    int64_t br = CalcBitrate(w, h, curFps);
+    int64_t br = CalcBitrate(codec, w, h, curFps);
     cctx->width = w;
     cctx->height = h;
     cctx->time_base = {1, curFps};
     cctx->framerate = {curFps, 1};
     cctx->bit_rate = br;
-    cctx->rc_max_rate = br * 2;
-    cctx->rc_buffer_size = static_cast<int>(br * 2);
+    cctx->rc_max_rate = CalcMaxRate(br);
+    cctx->rc_buffer_size = CalcBufferSize(br);
     cctx->gop_size = -1;
     cctx->max_b_frames = 0;
     cctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
@@ -202,10 +481,72 @@ bool VideoEncoder::TryInit(GPUVendor v, CodecType cc) {
         av_buffer_unref(&hwDev);
         avcodec_free_context(&cctx);
         vendor = GPUVendor::UNKNOWN;
+        activeEncoderName.clear();
+        usingHardware = false;
         return false;
     }
 
     LOG("VideoEncoder: Successfully initialized %s", encName);
+    return true;
+}
+
+bool VideoEncoder::TryInitSoftware(CodecType cc) {
+    std::string encoderName;
+    const AVCodec* enc = FindSoftwareEncoder(cc, encoderName);
+    if (!enc) return false;
+
+    LOG("VideoEncoder: Trying software encoder %s (%s)", encoderName.c_str(), CodecName(cc));
+
+    cctx = avcodec_alloc_context3(enc);
+    if (!cctx) {
+        ERR("VideoEncoder: avcodec_alloc_context3 failed for %s", encoderName.c_str());
+        return false;
+    }
+
+    usingHardware = false;
+    vendor = GPUVendor::UNKNOWN;
+    activeEncoderName = encoderName;
+
+    int64_t br = CalcBitrate(codec, w, h, curFps);
+    cctx->width = w;
+    cctx->height = h;
+    cctx->time_base = {1, curFps};
+    cctx->framerate = {curFps, 1};
+    cctx->bit_rate = br;
+    cctx->rc_max_rate = CalcMaxRate(br);
+    cctx->rc_buffer_size = CalcBufferSize(br);
+    cctx->gop_size = -1;
+    cctx->max_b_frames = 0;
+    cctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    cctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    cctx->delay = 0;
+    cctx->thread_count = 0;
+    cctx->color_range = AVCOL_RANGE_JPEG;
+    cctx->colorspace = AVCOL_SPC_BT709;
+    cctx->color_primaries = AVCOL_PRI_BT709;
+    cctx->color_trc = AVCOL_TRC_BT709;
+
+    if (!InitSwFrame(enc)) {
+        avcodec_free_context(&cctx);
+        activeEncoderName.clear();
+        return false;
+    }
+
+    cctx->pix_fmt = swPixFmt;
+    Configure();
+
+    if (avcodec_open2(cctx, enc, nullptr) < 0) {
+        ERR("VideoEncoder: avcodec_open2 failed for software encoder %s", encoderName.c_str());
+        sws_freeContext(swsCtx);
+        swsCtx = nullptr;
+        SafeRelease(stagingTex);
+        av_frame_free(&swFr);
+        avcodec_free_context(&cctx);
+        activeEncoderName.clear();
+        return false;
+    }
+
+    LOG("VideoEncoder: Successfully initialized software encoder %s", encoderName.c_str());
     return true;
 }
 
@@ -235,9 +576,9 @@ bool VideoEncoder::DrainPackets(bool& gotKey) {
 }
 
 VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
-                           ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc)
+                           ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc, bool preferSoftware)
     : w(width), h(height), curFps(fps), dev(d), ctx(c), mt(m), codec(cc) {
-    LOG("VideoEncoder: Creating %dx%d @ %dfps, codec: %s", w, h, fps, CodecName(cc));
+    LOG("VideoEncoder: Creating %dx%d @ %dfps, codec: %s, preferSoftware=%d", w, h, fps, CodecName(cc), preferSoftware ? 1 : 0);
 
     dev->AddRef();
     if (ctx) ctx->AddRef(); else dev->GetImmediateContext(&ctx);
@@ -246,22 +587,37 @@ VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
     lastKey = steady_clock::now() - KEY_INT;
     sync.Init(dev, ctx);
 
-    for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
-        if (TryInit(v, cc)) break;
+    if (!preferSoftware) {
+        for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
+            if (TryInitHardware(v, cc)) break;
+        }
     }
 
-    if (!cctx) throw std::runtime_error("No hardware encoder available");
+    if (!cctx) TryInitSoftware(cc);
 
-    hwFr = av_frame_alloc();
+    if (!cctx && preferSoftware) {
+        for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
+            if (TryInitHardware(v, cc)) break;
+        }
+    }
+
+    if (!cctx) throw std::runtime_error("No encoder available for requested codec");
+
     pkt = av_packet_alloc();
-    if (!hwFr || !pkt) throw std::runtime_error("Frame/packet alloc failed");
+    if (!pkt) throw std::runtime_error("Frame/packet alloc failed");
 
-    hwFr->format = cctx->pix_fmt;
-    hwFr->width = w;
-    hwFr->height = h;
+    if (usingHardware) {
+        hwFr = av_frame_alloc();
+        if (!hwFr) throw std::runtime_error("Frame/packet alloc failed");
+        hwFr->format = cctx->pix_fmt;
+        hwFr->width = w;
+        hwFr->height = h;
+    }
 
-    LOG("Encoder: %dx%d @ %dfps, %.2f Mbps, codec: %s, GPU: %s",
-        w, h, fps, CalcBitrate(w, h, fps) / 1e6, GetEncName(cc, vendor), VendorName(vendor));
+    LOG("Encoder: %dx%d @ %dfps, %.2f Mbps, codec: %s, encoder: %s, backend: %s",
+        w, h, fps, CalcBitrate(cc, w, h, fps) / 1e6, CodecName(cc),
+        activeEncoderName.empty() ? "unknown" : activeEncoderName.c_str(),
+        usingHardware ? VendorName(vendor) : "Software");
 }
 
 VideoEncoder::~VideoEncoder() {
@@ -269,18 +625,21 @@ VideoEncoder::~VideoEncoder() {
         totalFrames.load(), failedFrames.load());
     av_packet_free(&pkt);
     av_frame_free(&hwFr);
+    av_frame_free(&swFr);
+    sws_freeContext(swsCtx);
     av_buffer_unref(&hwFrCtx);
     av_buffer_unref(&hwDev);
     if (cctx) avcodec_free_context(&cctx);
+    SafeRelease(stagingTex);
     SafeRelease(mt, ctx, dev);
 }
 
 bool VideoEncoder::UpdateFPS(int fps) {
     if (fps == curFps || fps < 1 || fps > 240) return false;
-    int64_t br = CalcBitrate(w, h, fps);
+    int64_t br = CalcBitrate(codec, w, h, fps);
     cctx->bit_rate = br;
-    cctx->rc_max_rate = br * 2;
-    cctx->rc_buffer_size = static_cast<int>(br * 2);
+    cctx->rc_max_rate = CalcMaxRate(br);
+    cctx->rc_buffer_size = CalcBufferSize(br);
     cctx->time_base = {1, fps};
     cctx->framerate = {fps, 1};
     cctx->gop_size = -1;
@@ -309,7 +668,7 @@ void VideoEncoder::Flush() {
     LOG("VideoEncoder: Flush complete");
 }
 
-EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceKey) {
+EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, int64_t sourceTs, bool forceKey) {
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
     out.Clear();
@@ -323,60 +682,71 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
         return nullptr;
     }
 
-    bool needKey = forceKey || frameNum == 0;
-    const char* keyReason = nullptr;
-    if (needKey) keyReason = forceKey ? "client-requested" : "first-frame";
+    const bool needKey = forceKey;
+    const char* keyReason = needKey ? "client-requested" : nullptr;
+    const int64_t encodeStartTs = GetTimestamp();
 
-    DBG("VideoEncoder: Encode start frame=%d ts=%lld forceKey=%d needKey=%d", frameNum, ts, forceKey ? 1 : 0, needKey ? 1 : 0);
+    DBG("VideoEncoder: Encode start frame=%d ts=%lld sourceTs=%lld forceKey=%d needKey=%d",
+        frameNum, ts, sourceTs, forceKey ? 1 : 0, needKey ? 1 : 0);
 
-    int hwBufRet = av_hwframe_get_buffer(cctx->hw_frames_ctx, hwFr, 0);
-    if (hwBufRet < 0) {
-        ERR("VideoEncoder: av_hwframe_get_buffer failed: %s (frame=%d)", AvErr(hwBufRet), frameNum);
-        failedFrames++;
-        return nullptr;
+    AVFrame* encodeFrame = nullptr;
+    if (usingHardware) {
+        int hwBufRet = av_hwframe_get_buffer(cctx->hw_frames_ctx, hwFr, 0);
+        if (hwBufRet < 0) {
+            ERR("VideoEncoder: av_hwframe_get_buffer failed: %s (frame=%d)", AvErr(hwBufRet), frameNum);
+            failedFrames++;
+            return nullptr;
+        }
+
+        uint64_t sig;
+        {
+            MTLock lk(mt);
+            ctx->CopySubresourceRegion(reinterpret_cast<ID3D11Texture2D*>(hwFr->data[0]),
+                static_cast<UINT>(reinterpret_cast<intptr_t>(hwFr->data[1])), 0, 0, 0, tex, 0, nullptr);
+            sig = sync.Signal();
+        }
+
+        if (!sync.Wait(sig, ctx, mt, 16)) {
+            WARN("VideoEncoder: GPU sync timeout (frame=%d, sig=%llu, ts=%lld) - frame dropped", frameNum, sig, ts);
+            av_frame_unref(hwFr);
+            failedFrames++;
+            return nullptr;
+        }
+
+        encodeFrame = hwFr;
+    } else {
+        if (!UploadSoftwareFrame(tex, swFr)) {
+            failedFrames++;
+            return nullptr;
+        }
+        encodeFrame = swFr;
     }
 
-    uint64_t sig;
-    {
-        MTLock lk(mt);
-        ctx->CopySubresourceRegion(reinterpret_cast<ID3D11Texture2D*>(hwFr->data[0]),
-            static_cast<UINT>(reinterpret_cast<intptr_t>(hwFr->data[1])), 0, 0, 0, tex, 0, nullptr);
-        sig = sync.Signal();
-    }
-
-    if (!sync.Wait(sig, ctx, mt, 16)) {
-        WARN("VideoEncoder: GPU sync timeout (frame=%d, sig=%llu, ts=%lld) - frame dropped", frameNum, sig, ts);
-        av_frame_unref(hwFr);
-        failedFrames++;
-        return nullptr;
-    }
-
-    hwFr->pts = frameNum++;
-    hwFr->pict_type = needKey ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
-    hwFr->flags = needKey ? (hwFr->flags | AV_FRAME_FLAG_KEY) : (hwFr->flags & ~AV_FRAME_FLAG_KEY);
+    encodeFrame->pts = frameNum++;
+    encodeFrame->pict_type = needKey ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    encodeFrame->flags = needKey ? (encodeFrame->flags | AV_FRAME_FLAG_KEY) : (encodeFrame->flags & ~AV_FRAME_FLAG_KEY);
 
     if (needKey) {
-        lastKey = steady_clock::now();
         LOG("VideoEncoder: Keyframe requested (%s, frame=%d)", keyReason, frameNum);
         DBG("VideoEncoder: Encoding keyframe (frame %d)", frameNum - 1);
     }
 
     bool gotKey = false;
-    int ret = avcodec_send_frame(cctx, hwFr);
+    int ret = avcodec_send_frame(cctx, encodeFrame);
     if (ret == AVERROR(EAGAIN)) {
         DrainPackets(gotKey);
-        ret = avcodec_send_frame(cctx, hwFr);
+        ret = avcodec_send_frame(cctx, encodeFrame);
     }
 
     if (ret < 0 && ret != AVERROR_EOF) {
         ERR("VideoEncoder: avcodec_send_frame failed: %s", AvErr(ret));
-        av_frame_unref(hwFr);
+        av_frame_unref(encodeFrame);
         failedFrames++;
         return nullptr;
     }
 
     DrainPackets(gotKey);
-    av_frame_unref(hwFr);
+    av_frame_unref(encodeFrame);
 
     if (out.data.empty()) {
         WARN("VideoEncoder: Encode produced empty output (frame=%d, ts=%lld, needKey=%d) - frame dropped", frameNum - 1, ts, needKey ? 1 : 0);
@@ -388,9 +758,15 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
     static const int64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
 
     out.ts = ts;
+    out.sourceTs = sourceTs > 0 ? sourceTs : ts;
+    out.encodeEndTs = GetTimestamp();
     out.encUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / freq;
     out.isKey = gotKey;
     totalFrames++;
+
+    if (gotKey) {
+        lastKey = steady_clock::now();
+    }
 
     if (needKey && !gotKey) {
         WARN("VideoEncoder: Requested keyframe but encoder did not produce one (frame=%d, ts=%lld, size=%zu)",
@@ -420,8 +796,8 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, bool forceK
             out.data.size(), frameNum - 1, gotKey ? 1 : 0);
     }
 
-    DBG("VideoEncoder: Encoded frame=%d ts=%lld key=%d size=%zu encUs=%lld total=%llu failed=%llu",
-        frameNum - 1, ts, gotKey ? 1 : 0, out.data.size(), out.encUs,
+    DBG("VideoEncoder: Encoded frame=%d ts=%lld sourceTs=%lld encodeStartTs=%lld encodeEndTs=%lld key=%d size=%zu encUs=%lld total=%llu failed=%llu",
+        frameNum - 1, ts, out.sourceTs, encodeStartTs, out.encodeEndTs, gotKey ? 1 : 0, out.data.size(), out.encUs,
         totalFrames.load(), failedFrames.load());
 
     return &out;

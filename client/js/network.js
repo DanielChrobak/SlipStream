@@ -6,13 +6,14 @@ import { S, $, safe, safeAsync, updateClockOffset, resetClockSync,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log, bus } from './state.js';
 import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry } from './media.js';
 import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs,
-    updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection,
+    updateLoadingStage, showLoading, hideLoading, getStoredCodec, getStoredSoftwareEncode, initCodecDetection,
+    updateSoftwareEncodeState,
     getStoredFps, updateFpsDropdown, closeTabbedMode } from './ui.js';
 import { resetRenderer, setCursorStyle } from './renderer.js';
 import { stopMic } from './mic.js';
 import { showAuth, hideAuth, clearSession, validateSession } from './auth.js';
 import { sendPing, requestKeyframe, requestRecoveryKeyframe, clearPendingKeyReq,
-    applyCodec, applyFps, getMaxInFlightFrames, expectedChunkSize,
+    applyCodec, applyFps, applySoftwareEncode, getMaxInFlightFrames, expectedChunkSize,
     tryRecoverFrameGroup, resetProtocolState } from './protocol.js';
 
 const BASE_URL = location.origin;
@@ -29,11 +30,71 @@ let lastFrameCompletedAt = 0;
 const MAX_SERVER_BUSY_RETRIES = 5;
 const TEXT_DECODER = new TextDecoder();
 let lastChunkCleanupAt = 0;
+let lastPendingFecCleanupAt = 0;
 const AUDIO_PKT_DATA = 0;
 const AUDIO_PKT_FEC = 1;
 const audioFecGroups = new Map();
 const seenAudioPacketIds = new Set();
 let lastAudioFecCleanupAt = 0;
+const pendingVideoFec = new Map();
+
+const cleanupPendingVideoFec = now => {
+    if (now - lastPendingFecCleanupAt < 100 && pendingVideoFec.size < 96) return;
+    lastPendingFecCleanupAt = now;
+    for (const [frameId, entry] of pendingVideoFec) {
+        if (now - entry.arrivalMs > C.FRAME_TIMEOUT_MS) pendingVideoFec.delete(frameId);
+    }
+};
+
+const stashPendingVideoFec = (frameId, frameInfo, groupIndex, chunkData, arrivalMs) => {
+    const pending = pendingVideoFec.get(frameId) || {
+        arrivalMs,
+        lastPacketMs: arrivalMs,
+        total: frameInfo.total,
+        frameSize: frameInfo.frameSize,
+        dataChunkSize: frameInfo.dataChunkSize,
+        capTs: frameInfo.capTs,
+        sourceTs: frameInfo.sourceTs,
+        encodeEndTs: frameInfo.encodeEndTs,
+        enqueueTs: frameInfo.enqueueTs,
+        isKey: frameInfo.isKey,
+        fecGroupSize: frameInfo.fecGroupSize,
+        groups: new Map()
+    };
+
+    if (pending.total !== frameInfo.total || pending.frameSize !== frameInfo.frameSize ||
+        pending.dataChunkSize !== frameInfo.dataChunkSize || pending.capTs !== frameInfo.capTs ||
+        pending.sourceTs !== frameInfo.sourceTs || pending.encodeEndTs !== frameInfo.encodeEndTs ||
+        pending.enqueueTs !== frameInfo.enqueueTs) {
+        pendingVideoFec.delete(frameId);
+        return;
+    }
+
+    pending.arrivalMs = Math.min(pending.arrivalMs, arrivalMs);
+    pending.lastPacketMs = Math.max(pending.lastPacketMs, arrivalMs);
+    if (!pending.groups.has(groupIndex)) pending.groups.set(groupIndex, chunkData.slice());
+    pendingVideoFec.set(frameId, pending);
+};
+
+const attachPendingVideoFec = (frameId, frame) => {
+    const pending = pendingVideoFec.get(frameId);
+    if (!pending) return;
+    if (pending.total !== frame.total || pending.frameSize !== frame.frameSize ||
+        pending.dataChunkSize !== frame.dataChunkSize || pending.capTs !== frame.capTs ||
+        pending.sourceTs !== frame.sourceTs || pending.encodeEndTs !== frame.encodeEndTs ||
+        pending.enqueueTs !== frame.enqueueTs) {
+        pendingVideoFec.delete(frameId);
+        return;
+    }
+
+    frame.arrivalMs = Math.min(frame.arrivalMs, pending.arrivalMs);
+    frame.lastPacketMs = Math.max(frame.lastPacketMs, pending.lastPacketMs);
+    frame.fecGroupSize = Math.max(frame.fecGroupSize, pending.fecGroupSize || 1);
+    for (const [groupIndex, payload] of pending.groups) {
+        if (!frame.fecParts.has(groupIndex)) frame.fecParts.set(groupIndex, payload);
+    }
+    pendingVideoFec.delete(frameId);
+};
 
 const trimSeenAudioPacketIds = () => {
     if (seenAudioPacketIds.size <= 4096) return;
@@ -232,7 +293,8 @@ const processFrame = (frameId, frame) => {
     if (frameId > S.lastFrameId) S.lastFrameId = frameId;
     lastFrameCompletedAt = performance.now();
 
-    const assemblyMs = performance.now() - frame.arrivalMs;
+    const reassemblyCompleteMs = performance.now();
+    const assemblyMs = reassemblyCompleteMs - frame.arrivalMs;
 
     log.debug('VIDEO', 'Frame complete', {
         id: frameId, key: frame.isKey ? 1 : 0, size: buffer.byteLength,
@@ -243,9 +305,15 @@ const processFrame = (frameId, frame) => {
     const decodeAccepted = decodeFrame({
         buf: buffer,
         capTs: frame.capTs,
+        sourceTs: frame.sourceTs,
+        encodeEndTs: frame.encodeEndTs,
+        enqueueTs: frame.enqueueTs,
         encMs: frame.encMs,
         isKey: frame.isKey,
-        arrivalMs: frame.arrivalMs
+        arrivalMs: frame.arrivalMs,
+        firstPacketMs: frame.arrivalMs,
+        lastPacketMs: frame.lastPacketMs,
+        reassemblyCompleteMs
     });
 
     if (waitingFirstFrame && decodeAccepted) {
@@ -271,11 +339,34 @@ const handleControl = async e => {
         updateClockOffset(Number(view.getBigUint64(8, true)), Number(view.getBigUint64(16, true)), arrivalUs);
         return recordPacket(length, 'control');
     }
-    if (msgType === MSG.HOST_INFO && length === 6) {
+    if (msgType === MSG.HOST_INFO && length >= 6) {
+        const hostFlags = length >= 7 ? view.getUint8(6) : 0;
+        const softwareEncodeEnabled = (hostFlags & 0x01) !== 0;
+        const softwareEncodeForced = (hostFlags & 0x02) !== 0;
         S.hostFps = view.getUint16(4, true);
+        updateSoftwareEncodeState({ enabled: softwareEncodeEnabled, forced: softwareEncodeForced });
         if (!S.fpsSent) setTimeout(() => applyFps(getStoredFps() ?? 60), 50);
+        const softwareEncodePref = getStoredSoftwareEncode();
+        if (!softwareEncodeForced && softwareEncodeEnabled !== softwareEncodePref) {
+            setTimeout(() => applySoftwareEncode(softwareEncodePref), 75);
+        }
         if (!hasConnection) { updateLoadingStage('Connected'); waitingFirstFrame = true; armFirstFrameWatchdog(); log.info('NET', 'Waiting for first frame', { seq: activeConnectSeq }); }
-        log.info('NET', 'Host info', { fps: S.hostFps });
+        log.info('NET', 'Host info', { fps: S.hostFps, softwareEncodeEnabled, softwareEncodeForced });
+        return recordPacket(length, 'control');
+    }
+    if (msgType === MSG.ENCODER_INFO && length >= 7) {
+        const codecId = view.getUint8(4);
+        const encoderFlags = view.getUint8(5);
+        const nameLen = view.getUint8(6);
+        if (length >= 7 + nameLen && nameLen <= 64) {
+            S.hostEncoderName = nameLen > 0 ? TEXT_DECODER.decode(new Uint8Array(e.data, 7, nameLen)) : null;
+            log.info('NET', 'Host encoder info', {
+                codec: codecId,
+                software: (encoderFlags & 0x01) !== 0,
+                forced: (encoderFlags & 0x02) !== 0,
+                encoder: S.hostEncoderName || 'unknown'
+            });
+        }
         return recordPacket(length, 'control');
     }
     if (msgType === MSG.CODEC_CAPS && length === 5) {
@@ -342,17 +433,20 @@ const handleVideo = e => {
     const view = new DataView(e.data);
     const length = e.data.byteLength;
     const captureTs = Number(view.getBigUint64(0, true));
-    const frameId = view.getUint32(12, true);
-    const frameSize = view.getUint32(16, true);
-    const chunkIndex = view.getUint16(20, true);
-    const totalChunks = view.getUint16(22, true);
-    const chunkBytes = view.getUint16(24, true);
-    const dataChunkSize = view.getUint16(26, true);
-    const frameType = view.getUint8(28);
-    const packetType = view.getUint8(29);
-    const fecGroupSize = view.getUint8(30) || C.FEC_GROUP_SIZE;
+    const sourceTs = Number(view.getBigUint64(8, true));
+    const encodeEndTs = Number(view.getBigUint64(16, true));
+    const enqueueTs = Number(view.getBigUint64(24, true));
+    const frameId = view.getUint32(36, true);
+    const frameSize = view.getUint32(40, true);
+    const chunkIndex = view.getUint16(44, true);
+    const totalChunks = view.getUint16(46, true);
+    const chunkBytes = view.getUint16(48, true);
+    const dataChunkSize = view.getUint16(50, true);
+    const frameType = view.getUint8(52);
+    const packetType = view.getUint8(53);
+    const fecGroupSize = view.getUint8(54) || C.FEC_GROUP_SIZE;
 
-    if (totalChunks === 0 || captureTs <= 0 || frameSize === 0 || dataChunkSize === 0) { logVideoDrop('Invalid packet data'); return; }
+    if (totalChunks === 0 || captureTs <= 0 || sourceTs <= 0 || frameSize === 0 || dataChunkSize === 0) { logVideoDrop('Invalid packet data'); return; }
     if (packetType === VIDEO_PKT_DATA && chunkIndex >= totalChunks) { logVideoDrop('Invalid data chunk index', { frameId, chunkIndex, totalChunks }); return; }
     if (packetType !== VIDEO_PKT_DATA && packetType !== VIDEO_PKT_FEC) { logVideoDrop('Unknown video packet type', { packetType, frameId }); return; }
     if (length < C.HEADER || chunkBytes !== length - C.HEADER) { logVideoDrop('Video size mismatch', { frameId, chunkBytes, actual: length - C.HEADER }); return; }
@@ -360,6 +454,7 @@ const handleVideo = e => {
     const chunkData = new Uint8Array(e.data, C.HEADER, chunkBytes);
     recordPacket(length, 'video');
     S.stats.bytes += length;
+    cleanupPendingVideoFec(arrivalMs);
 
     if (arrivalMs - lastChunkCleanupAt >= 50) {
         lastChunkCleanupAt = arrivalMs;
@@ -375,7 +470,7 @@ const handleVideo = e => {
                     isKey: frame.isKey ? 1 : 0,
                     fecParts: frame.fecParts.size,
                     fecRecovered: frame.fecRecovered || 0
-                });
+                }, { countDropped: false });
                 S.chunks.delete(id);
                 S.stats.framesTimeout++;
                 if (frame.isKey && frame.received > 0) {
@@ -390,13 +485,32 @@ const handleVideo = e => {
 
     // Create frame entry if needed
     if (!S.chunks.has(frameId)) {
+        if (packetType === VIDEO_PKT_FEC) {
+            stashPendingVideoFec(frameId, {
+                total: totalChunks,
+                frameSize,
+                dataChunkSize,
+                capTs: captureTs,
+                sourceTs,
+                encodeEndTs,
+                enqueueTs,
+                isKey: frameType === 1,
+                fecGroupSize: Math.max(1, fecGroupSize)
+            }, chunkIndex, chunkData, arrivalMs);
+            return;
+        }
+
         S.chunks.set(frameId, {
             parts: Array(totalChunks).fill(null), partSizes: Array(totalChunks).fill(0),
             total: totalChunks, received: 0, capTs: captureTs,
-            encMs: view.getUint32(8, true) / 1000, arrivalMs, isKey: frameType === 1,
+            sourceTs,
+            encodeEndTs,
+            enqueueTs,
+            encMs: view.getUint32(32, true) / 1000, arrivalMs, lastPacketMs: arrivalMs, isKey: frameType === 1,
             frameSize, dataChunkSize, fecGroupSize: Math.max(1, fecGroupSize),
             fecParts: new Map(), fecRecovered: 0
         });
+        attachPendingVideoFec(frameId, S.chunks.get(frameId));
 
         const maxInFlight = getMaxInFlightFrames();
         if (S.chunks.size > maxInFlight) {
@@ -421,6 +535,7 @@ const handleVideo = e => {
 
     const frame = S.chunks.get(frameId);
     if (!frame) return;
+    frame.lastPacketMs = Math.max(frame.lastPacketMs, arrivalMs);
     if (frame.total !== totalChunks || frame.frameSize !== frameSize || frame.dataChunkSize !== dataChunkSize) { logVideoDrop('Frame metadata mismatch', { frameId }); return; }
 
     if (packetType === VIDEO_PKT_DATA) {
@@ -586,6 +701,7 @@ const cleanup = () => {
     closeDataChannels();
     audioFecGroups.clear();
     seenAudioPacketIds.clear();
+    pendingVideoFec.clear();
     channelsReady = 0;
     stopMic();
 };
@@ -596,6 +712,7 @@ const resetState = () => {
     DC_KEYS.forEach(k => S[k] = null);
     S.pc = S.decoder = null;
     S.ready = S.fpsSent = S.codecSent = waitingFirstFrame = 0;
+    S.hostEncoderName = null;
     hasConnection = false;
     lastFrameCompletedAt = 0;
     resetProtocolState();

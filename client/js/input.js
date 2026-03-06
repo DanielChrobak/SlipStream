@@ -402,7 +402,7 @@ const toggleControl = enable => {
 };
 export const setRelativeMouseMode = enable => {
     S.relativeMouseMode = enable;
-    sendCursorCapture(enable);
+    sendCursorCapture(enable, { suppressIfClosed: true });
 
     if (enable) {
         resetCursorStyle();

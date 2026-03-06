@@ -8,6 +8,9 @@
 #pragma pack(push,1)
 struct PacketHeader {
     int64_t timestamp;
+    int64_t sourceTimestamp;
+    int64_t encodeEndTimestamp;
+    int64_t enqueueTimestamp;
     uint32_t encodeTimeUs, frameId;
     uint32_t frameSize;
     uint16_t chunkIndex, totalChunks;
@@ -26,8 +29,11 @@ struct WebRTCCallbacks {
     std::function<bool(int)> onMonitorChange;
     std::function<void()> onDisconnect, onConnected;
     std::function<bool(CodecType)> onCodecChange;
+    std::function<bool(bool)> onSoftwareEncodeChange;
     std::function<CodecType()> getCodec;
     std::function<uint8_t()> getCodecCaps;
+    std::function<uint8_t()> getHostInfoFlags;
+    std::function<std::string()> getEncoderName;
     std::function<std::string()> getClipboard;
     std::function<bool(const std::string&)> setClipboard;
     std::function<void(bool)> onCursorCapture, onAudioEnable, onMicEnable;
@@ -75,9 +81,11 @@ class WebRTCServer {
     std::atomic<uint64_t> videoSent{0}, audioSent{0}, videoErr{0}, audioErr{0};
     std::atomic<uint64_t> ctrlSent{0}, ctrlRecv{0}, inputRecv{0}, micRecv{0}, connCount{0};
     std::atomic<uint64_t> peerEpoch{0};
+    std::atomic<bool> videoDrainActive_{false}, audioDrainActive_{false};
 
     bool SendCtrl(const void* d, size_t len);
     void SendHostInfo();
+    void SendEncoderInfo();
     void SendMonitorList();
     void SendCodecCaps();
     void SendVersion();

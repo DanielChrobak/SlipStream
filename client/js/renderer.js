@@ -1,6 +1,6 @@
 
 import { C, CURSOR_TYPES } from './constants.js';
-import { S, serverFrameAgeMs, recordRenderTime, logVideoDrop, log, safe } from './state.js';
+import { S, syncedServerTimestampAgeMs, recordRenderTime, recordVideoLatencySample, logVideoDrop, log, safe } from './state.js';
 
 export const canvas = document.querySelector('#c');
 export let canvasW = 0, canvasH = 0;
@@ -16,6 +16,8 @@ const gl = canvas?.getContext('webgl2', {
 
 let lastViewport = null;
 let hasValidTexture = false;
+let pendingPresentation = null;
+let presentationScheduled = false;
 const BG_COLOR = [0.039, 0.039, 0.043, 1];
 const updateSize = () => {
     const dpr = devicePixelRatio || 1;
@@ -188,7 +190,9 @@ const renderFrame = (frame, meta) => {
         gl.viewport(vp.x, vp.y, vp.w, vp.h);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
-    if (meta?.capTs) {
+    if (meta?.frameKey) {
+        S.frameMeta.delete(meta.frameKey);
+    } else if (meta?.capTs) {
         S.frameMeta.delete(meta.capTs);
     }
 
@@ -204,35 +208,88 @@ export const setCursorStyle = type => {
 export const resetCursorStyle = () => {
     canvas.style.cursor = 'default';
 };
-export const queueFrameForPresentation = entry => {
-    const now = performance.now();
+
+const closePresentationEntry = entry => {
+    if (!entry) return;
+    if (entry.meta?.frameKey) {
+        S.frameMeta.delete(entry.meta.frameKey);
+    } else if (entry.meta?.capTs) {
+        S.frameMeta.delete(entry.meta.capTs);
+    }
+    safe(() => entry.frame.close(), undefined, 'RENDER');
+};
+
+const presentQueuedFrame = displayTs => {
+    presentationScheduled = false;
+
+    const entry = pendingPresentation;
+    pendingPresentation = null;
+    if (!entry) return;
+
     const m = S.jitterMetrics;
-    const localAge = now - entry.queuedAt;
-    if (localAge > C.JITTER_MAX_AGE_MS) {
+    const queueAge = displayTs - entry.queuedAt;
+    if (queueAge > C.JITTER_MAX_AGE_MS) {
         m.framesDroppedLate++;
-        logVideoDrop('Frame too old', { ageMs: localAge.toFixed(2) });
-        safe(() => entry.frame.close(), undefined, 'RENDER');
+        logVideoDrop('Frame too old', { ageMs: queueAge.toFixed(2) }, { countDropped: false });
+        closePresentationEntry(entry);
+        if (pendingPresentation) {
+            presentationScheduled = true;
+            requestAnimationFrame(presentQueuedFrame);
+        }
         return;
     }
-    m.frameAgeSum += localAge;
-    m.frameAgeSamples++;
-    if (S.clockSync.valid && entry.serverCapTs) {
-        const serverAge = serverFrameAgeMs(entry.serverCapTs);
-        m.serverAgeSum += serverAge;
-        m.serverAgeSamples++;
+
+    if (entry.sourceTs && S.clockSync.valid) {
+        recordVideoLatencySample({
+            sourceCaptureMs: entry.meta?.capTs && entry.sourceTs ? Math.max(0, (entry.meta.capTs - entry.sourceTs) / 1000) : NaN,
+            captureEncodeMs: entry.meta?.encodeEndTs && entry.meta?.capTs ? Math.max(0, (entry.meta.encodeEndTs - entry.meta.capTs) / 1000) : NaN,
+            encodeSendMs: entry.meta?.enqueueTs && entry.meta?.encodeEndTs ? Math.max(0, (entry.meta.enqueueTs - entry.meta.encodeEndTs) / 1000) : NaN,
+            sendReceiveMs: entry.meta?.enqueueTs && Number.isFinite(entry.meta?.firstPacketMs)
+                ? syncedServerTimestampAgeMs(entry.meta.enqueueTs, entry.meta.firstPacketMs)
+                : NaN,
+            receiveAssembleMs: Number.isFinite(entry.meta?.firstPacketMs) && Number.isFinite(entry.meta?.reassemblyCompleteMs)
+                ? Math.max(0, entry.meta.reassemblyCompleteMs - entry.meta.firstPacketMs)
+                : NaN,
+            assembleDecodeMs: Number.isFinite(entry.meta?.reassemblyCompleteMs) && Number.isFinite(entry.meta?.decodeOutputMs)
+                ? Math.max(0, entry.meta.decodeOutputMs - entry.meta.reassemblyCompleteMs)
+                : NaN,
+            decodePresentMs: Number.isFinite(entry.meta?.decodeOutputMs)
+                ? Math.max(0, displayTs - entry.meta.decodeOutputMs)
+                : NaN,
+            e2eMs: syncedServerTimestampAgeMs(entry.sourceTs, displayTs)
+        });
     }
     if (m.lastPresentTs > 0) {
-        m.presentIntervals.push(now - m.lastPresentTs);
+        m.presentIntervals.push(displayTs - m.lastPresentTs);
         if (m.presentIntervals.length > C.JITTER_SAMPLES) {
             m.presentIntervals.shift();
         }
     }
-    m.lastPresentTs = now;
+    m.lastPresentTs = displayTs;
 
     renderFrame(entry.frame, entry.meta);
+
+    if (pendingPresentation) {
+        presentationScheduled = true;
+        requestAnimationFrame(presentQueuedFrame);
+    }
+};
+
+export const queueFrameForPresentation = entry => {
+    if (pendingPresentation) {
+        closePresentationEntry(pendingPresentation);
+    }
+    pendingPresentation = entry;
+    if (!presentationScheduled) {
+        presentationScheduled = true;
+        requestAnimationFrame(presentQueuedFrame);
+    }
 };
 export const resetRenderer = () => {
     S.jitterMetrics.lastPresentTs = 0;
+    closePresentationEntry(pendingPresentation);
+    pendingPresentation = null;
+    presentationScheduled = false;
     hasValidTexture = false;
     lastViewport = null;
     resetCursorStyle();

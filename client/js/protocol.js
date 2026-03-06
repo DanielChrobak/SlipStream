@@ -3,18 +3,22 @@ import { MSG, C } from './constants.js';
 import { S, mkBuf, safe, log, logNetworkDrop, clientTimeUs, bus } from './state.js';
 
 // --- Message helpers ---
-const sendControl = buf => {
-    if (S.dcControl?.readyState !== 'open') { logNetworkDrop('Control channel not open'); return false; }
+const sendControl = (buf, options = {}) => {
+    if (S.dcControl?.readyState !== 'open') {
+        if (!options.suppressIfClosed) logNetworkDrop('Control channel not open');
+        return false;
+    }
     return safe(() => { S.dcControl.send(buf); return true; }, false, 'NET');
 };
-const mkCtrlMsg = (type, size, fn) => sendControl(mkBuf(size, v => { v.setUint32(0, type, true); fn?.(v); }));
-const mkByte5Msg = (type, val) => mkCtrlMsg(type, 5, v => v.setUint8(4, val));
+const mkCtrlMsg = (type, size, fn, options) => sendControl(mkBuf(size, v => { v.setUint32(0, type, true); fn?.(v); }), options);
+const mkByte5Msg = (type, val, options) => mkCtrlMsg(type, 5, v => v.setUint8(4, val), options);
 
-export const sendAudioEnable = en => mkByte5Msg(MSG.AUDIO_ENABLE, en ? 1 : 0);
-export const sendMicEnable = en => mkByte5Msg(MSG.MIC_ENABLE, en ? 1 : 0);
+export const sendAudioEnable = (en, options) => mkByte5Msg(MSG.AUDIO_ENABLE, en ? 1 : 0, options);
+export const sendMicEnable = (en, options) => mkByte5Msg(MSG.MIC_ENABLE, en ? 1 : 0, options);
 export const sendMonitor = idx => mkByte5Msg(MSG.MONITOR_SET, idx);
-export const sendCursorCapture = en => mkByte5Msg(MSG.CURSOR_CAPTURE, en ? 1 : 0);
+export const sendCursorCapture = (en, options) => mkByte5Msg(MSG.CURSOR_CAPTURE, en ? 1 : 0, options);
 const sendCodec = id => mkByte5Msg(MSG.CODEC_SET, id);
+const sendSoftwareEncode = en => mkByte5Msg(MSG.SOFTWARE_ENCODE, en ? 1 : 0);
 const sendFps = (fps, mode) => mkCtrlMsg(MSG.FPS_SET, 7, v => { v.setUint16(4, fps, true); v.setUint8(6, mode); });
 
 export const sendPing = () => {
@@ -78,6 +82,14 @@ export const pushClipboardToHost = async () => {
 // --- Apply settings ---
 export const applyCodec = id => {
     if (sendCodec(id)) { S.currentCodec = id; S.codecSent = 1; log.info('NET', 'Codec set', { id }); }
+};
+
+export const applySoftwareEncode = enabled => {
+    if (sendSoftwareEncode(enabled)) {
+        log.info('NET', 'Software encode set', { enabled });
+        return true;
+    }
+    return false;
 };
 
 export const applyFps = val => {

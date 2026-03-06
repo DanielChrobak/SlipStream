@@ -1,10 +1,10 @@
 
 import { CODECS, CODEC_KEYS } from './constants.js';
 import { S, $, detectCodecs, subscribeToMetrics, safe, log, bus } from './state.js';
-import { toggleAudio } from './media.js';
+import { toggleAudio, initDecoder } from './media.js';
 import { setRelativeMouseMode } from './input.js';
 import { toggleMic, isMicSupported } from './mic.js';
-import { applyFps, sendMonitor, applyCodec } from './protocol.js';
+import { applyFps, sendMonitor, applyCodec, applySoftwareEncode } from './protocol.js';
 const loadEl = $('loadingOverlay');
 const statusEl = $('loadingStatus');
 const subStatusEl = $('loadingSubstatus');
@@ -39,6 +39,8 @@ const customFpsApply = $('customFpsApply');
 const STORAGE_KEYS = {
     FPS: 'slipstream_fps',
     CODEC: 'slipstream_codec',
+    SOFTWARE_ENCODE: 'slipstream_software_encode',
+    SOFTWARE_DECODE: 'slipstream_software_decode',
     TABBED: 'slipstream_tabbed_mode',
     STATS: 'slipstream_stats_overlay',
     CLIPBOARD: 'slipstream_clipboard_sync',
@@ -60,6 +62,22 @@ const savePref = (key, val) => {
 
 export const getStoredFps = () => loadPref(STORAGE_KEYS.FPS, v => v >= 1 && v <= 240, null);
 export const getStoredCodec = () => loadPref(STORAGE_KEYS.CODEC, v => v >= 0 && v <= 2, null) ?? defaultCodec ?? 0;
+export const getStoredSoftwareEncode = () => {
+    try {
+        return localStorage.getItem(STORAGE_KEYS.SOFTWARE_ENCODE) === 'true';
+    } catch (e) {
+        log.warn('UI', 'Failed to load software encode preference', { error: e.message });
+        return false;
+    }
+};
+export const getStoredSoftwareDecode = () => {
+    try {
+        return localStorage.getItem(STORAGE_KEYS.SOFTWARE_DECODE) === 'true';
+    } catch (e) {
+        log.warn('UI', 'Failed to load software decode preference', { error: e.message });
+        return false;
+    }
+};
 const togglePanel = show => {
     ['panel', 'backdrop', 'edge'].forEach(id => $(id).classList.toggle('on', show));
     log.debug('UI', 'Panel toggled', { show });
@@ -117,6 +135,7 @@ export const updateCodecDropdown = codecId => {
     if (codecSel.value !== codecId.toString()) {
         codecSel.value = codecId.toString();
     }
+    void refreshSoftwareDecodeToggle();
 };
 
 export const setHostCodecs = caps => {
@@ -144,19 +163,14 @@ export const updateCodecOpts = async () => {
     const { support } = await detectCodecs();
     const hostCaps = S.hostCodecs;
 
-    codecSel.innerHTML = Object.entries(CODECS).map(([key, codec]) => {
-        const k = key.toLowerCase();
-        const hasHw = support[k + 'Hw'];
-        const hostSupports = (hostCaps & (1 << codec.id)) !== 0;
-        const clientSupports = support[k];
+    const supportedCodecs = Object.values(CODECS).filter(codec => {
+        const key = CODEC_KEYS[codec.id];
+        return support[key] && (hostCaps & (1 << codec.id));
+    });
 
-        let suffix = !hostSupports ? ' (host n/a)'
-            : !clientSupports ? ' (unsupported)'
-            : hasHw ? ' (HW)' : ' (SW)';
-
-        const disabled = !(clientSupports && hostSupports);
-        return `<option value="${codec.id}" ${disabled ? 'disabled' : ''}>${codec.name}${suffix}</option>`;
-    }).join('');
+    codecSel.innerHTML = supportedCodecs.length
+        ? supportedCodecs.map(codec => `<option value="${codec.id}">${codec.name}</option>`).join('')
+        : '<option value="2">H.264</option>';
 
     const storedCodec = loadPref(STORAGE_KEYS.CODEC, v => v >= 0 && v <= 2, null);
     const preferred = storedCodec ?? defaultCodec ?? 0;
@@ -171,14 +185,99 @@ export const updateCodecOpts = async () => {
     }
 
     S.currentCodec = +codecSel.value;
+    void refreshSoftwareDecodeToggle();
 };
 
 codecSel.onchange = () => {
     const codec = +codecSel.value;
     savePref(STORAGE_KEYS.CODEC, codec);
+    void refreshSoftwareDecodeToggle();
     applyCodec(codec);
     log.info('UI', 'Codec changed', { codec });
 };
+const softwareEncodeBtn = $('softwareEncodeBtn');
+const softwareEncodeHint = $('softwareEncodeHint');
+let softwareEncodePreference = getStoredSoftwareEncode();
+const softwareDecodeBtn = $('softwareDecodeBtn');
+const softwareDecodeHint = $('softwareDecodeHint');
+let softwareDecodePreference = getStoredSoftwareDecode();
+
+const renderSoftwareEncodeToggle = () => {
+    if (!softwareEncodeBtn) return;
+
+    const enabled = S.softwareEncodeForced ? true : softwareEncodePreference;
+    softwareEncodeBtn.classList.toggle('on', enabled);
+    softwareEncodeBtn.disabled = !!S.softwareEncodeForced;
+
+    if (softwareEncodeHint) {
+        const forced = !!S.softwareEncodeForced;
+        softwareEncodeHint.textContent = forced ? 'Required because the host cannot use hardware encode for the active codec.' : '';
+        softwareEncodeHint.classList.toggle('visible', forced);
+    }
+};
+
+export const updateSoftwareEncodeState = ({ enabled, forced }) => {
+    S.softwareEncodeEnabled = enabled ? 1 : 0;
+    S.softwareEncodeForced = forced ? 1 : 0;
+    renderSoftwareEncodeToggle();
+    log.debug('UI', 'Software encode state updated', { enabled: !!enabled, forced: !!forced });
+};
+
+const renderSoftwareDecodeToggle = () => {
+    if (!softwareDecodeBtn) return;
+
+    const enabled = S.softwareDecodeForced ? true : softwareDecodePreference;
+    softwareDecodeBtn.classList.toggle('on', enabled);
+    softwareDecodeBtn.disabled = !!S.softwareDecodeForced;
+
+    if (softwareDecodeHint) {
+        const forced = !!S.softwareDecodeForced;
+        softwareDecodeHint.textContent = forced ? 'Required because this codec has no hardware decoder on the client.' : '';
+        softwareDecodeHint.classList.toggle('visible', forced);
+    }
+};
+
+const refreshSoftwareDecodeToggle = async () => {
+    const { support } = await detectCodecs();
+    const codecId = +codecSel.value || S.currentCodec || 0;
+    const codecKey = CODEC_KEYS[codecId];
+    const forced = codecKey ? !support[codecKey + 'Hw'] : false;
+    const previous = !!S.softwareDecodeEnabled;
+
+    S.softwareDecodeForced = forced ? 1 : 0;
+    S.softwareDecodeEnabled = (forced || softwareDecodePreference) ? 1 : 0;
+    renderSoftwareDecodeToggle();
+
+    if (previous !== !!S.softwareDecodeEnabled && S.decoder) {
+        await initDecoder(true);
+    }
+};
+
+if (softwareEncodeBtn) {
+    softwareEncodeBtn.onclick = () => {
+        if (S.softwareEncodeForced) return;
+        softwareEncodePreference = !softwareEncodePreference;
+        savePref(STORAGE_KEYS.SOFTWARE_ENCODE, softwareEncodePreference);
+        renderSoftwareEncodeToggle();
+        applySoftwareEncode(softwareEncodePreference);
+        log.info('UI', 'Software encode toggled', { enabled: softwareEncodePreference });
+    };
+
+    renderSoftwareEncodeToggle();
+}
+if (softwareDecodeBtn) {
+    softwareDecodeBtn.onclick = async () => {
+        if (S.softwareDecodeForced) return;
+        softwareDecodePreference = !softwareDecodePreference;
+        savePref(STORAGE_KEYS.SOFTWARE_DECODE, softwareDecodePreference);
+        S.softwareDecodeEnabled = softwareDecodePreference ? 1 : 0;
+        renderSoftwareDecodeToggle();
+        await initDecoder(true);
+        log.info('UI', 'Software decode toggled', { enabled: softwareDecodePreference });
+    };
+
+    renderSoftwareDecodeToggle();
+}
 monSel.onchange = () => {
     const idx = +monSel.value;
     sendMonitor(idx);
@@ -435,8 +534,9 @@ export const updateMonOpts = () => {
     log.debug('UI', 'Monitor options updated', { count: S.monitors.length });
 };
 const STATS_SCHEMA = [
-    { label: 'THROUGHPUT', rows: [['FPS', 'statsFps'], ['Bitrate', 'statsBitrate'], ['Resolution', 'statsResolution'], ['Codec', 'statsCodec']] },
-    { label: 'LATENCY', rows: [['RTT', 'statsRtt'], ['Frame Age', 'statsFrameAge']] },
+    { label: 'THROUGHPUT', rows: [['FPS', 'statsFps'], ['Bitrate', 'statsBitrate'], ['Resolution', 'statsResolution'], ['Codec', 'statsCodec'], ['Encode', 'statsEncode']] },
+    { label: 'LATENCY', rows: [['RTT', 'statsRtt'], ['Video E2E', 'statsE2e'], ['Sync +/-', 'statsSync']] },
+    { label: 'E2E STAGES', rows: [['Src->Cap', 'statsStageSourceCapture'], ['Cap->Enc', 'statsStageCaptureEncode'], ['Enc->Send', 'statsStageEncodeSend'], ['Send->Recv', 'statsStageSendReceive'], ['Rx->Asm', 'statsStageReceiveAssemble'], ['Asm->Dec', 'statsStageAssembleDecode'], ['Dec->Present', 'statsStageDecodePresent']] },
     { label: 'JITTER', rows: [['Interval', 'statsInterval'], ['Std Dev', 'statsStdDev']] },
     { label: 'DECODE', rows: [['Time', 'statsDecodeTime'], ['Queue', 'statsDecodeQueue'], ['HW Accel', 'statsHwAccel']] },
     { label: 'RENDER', rows: [['Time', 'statsRenderTime'], ['Frames', 'statsRenderFrames']] },
@@ -471,7 +571,7 @@ let statsEnabled = localStorage.getItem(STORAGE_KEYS.STATS) === 'true';
 let metricsUnsubscribe = null;
 
 const formatValue = (val, decimals = 2, suffix = '') =>
-    val > 0 ? `${val.toFixed(decimals)}${suffix}` : `--${suffix}`;
+    Number.isFinite(val) && val >= 0 ? `${val.toFixed(decimals)}${suffix}` : `--${suffix}`;
 
 const formatUptime = totalSeconds => {
     const sec = Math.max(0, Math.floor(totalSeconds || 0));
@@ -487,6 +587,14 @@ const formatUptime = totalSeconds => {
 };
 
 const CODEC_NAMES = ['AV1', 'H.265', 'H.264'];
+const getHostEncoderModeLabel = () => {
+    if (S.softwareEncodeForced) return 'SW forced';
+    return S.softwareEncodeEnabled ? 'SW' : 'HW';
+};
+const getHostEncoderDisplay = () => {
+    const mode = getHostEncoderModeLabel();
+    return S.hostEncoderName ? `${mode} (${S.hostEncoderName})` : mode;
+};
 
 const updateStats = data => {
     if (!statsEnabled) return;
@@ -497,14 +605,23 @@ const updateStats = data => {
         statsFps: `${computed.fps}/${computed.targetFps} (${computed.fpsEff.toFixed(0)}%)`,
         statsBitrate: `${computed.mbps} Mbps`,
         statsResolution: S.W > 0 ? `${S.W}x${S.H}` : '--x--',
-        statsCodec: `${CODEC_NAMES[S.currentCodec] || 'H.264'} (${S.hwAccel})`,
+        statsCodec: `${CODEC_NAMES[S.currentCodec] || 'H.264'}`,
+        statsEncode: getHostEncoderDisplay(),
         statsRtt: clock.valid ? formatValue(clock.rttMs, 1, ' ms') : '-- ms',
-        statsFrameAge: formatValue(jitter.avgServerAgeMs, 1, ' ms'),
+        statsE2e: formatValue(jitter.avgE2eLatencyMs, 1, ' ms'),
+        statsSync: clock.valid ? formatValue(clock.uncertaintyMs, 1, ' ms') : '-- ms',
+        statsStageSourceCapture: formatValue(jitter.avgSourceCaptureMs, 1, ' ms'),
+        statsStageCaptureEncode: formatValue(jitter.avgCaptureEncodeMs, 1, ' ms'),
+        statsStageEncodeSend: formatValue(jitter.avgEncodeSendMs, 1, ' ms'),
+        statsStageSendReceive: formatValue(jitter.avgSendReceiveMs, 1, ' ms'),
+        statsStageReceiveAssemble: formatValue(jitter.avgReceiveAssembleMs, 1, ' ms'),
+        statsStageAssembleDecode: formatValue(jitter.avgAssembleDecodeMs, 1, ' ms'),
+        statsStageDecodePresent: formatValue(jitter.avgDecodePresentMs, 1, ' ms'),
         statsInterval: formatValue(jitter.intervalMean, 1, ' ms'),
         statsStdDev: formatValue(jitter.intervalStdDev, 2, ' ms'),
         statsDecodeTime: formatValue(decode.avgDecodeTimeMs, 2, ' ms'),
         statsDecodeQueue: decode.maxQueueSize.toString(),
-        statsHwAccel: S.hwAccel || '--',
+        statsHwAccel: S.hwAccel ? `Decoder ${S.hwAccel}` : '--',
         statsRenderTime: formatValue(render.avgRenderTimeMs, 2, ' ms'),
         statsRenderFrames: render.renderCount.toString(),
         statsPackets: `${network.packetsReceived} (V:${network.videoPackets} A:${network.audioPackets})`,

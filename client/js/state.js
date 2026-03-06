@@ -33,8 +33,8 @@ export const safeAsync = async (fn, fallback, context = 'ASYNC') => {
         return fallback;
     }
 };
-export const logVideoDrop = (reason, data) => {
-    S.stats.framesDropped++;
+export const logVideoDrop = (reason, data, options = {}) => {
+    if (options.countDropped !== false) S.stats.framesDropped++;
     log.warn('VIDEO', `Drop: ${reason}`, { ...data, droppedTotal: S.stats.framesDropped });
 };
 
@@ -91,8 +91,16 @@ export const detectCodecs = async () => {
     return codecCache;
 };
 const mkClockSync = () => ({ offset: 0, offsetSamples: [], rttSamples: [], valid: 0, sampleCount: 0, avgRttUs: 0 });
-const mkJitter = () => ({ framesDroppedLate: 0, frameAgeSum: 0, frameAgeSamples: 0, presentIntervals: [],
-    lastPresentTs: 0, serverAgeSum: 0, serverAgeSamples: 0, avgFrameAgeMs: 0, avgServerAgeMs: 0,
+const mkJitter = () => ({ framesDroppedLate: 0, presentIntervals: [],
+    lastPresentTs: 0,
+    sourceCaptureSum: 0, sourceCaptureSamples: 0, avgSourceCaptureMs: 0,
+    captureEncodeSum: 0, captureEncodeSamples: 0, avgCaptureEncodeMs: 0,
+    encodeSendSum: 0, encodeSendSamples: 0, avgEncodeSendMs: 0,
+    sendReceiveSum: 0, sendReceiveSamples: 0, avgSendReceiveMs: 0,
+    receiveAssembleSum: 0, receiveAssembleSamples: 0, avgReceiveAssembleMs: 0,
+    assembleDecodeSum: 0, assembleDecodeSamples: 0, avgAssembleDecodeMs: 0,
+    decodePresentSum: 0, decodePresentSamples: 0, avgDecodePresentMs: 0,
+    e2eLatencySum: 0, e2eLatencySamples: 0, avgE2eLatencyMs: 0,
     intervalStdDev: 0, intervalMean: 0 });
 const mkStats = () => ({ bytes: 0, moves: 0, clicks: 0, keys: 0, framesComplete: 0, framesDropped: 0,
     framesTimeout: 0, keyframesReceived: 0, decodeErrors: 0, renderErrors: 0, lastUpdate: performance.now() });
@@ -113,6 +121,9 @@ export const S = {
     relativeMouseMode: 0, pointerLocked: 0, keyboardLockActive: 0,
     isReconnecting: 0, firstFrameReceived: 0,
     currentCodec: 1, codecSent: 0, hostCodecs: 0x07,
+    softwareEncodeEnabled: 0, softwareEncodeForced: 0,
+    softwareDecodeEnabled: 0, softwareDecodeForced: 0,
+    hostEncoderName: null,
     clipboardSyncEnabled: 0,
     chunks: new Map(), frameMeta: new Map(), lastFrameId: 0,
     stats: mkStats(), clockSync: mkClockSync(), jitterMetrics: mkJitter(),
@@ -132,9 +143,9 @@ export const bus = {
     emit(e, ...args) { (this._h[e] || []).forEach(fn => fn(...args)); }
 };
 
-export const serverFrameAgeMs = ts => {
+export const syncedServerTimestampAgeMs = (ts, clientNowMs = performance.now()) => {
     if (!S.clockSync.valid) return 0;
-    return Math.max(0, (clientTimeUs() - (ts - S.clockSync.offset)) / 1000);
+    return Math.max(0, ((Math.floor(clientNowMs * 1000) - (ts - S.clockSync.offset)) / 1000));
 };
 
 const median = arr => {
@@ -175,6 +186,7 @@ export const resetClockSync = () => {
 export const getClockSyncStats = () => ({
     offsetMs: S.clockSync.offset / 1000,
     rttMs: S.clockSync.avgRttUs / 1000,
+    uncertaintyMs: S.clockSync.valid ? S.clockSync.avgRttUs / 2000 : 0,
     samples: S.clockSync.sampleCount,
     valid: S.clockSync.valid
 });
@@ -187,8 +199,14 @@ export const resetStats = () => {
 
 export const resetJitterMetrics = () => {
     const m = S.jitterMetrics;
-    m.avgFrameAgeMs = m.frameAgeSamples > 0 ? m.frameAgeSum / m.frameAgeSamples : 0;
-    m.avgServerAgeMs = m.serverAgeSamples > 0 ? m.serverAgeSum / m.serverAgeSamples : 0;
+    m.avgSourceCaptureMs = m.sourceCaptureSamples > 0 ? m.sourceCaptureSum / m.sourceCaptureSamples : 0;
+    m.avgCaptureEncodeMs = m.captureEncodeSamples > 0 ? m.captureEncodeSum / m.captureEncodeSamples : 0;
+    m.avgEncodeSendMs = m.encodeSendSamples > 0 ? m.encodeSendSum / m.encodeSendSamples : 0;
+    m.avgSendReceiveMs = m.sendReceiveSamples > 0 ? m.sendReceiveSum / m.sendReceiveSamples : 0;
+    m.avgReceiveAssembleMs = m.receiveAssembleSamples > 0 ? m.receiveAssembleSum / m.receiveAssembleSamples : 0;
+    m.avgAssembleDecodeMs = m.assembleDecodeSamples > 0 ? m.assembleDecodeSum / m.assembleDecodeSamples : 0;
+    m.avgDecodePresentMs = m.decodePresentSamples > 0 ? m.decodePresentSum / m.decodePresentSamples : 0;
+    m.avgE2eLatencyMs = m.e2eLatencySamples > 0 ? m.e2eLatencySum / m.e2eLatencySamples : 0;
 
     if (m.presentIntervals.length > 1) {
         const mean = m.presentIntervals.reduce((a, b) => a + b, 0) / m.presentIntervals.length;
@@ -199,7 +217,14 @@ export const resetJitterMetrics = () => {
     }
 
     const result = {
-        avgFrameAgeMs: m.avgFrameAgeMs, avgServerAgeMs: m.avgServerAgeMs,
+        avgSourceCaptureMs: m.avgSourceCaptureMs,
+        avgCaptureEncodeMs: m.avgCaptureEncodeMs,
+        avgEncodeSendMs: m.avgEncodeSendMs,
+        avgSendReceiveMs: m.avgSendReceiveMs,
+        avgReceiveAssembleMs: m.avgReceiveAssembleMs,
+        avgAssembleDecodeMs: m.avgAssembleDecodeMs,
+        avgDecodePresentMs: m.avgDecodePresentMs,
+        avgE2eLatencyMs: m.avgE2eLatencyMs,
         intervalMean: m.intervalMean, intervalStdDev: m.intervalStdDev,
         framesDroppedLate: m.framesDroppedLate
     };
@@ -253,6 +278,24 @@ export const recordRenderTime = time => {
     S.renderMetrics.renderCount++;
     S.renderMetrics.renderTimeSum += time;
 };
+
+const addLatencySample = (metrics, sumKey, countKey, value) => {
+    if (!Number.isFinite(value) || value < 0) return;
+    metrics[sumKey] += value;
+    metrics[countKey]++;
+};
+
+export const recordVideoLatencySample = sample => {
+    const m = S.jitterMetrics;
+    addLatencySample(m, 'sourceCaptureSum', 'sourceCaptureSamples', sample.sourceCaptureMs);
+    addLatencySample(m, 'captureEncodeSum', 'captureEncodeSamples', sample.captureEncodeMs);
+    addLatencySample(m, 'encodeSendSum', 'encodeSendSamples', sample.encodeSendMs);
+    addLatencySample(m, 'sendReceiveSum', 'sendReceiveSamples', sample.sendReceiveMs);
+    addLatencySample(m, 'receiveAssembleSum', 'receiveAssembleSamples', sample.receiveAssembleMs);
+    addLatencySample(m, 'assembleDecodeSum', 'assembleDecodeSamples', sample.assembleDecodeMs);
+    addLatencySample(m, 'decodePresentSum', 'decodePresentSamples', sample.decodePresentMs);
+    addLatencySample(m, 'e2eLatencySum', 'e2eLatencySamples', sample.e2eMs);
+};
 let metricsSubs = [];
 let metricsInt = null;
 let uptime = 0, sesFrames = 0, sesBytes = 0, sesDrops = 0;
@@ -295,7 +338,7 @@ export const startMetricsLogger = () => {
 
         sesFrames += stats.framesComplete;
         sesBytes += stats.bytes;
-        sesDrops += stats.framesDropped + jitter.framesDroppedLate;
+        sesDrops += stats.framesDropped + stats.framesTimeout + jitter.framesDroppedLate + stats.decodeErrors;
 
         const fps = stats.framesComplete;
         const targetFps = S.currentFps || 60;

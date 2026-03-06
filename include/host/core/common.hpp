@@ -48,6 +48,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libswscale/swscale.h>
 }
 
 constexpr const char* SLIPSTREAM_VERSION = "1.0.0";

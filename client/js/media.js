@@ -116,13 +116,14 @@ export const initDecoder = async (force = false) => {
                 ts: frame.timestamp, w: frame.displayWidth, h: frame.displayHeight,
                 queueSize: S.decoder?.decodeQueueSize || 0
             });
+            if (meta) meta.decodeOutputMs = now;
 
             queueFrameForPresentation({
                 frame,
                 meta,
                 queuedAt: now,
                 timestamp: frame.timestamp,
-                serverCapTs: meta?.capTs || frame.timestamp
+                sourceTs: meta?.sourceTs || meta?.capTs || frame.timestamp
             });
         },
         error: e => {
@@ -141,7 +142,8 @@ export const initDecoder = async (force = false) => {
         }
     });
     let configured = false;
-    for (const [preferHw, label] of [[true, 'HW'], [false, 'SW']]) {
+    const decodeModes = S.softwareDecodeEnabled ? [[false, 'SW']] : [[true, 'HW'], [false, 'SW']];
+    for (const [preferHw, label] of decodeModes) {
         const config = {
             codec,
             optimizeForLatency: true,
@@ -159,7 +161,7 @@ export const initDecoder = async (force = false) => {
             decoder.configure(supported.config);
             S.hwAccel = label;
             configured = true;
-            log.info('MEDIA', 'Decoder configured', { codec, accel: label });
+            log.info('MEDIA', 'Decoder configured', { codec, accel: label, forcedSoftware: !!S.softwareDecodeEnabled });
             break;
         }
     }
@@ -223,6 +225,13 @@ export const decodeFrame = data => {
     }
     S.frameMeta.set(data.capTs, {
         capTs: data.capTs,
+        sourceTs: data.sourceTs || data.capTs,
+        encodeEndTs: data.encodeEndTs || 0,
+        enqueueTs: data.enqueueTs || 0,
+        firstPacketMs: data.firstPacketMs,
+        lastPacketMs: data.lastPacketMs,
+        reassemblyCompleteMs: data.reassemblyCompleteMs,
+        frameKey: data.capTs,
         decodeStartMs: performance.now(),
         arrivalMs: data.arrivalMs
     });
@@ -268,7 +277,7 @@ export const decodeFrame = data => {
             capTs: data.capTs, size: data.buf?.byteLength,
             decoderState: S.decoder?.state,
             queueSize: S.decoder?.decodeQueueSize || 0
-        });
+        }, { countDropped: false });
         S.stats.decodeErrors++;
         S.needKey = 1;
         S.ready = 1;
@@ -494,7 +503,7 @@ export const toggleAudio = async () => {
                 S.audioEnabled = 1;
                 btn.classList.add('on');
                 txt.textContent = 'Mute';
-                sendAudioEnable(1);
+                sendAudioEnable(1, { suppressIfClosed: true });
                 log.info('MEDIA', 'Audio enabled');
             } else {
                 log.error('MEDIA', 'Failed to enable audio');
@@ -507,7 +516,7 @@ export const toggleAudio = async () => {
         btn.classList.remove('on');
         txt.textContent = 'Enable';
         resetAudioState();
-        sendAudioEnable(0);
+        sendAudioEnable(0, { suppressIfClosed: true });
         log.info('MEDIA', 'Audio disabled');
     }
 };

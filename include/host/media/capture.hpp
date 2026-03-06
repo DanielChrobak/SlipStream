@@ -4,11 +4,12 @@
 struct FrameData {
     ID3D11Texture2D* tex = nullptr;
     int64_t ts = 0;
+    int64_t sourceTs = 0;
     uint64_t fence = 0;
     int poolIdx = -1;
     bool needsSync = false;
     uint64_t generation = 0;
-    void Release() { SafeRelease(tex); poolIdx = -1; needsSync = false; generation = 0; }
+    void Release() { SafeRelease(tex); ts = sourceTs = 0; poolIdx = -1; needsSync = false; generation = 0; }
 };
 
 class FrameSlot {
@@ -25,7 +26,7 @@ public:
     ~FrameSlot();
     void SetGeneration(uint64_t g) { curGen.store(g, std::memory_order_release); }
     [[nodiscard]] uint64_t GetGeneration() const { return curGen.load(std::memory_order_acquire); }
-    void Push(ID3D11Texture2D* tex, int64_t ts, uint64_t fence, bool sync, int idx = -1);
+    void Push(ID3D11Texture2D* tex, int64_t ts, int64_t sourceTs, uint64_t fence, bool sync, int idx = -1);
     bool Pop(FrameData& out);
     void Wake() { if (evt) SetEvent(evt); }
     void MarkReleased(int i);
