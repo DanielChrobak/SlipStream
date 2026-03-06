@@ -1,10 +1,10 @@
 # SlipStream
 
-Low-latency remote desktop streaming over WebRTC with hardware-accelerated encoding.
+Low-latency remote desktop streaming over WebRTC with hardware-first video encode and decode paths.
 
 ## Overview
 
-SlipStream captures the Windows desktop using the Windows Graphics Capture API and encodes frames in real-time using hardware encoders (NVIDIA NVENC, Intel QSV, or AMD AMF). Video and audio are streamed to web browsers via WebRTC data channels with encrypted DTLS transport provided by the browser/libdatachannel stack. The browser client renders frames using WebGL2 and decodes video/audio using the WebCodecs API. Bidirectional microphone support enables voice communication from the client to the server with automatic output-device fallback (VB-Cable preferred when available). The server runs as a system tray application with optional startup scheduling via a Windows scheduled task.
+SlipStream captures the Windows desktop with the Windows Graphics Capture API and encodes frames in real time with FFmpeg-backed encoder paths. It prefers hardware encoders on NVIDIA, Intel, and AMD GPUs, but can fall back to software encoders when the selected codec is not available in hardware. Video, system audio, control traffic, input, and microphone audio are carried over WebRTC data channels with DTLS transport from the browser/libdatachannel stack. The browser client renders decoded frames with WebGL2, uses WebCodecs for video and audio decode, supports software decode fallback when hardware decode is unavailable, and can send microphone audio upstream with WebCodecs AudioEncoder. The server runs as an elevated Windows tray application and can also be installed with a scheduled task for boot-time startup.
 
 ## Architecture
 
@@ -14,8 +14,8 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 +------------------------------------------------------------------------------+
 |  Screen Capture         Encoder             WebRTC              Audio        |
 |  +--------------+    +--------------+    +----------------+    +----------+  |
-|  | WGC API      |--->| NVENC/QSV/   |--->| Data Channel   |<-->| WASAPI   |  |
-|  | D3D11 Fence  |    | AMF          |    | libdatachannel |    | Opus     |  |
+|  | WGC API      |--->| HW + SW      |--->| Data Channel   |<-->| WASAPI   |  |
+|  | D3D11 Fence  |    | FFmpeg Enc   |    | libdatachannel |    | Opus     |  |
 |  | 6-tex pool   |    | AV1/H265/264 |    | 5 channels     |    | 96 kbps  |  |
 |  +--------------+    +--------------+    +----------------+    +----------+  |
 |                                                 |                  |         |
@@ -56,7 +56,7 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 | Component | Requirement |
 |-----------|-------------|
 | OS | Windows 10/11 64-bit |
-| GPU | NVIDIA (NVENC), Intel (QSV), or AMD (AMF) GPU |
+| GPU | NVIDIA, Intel, or AMD GPU recommended for hardware encode; software encode fallback is available |
 | IDE | Visual Studio 2022 with C++20 Desktop workload |
 | Package Manager | [vcpkg](https://github.com/microsoft/vcpkg) |
 | Microphone Output | VB-Cable optional (`CABLE Input` preferred), default render fallback supported |
@@ -65,8 +65,8 @@ SlipStream captures the Windows desktop using the Windows Graphics Capture API a
 
 | Component | Requirement |
 |-----------|-------------|
-| Browser | Modern browser with WebRTC DataChannel support |
-| APIs | WebRTC, WebCodecs (VideoDecoder, AudioDecoder, AudioEncoder for mic), WebGL2, AudioWorklet |
+| Browser | Modern browser with WebRTC DataChannel support; Chromium-based browsers are recommended for best WebCodecs coverage |
+| APIs | WebRTC, WebCodecs (VideoDecoder, AudioDecoder, AudioEncoder, AudioData), WebGL2, AudioWorklet, Clipboard API |
 
 ## Quick Start
 
@@ -107,6 +107,7 @@ On first run:
 - Saves hashed credentials to `%APPDATA%\SlipStream\auth.json`
 - Generates JWT secret to `%APPDATA%\SlipStream\jwt_secret.dat`
 - Creates log file at `%APPDATA%\SlipStream\slipstream.log`
+- Requests elevation on launch for capture/input features (`requireAdministrator` manifest)
 - Hides console to system tray
 
 ### 4. Connect
@@ -134,7 +135,6 @@ At startup, SlipStream prints:
 | ICE Candidate Pool | 4 |
 | Bundle Policy | max-bundle |
 | RTCP Mux Policy | require |
-| ICE Gathering Timeout | 300 ms |
 
 ### STUN Servers
 
@@ -238,7 +238,7 @@ The encoder automatically detects the GPU vendor and selects the appropriate enc
 | 0x8086 | Intel | QSV |
 | 0x1002 | AMD | AMF |
 
-If the primary GPU's encoder fails, the system falls back to other available encoders.
+If the primary GPU's encoder path fails, SlipStream probes other vendor-specific hardware encoders and then software encoders for the active codec.
 
 ### Encoding
 
@@ -248,16 +248,25 @@ If the primary GPU's encoder fails, the system falls back to other available enc
 | Intel | h264_qsv | hevc_qsv | av1_qsv |
 | AMD | h264_amf | hevc_amf | av1_amf |
 
+Software fallback encoders are also supported when available:
+
+| Codec | Software Fallback Order |
+|------|--------------------------|
+| H.264 | libx264 |
+| H.265 | libx265 |
+| AV1 | libsvtav1, libaom-av1, librav1e |
+
 #### NVIDIA NVENC Configuration
 
 | Setting | Value |
 |---------|-------|
-| Preset | P1 (fastest) |
+| Preset | P2 |
 | Tune | Ultra-low latency |
 | Rate Control | VBR |
-| CQ Level | 23 (H.264), 25 (H.265), 28 (AV1) |
+| CQ Level | Dynamic by codec / resolution / FPS (base 25 H.264, 28 H.265, 31 AV1) |
 | Zero Latency | Enabled |
-| B-Frames | 0 |
+| Lookahead | Disabled |
+| Surfaces | 3 |
 
 #### Intel QSV Configuration
 
@@ -267,31 +276,39 @@ If the primary GPU's encoder fails, the system falls back to other available enc
 | Look Ahead | Disabled |
 | Async Depth | 1 |
 | Low Power | Enabled |
-| Global Quality | 23 (H.264), 25 (H.265), 28 (AV1) |
+| Global Quality | Dynamic by codec / resolution / FPS (base 25 H.264, 28 H.265, 31 AV1) |
+| Forced IDR | Enabled |
 
 #### AMD AMF Configuration
 
 | Setting | Value |
 |---------|-------|
 | Usage | Ultra-low latency |
-| Quality | Speed |
+| Quality | Balanced |
 | Rate Control | VBR latency |
 | Header Insertion | GOP |
-| QP | 23 (H.264), 25 (H.265), 28 (AV1) |
+| QP | Dynamic by codec / resolution / FPS (base 25 H.264, 28 H.265, 31 AV1) |
 
-**Bitrate Formula:** `0.18085 × width × height × fps` bps
+**Bitrate Formula:** bitrate is codec-aware and uses an effective-FPS curve.
 
-Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
+- AV1: `max(6,000,000, 0.112 × width × height × effectiveFps)`
+- H.265: `max(6,000,000, 0.138 × width × height × effectiveFps)`
+- H.264: `max(6,000,000, 0.165 × width × height × effectiveFps)`
+
+`effectiveFps = fps` for `fps <= 60`, `60 + 2/3 × (fps - 60)` for `61-90`, and `80 + floor((fps - 90) / 3)` above 90 FPS.
+
+For all codecs, `maxrate` is clamped to at least the target bitrate and otherwise set to 115% of target bitrate.
 
 ### Transport
 
 | Parameter | Value |
 |-----------|-------|
-| Chunk Size | 1,400 bytes max (31-byte header + up to 1,369-byte payload) |
-| Header Size | 31 bytes |
+| Chunk Size | 1,400 bytes max |
+| Header Size | 55 bytes |
+| Data Payload | Up to 1,345 bytes per video packet |
 | Video Buffer | 256 KB threshold |
 | Max Queue | 2,048 packets (trimmed to 512 on overflow) |
-| Congestion Threshold | 256 packets |
+| Congestion Threshold | 256 queued packets or 128 KB buffered in the video data channel |
 | Delivery | Unordered, maxRetransmits=0 |
 
 ### Forward Error Correction (FEC)
@@ -299,25 +316,28 @@ Example: 1920×1080 @ 60fps ≈ 22.5 Mbps
 | Parameter | Value |
 |-----------|-------|
 | Algorithm | XOR parity per group |
-| Group Size (video) | 10 data chunks per parity packet |
+| Group Size (video) | 10 data chunks by default; 20 for larger non-keyframes when FEC remains enabled |
 | Recovery | Single missing chunk per group (client-side XOR reconstruction) |
-| Bypass | Skipped when queue ≥ 128 packets or buffered ≥ 128 KB |
+| Bypass | Skipped for non-keyframes when queue ≥ 128 packets, buffered ≥ 22,400 bytes, or chunk count ≥ 48 |
 
-### Video Packet Header (31 bytes)
+### Video Packet Header (55 bytes)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 8 | timestamp | Capture timestamp (microseconds) |
-| 8 | 4 | encodeTimeUs | Encode duration (microseconds) |
-| 12 | 4 | frameId | Frame sequence number |
-| 16 | 4 | frameSize | Encoded frame size in bytes |
-| 20 | 2 | chunkIndex | Chunk index (data: chunk number, FEC: group number) |
-| 22 | 2 | totalChunks | Number of data chunks |
-| 24 | 2 | chunkBytes | Payload bytes in this packet |
-| 26 | 2 | dataChunkSize | Nominal data-chunk size |
-| 28 | 1 | frameType | 1=keyframe, 0=delta |
-| 29 | 1 | packetType | 0=data, 1=FEC parity |
-| 30 | 1 | fecGroupSize | FEC group size (currently 10) |
+| 8 | 8 | sourceTimestamp | WGC source/compositor timestamp |
+| 16 | 8 | encodeEndTimestamp | Timestamp after encode completes |
+| 24 | 8 | enqueueTimestamp | Timestamp when packetization begins |
+| 32 | 4 | encodeTimeUs | Encode duration (microseconds) |
+| 36 | 4 | frameId | Frame sequence number |
+| 40 | 4 | frameSize | Encoded frame size in bytes |
+| 44 | 2 | chunkIndex | Chunk index (data: chunk number, FEC: group number) |
+| 46 | 2 | totalChunks | Number of data chunks |
+| 48 | 2 | chunkBytes | Payload bytes in this packet |
+| 50 | 2 | dataChunkSize | Nominal data-chunk size |
+| 52 | 1 | frameType | 1=keyframe, 0=delta |
+| 53 | 1 | packetType | 0=data, 1=FEC parity |
+| 54 | 1 | fecGroupSize | Effective FEC group size for this frame |
 
 ## Audio Pipeline (Server to Client)
 
@@ -514,12 +534,14 @@ Cursor types: 0=default, 1=text, 2=pointer, 3=wait, 4=progress, 5=crosshair, 6=m
 | Message | Magic | Size | Description |
 |---------|-------|------|-------------|
 | PING | 0x504E4750 | 16/24 | Clock synchronization |
-| HOST_INFO | 0x484F5354 | 6 | Host display refresh rate |
+| HOST_INFO | 0x484F5354 | 7 | Host display refresh rate plus host flags |
 | FPS_SET | 0x46505343 | 7 | Set target frame rate |
 | FPS_ACK | 0x46505341 | 7 | Frame rate acknowledgment |
 | CODEC_SET | 0x434F4443 | 5 | Set video codec |
 | CODEC_ACK | 0x434F4441 | 5 | Codec acknowledgment |
 | CODEC_CAPS | 0x434F4350 | 5 | Server codec capabilities bitmask |
+| SOFTWARE_ENCODE | 0x4E455753 | 5 | Enable or disable software encoding on the host |
+| ENCODER_INFO | 0x49434E45 | Variable | Active codec, host encode flags, and encoder name |
 | REQUEST_KEY | 0x4B455952 | 4 | Request keyframe |
 | MONITOR_LIST | 0x4D4F4E4C | Variable | Monitor enumeration |
 | MONITOR_SET | 0x4D4F4E53 | 5 | Switch monitor |
@@ -540,6 +562,13 @@ The server sends a bitmask indicating supported codecs:
 
 The client uses this to enable/disable codec options in the UI.
 
+### Host Flags
+
+`HOST_INFO` and `ENCODER_INFO` expose host-side encode state bits:
+
+- Bit 0 (`0x01`): software encoding currently active
+- Bit 1 (`0x02`): software encoding forced because the selected codec has no hardware encoder available
+
 ## WebRTC Data Channels
 
 | Channel | Ordered | MaxRetransmits | Purpose |
@@ -556,11 +585,11 @@ The client uses this to enable/disable codec options in the UI.
 |------|---------|
 | `constants.js` | Protocol message types, codec definitions, data channel configs, tuning constants |
 | `state.js` | Shared state, logging, codec detection, clock sync, metrics collection |
-| `network.js` | WebRTC signaling, data channel management, reconnection logic |
+| `network.js` | WebRTC signaling, data channel management, FEC handling, reconnection logic |
 | `renderer.js` | WebGL2 rendering with aspect ratio letterboxing |
-| `media.js` | VideoDecoder, AudioDecoder, AudioWorklet plumbing |
+| `media.js` | VideoDecoder, AudioDecoder, keyframe retry, and AudioWorklet plumbing |
 | `input.js` | Mouse/keyboard capture, RAF batching, pointer lock |
-| `ui.js` | Settings panel, fullscreen, tabbed mode, stats overlay |
+| `ui.js` | Settings panel, fullscreen, software encode/decode toggles, tabbed mode, stats overlay |
 | `mic.js` | Microphone capture, AudioEncoder, packet transmission |
 | `auth.js` | Authentication flow, session validation, login/logout UI |
 | `protocol.js` | Message construction, keyframe throttling, FEC recovery, adaptive quality |
@@ -618,6 +647,8 @@ Access by clicking the right edge of the screen:
 - **Monitor** - Switch between displays
 - **Frame Rate** - 15/30/60/120/144 or custom (1-240)
 - **Codec** - AV1, H.265, or H.264 (shows HW/SW status and host availability)
+- **Software Encode** - Prefer software encoding on the host when available; forced on when hardware encode is unavailable for the active codec
+- **Software Decode** - Prefer software decoding on the client; forced on when the browser lacks hardware decode for the active codec
 - **Tabbed Mode** - Monitor tabs at top of screen
 - **Debug Stats** - Real-time performance overlay
 - **Relative Mouse** - Pointer lock mode for gaming
@@ -637,7 +668,8 @@ Real-time metrics display organized into sections:
 
 | Section | Metrics |
 |---------|---------|
-| Throughput | FPS (actual/target with efficiency %), bitrate, resolution, codec (with HW/SW indicator) |
+| Throughput | FPS (actual/target with efficiency %), bitrate, resolution, codec |
+| Encode | Active host encode mode and encoder name |
 | Latency | RTT, frame age |
 | Jitter | Frame interval mean and standard deviation |
 | Decode | Average decode time, queue size, HW acceleration status |
@@ -689,7 +721,7 @@ Process priority class: `ABOVE_NORMAL_PRIORITY_CLASS`
 | `d3d_sync.hpp` | D3D11 fence synchronization (ID3D11Fence) |
 | `audio_resampler.hpp` | Speex-based audio resampler |
 | `capture.hpp` | Screen capture with WGC, texture pool, frame slot |
-| `encoder.hpp` | Hardware video encoding via FFmpeg (NVENC/QSV/AMF) |
+| `encoder.hpp` | Video encoding via FFmpeg (hardware-first with software fallback) |
 | `webrtc.hpp` | WebRTC server, data channels, packet headers |
 | `audio.hpp` | WASAPI audio capture + Opus encoding, mic playback |
 | `input.hpp` | Input handling, keyboard/mouse injection, clipboard |
@@ -706,9 +738,11 @@ Managed via vcpkg (`vcpkg.json`):
 | nlohmann-json | JSON parsing |
 | opus | Audio encoding/decoding |
 | openssl | Cryptography, SSL/TLS |
-| ffmpeg[nvcodec,avcodec] | Video encoding |
+| ffmpeg[nvcodec,avcodec] | Hardware and software video encoding support |
 | jwt-cpp | JWT token handling |
 | speexdsp | Audio resampling |
+
+The build also links FFmpeg's `avutil` and `swscale` components for frame handling and software encode paths.
 
 ## Building
 
@@ -724,6 +758,8 @@ cmake --build build --config Release --target SlipStream
 ```batch
 build\bin\Release\SlipStream.exe
 ```
+
+The executable is built with a `requireAdministrator` manifest, so Windows will prompt for elevation when it starts.
 
 ### Installer Build
 
@@ -776,7 +812,7 @@ SlipStream/
 │       │   └── input.hpp         # Input handling + clipboard
 │       ├── media/
 │       │   ├── capture.hpp       # Screen capture with WGC
-│       │   ├── encoder.hpp       # Hardware video encoding (NVENC/QSV/AMF)
+│       │   ├── encoder.hpp       # Video encoding (hardware-first with software fallback)
 │       │   └── audio.hpp         # WASAPI audio capture + Opus + mic playback
 │       └── net/
 │           └── webrtc.hpp        # WebRTC server declarations
@@ -803,9 +839,9 @@ SlipStream/
 │   └── js/
 │       ├── constants.js          # Protocol constants, codec definitions
 │       ├── state.js              # Shared state and metrics
-│       ├── network.js            # WebRTC and HTTP
+│       ├── network.js            # WebRTC signaling, protocol, and reconnection
 │       ├── renderer.js           # WebGL2 rendering
-│       ├── media.js              # Video/audio decoding
+│       ├── media.js              # Video/audio decoding and playback pipeline
 │       ├── input.js              # Input capture
 │       ├── ui.js                 # UI controls
 │       ├── mic.js                # Microphone capture and encoding
@@ -837,24 +873,27 @@ If VB-Cable is not installed, SlipStream falls back to the default audio render 
 | Problem | Solution |
 |---------|----------|
 | vcpkg not found | Set `VCPKG_ROOT` environment variable or install to `C:\vcpkg` |
-| No hardware encoder | Ensure FFmpeg hardware codec path and supported NVIDIA/Intel/AMD encoder are available |
+| No hardware encoder | SlipStream can fall back to software encode for supported codecs; expect higher CPU usage and lower headroom |
 | Connection refused | Check firewall for TCP 443 and UDP 50000-50020 |
 | Black screen | Wait for keyframe; verify codec compatibility and channel readiness |
 | No audio | Click "Enable" in settings panel after connecting |
-| Mic not working | Ensure browser has microphone permission; confirm WebCodecs AudioEncoder support |
+| Mic not working | Ensure browser has microphone permission and supports `AudioEncoder` plus `AudioData` |
 | Input not working | Click the video canvas to capture input focus |
 | Certificate warning | Expected with self-signed certificate, click proceed |
 | Kicked message | Another client connected (single client only) |
 | Monitor switch issues | Frames from previous monitor generations are automatically discarded |
-| Codec grayed out | Either client browser or server encoder path does not support that codec |
+| Codec grayed out | Either the client browser or the host encoder probe does not support that codec |
+| Software encode forced | The selected codec has no hardware encoder path on the host |
+| Software decode forced | The browser has no hardware decoder for the selected codec |
 
 ## Known Limitations
 
 - Windows server only
 - Single client connection (new client kicks existing)
-- Hardware GPU encoding path required for video
 - No custom cursor bitmap sync (standard cursor type sync only)
-- WebCodecs AudioEncoder required in browser for client microphone uplink
+- WebGL2 and WebCodecs are required on the client
+- Client microphone uplink requires browser support for `AudioEncoder` and `AudioData`
+- Software encode and decode fallbacks work, but they increase CPU load and can reduce latency headroom
 
 ## Data Storage
 
@@ -875,16 +914,18 @@ All persistent data is stored in `%APPDATA%\SlipStream\`:
 The server probes for encoder support on startup:
 1. Detects primary GPU vendor (NVIDIA/Intel/AMD)
 2. Tests each codec (AV1, H.265, H.264) with the vendor's encoder
-3. Falls back to other vendors if primary fails
-4. Sends codec capabilities bitmask to client
+3. Falls back to other hardware vendors if the detected vendor path is unavailable
+4. Falls back to software encoders when no hardware path is available for a codec
+5. Sends codec capabilities, host flags, and active encoder information to the client
 
 ### Client-Side
 
 The client automatically detects codec support on connection:
 1. Tests hardware acceleration for each codec (AV1, H.265, H.264)
-2. Falls back to software decoding if hardware unavailable
-3. Intersects with server capabilities to determine available options
-4. Displays HW/SW status and availability in codec dropdown
+2. Falls back to software decoding when hardware decode is unavailable or user-selected
+3. Intersects browser support with server codec capabilities
+4. Forces software decode when the selected codec has no hardware decoder in the browser
+5. Surfaces codec availability plus software encode/decode state in the UI
 
 ## License
 
