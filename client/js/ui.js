@@ -1,10 +1,10 @@
 
 import { CODECS, CODEC_KEYS } from './constants.js';
 import { S, $, detectCodecs, subscribeToMetrics, safe, log, bus } from './state.js';
-import { toggleAudio, initDecoder } from './media.js';
+import { toggleAudio } from './media.js';
 import { setRelativeMouseMode } from './input.js';
 import { toggleMic, isMicSupported } from './mic.js';
-import { applyFps, sendMonitor, applyCodec, applySoftwareEncode } from './protocol.js';
+import { applyFps, sendMonitor, applyCodec } from './protocol.js';
 const loadEl = $('loadingOverlay');
 const statusEl = $('loadingStatus');
 const subStatusEl = $('loadingSubstatus');
@@ -39,8 +39,6 @@ const customFpsApply = $('customFpsApply');
 const STORAGE_KEYS = {
     FPS: 'slipstream_fps',
     CODEC: 'slipstream_codec',
-    SOFTWARE_ENCODE: 'slipstream_software_encode',
-    SOFTWARE_DECODE: 'slipstream_software_decode',
     TABBED: 'slipstream_tabbed_mode',
     STATS: 'slipstream_stats_overlay',
     CLIPBOARD: 'slipstream_clipboard_sync',
@@ -62,22 +60,6 @@ const savePref = (key, val) => {
 
 export const getStoredFps = () => loadPref(STORAGE_KEYS.FPS, v => v >= 1 && v <= 240, null);
 export const getStoredCodec = () => loadPref(STORAGE_KEYS.CODEC, v => v >= 0 && v <= 2, null) ?? defaultCodec ?? 0;
-export const getStoredSoftwareEncode = () => {
-    try {
-        return localStorage.getItem(STORAGE_KEYS.SOFTWARE_ENCODE) === 'true';
-    } catch (e) {
-        log.warn('UI', 'Failed to load software encode preference', { error: e.message });
-        return false;
-    }
-};
-export const getStoredSoftwareDecode = () => {
-    try {
-        return localStorage.getItem(STORAGE_KEYS.SOFTWARE_DECODE) === 'true';
-    } catch (e) {
-        log.warn('UI', 'Failed to load software decode preference', { error: e.message });
-        return false;
-    }
-};
 const togglePanel = show => {
     ['panel', 'backdrop', 'edge'].forEach(id => $(id).classList.toggle('on', show));
     log.debug('UI', 'Panel toggled', { show });
@@ -135,7 +117,6 @@ export const updateCodecDropdown = codecId => {
     if (codecSel.value !== codecId.toString()) {
         codecSel.value = codecId.toString();
     }
-    void refreshSoftwareDecodeToggle();
 };
 
 export const setHostCodecs = caps => {
@@ -185,99 +166,14 @@ export const updateCodecOpts = async () => {
     }
 
     S.currentCodec = +codecSel.value;
-    void refreshSoftwareDecodeToggle();
 };
 
 codecSel.onchange = () => {
     const codec = +codecSel.value;
     savePref(STORAGE_KEYS.CODEC, codec);
-    void refreshSoftwareDecodeToggle();
     applyCodec(codec);
     log.info('UI', 'Codec changed', { codec });
 };
-const softwareEncodeBtn = $('softwareEncodeBtn');
-const softwareEncodeHint = $('softwareEncodeHint');
-let softwareEncodePreference = getStoredSoftwareEncode();
-const softwareDecodeBtn = $('softwareDecodeBtn');
-const softwareDecodeHint = $('softwareDecodeHint');
-let softwareDecodePreference = getStoredSoftwareDecode();
-
-const renderSoftwareEncodeToggle = () => {
-    if (!softwareEncodeBtn) return;
-
-    const enabled = S.softwareEncodeForced ? true : softwareEncodePreference;
-    softwareEncodeBtn.classList.toggle('on', enabled);
-    softwareEncodeBtn.disabled = !!S.softwareEncodeForced;
-
-    if (softwareEncodeHint) {
-        const forced = !!S.softwareEncodeForced;
-        softwareEncodeHint.textContent = forced ? 'Required because the host cannot use hardware encode for the active codec.' : '';
-        softwareEncodeHint.classList.toggle('visible', forced);
-    }
-};
-
-export const updateSoftwareEncodeState = ({ enabled, forced }) => {
-    S.softwareEncodeEnabled = enabled ? 1 : 0;
-    S.softwareEncodeForced = forced ? 1 : 0;
-    renderSoftwareEncodeToggle();
-    log.debug('UI', 'Software encode state updated', { enabled: !!enabled, forced: !!forced });
-};
-
-const renderSoftwareDecodeToggle = () => {
-    if (!softwareDecodeBtn) return;
-
-    const enabled = S.softwareDecodeForced ? true : softwareDecodePreference;
-    softwareDecodeBtn.classList.toggle('on', enabled);
-    softwareDecodeBtn.disabled = !!S.softwareDecodeForced;
-
-    if (softwareDecodeHint) {
-        const forced = !!S.softwareDecodeForced;
-        softwareDecodeHint.textContent = forced ? 'Required because this codec has no hardware decoder on the client.' : '';
-        softwareDecodeHint.classList.toggle('visible', forced);
-    }
-};
-
-const refreshSoftwareDecodeToggle = async () => {
-    const { support } = await detectCodecs();
-    const codecId = +codecSel.value || S.currentCodec || 0;
-    const codecKey = CODEC_KEYS[codecId];
-    const forced = codecKey ? !support[codecKey + 'Hw'] : false;
-    const previous = !!S.softwareDecodeEnabled;
-
-    S.softwareDecodeForced = forced ? 1 : 0;
-    S.softwareDecodeEnabled = (forced || softwareDecodePreference) ? 1 : 0;
-    renderSoftwareDecodeToggle();
-
-    if (previous !== !!S.softwareDecodeEnabled && S.decoder) {
-        await initDecoder(true);
-    }
-};
-
-if (softwareEncodeBtn) {
-    softwareEncodeBtn.onclick = () => {
-        if (S.softwareEncodeForced) return;
-        softwareEncodePreference = !softwareEncodePreference;
-        savePref(STORAGE_KEYS.SOFTWARE_ENCODE, softwareEncodePreference);
-        renderSoftwareEncodeToggle();
-        applySoftwareEncode(softwareEncodePreference);
-        log.info('UI', 'Software encode toggled', { enabled: softwareEncodePreference });
-    };
-
-    renderSoftwareEncodeToggle();
-}
-if (softwareDecodeBtn) {
-    softwareDecodeBtn.onclick = async () => {
-        if (S.softwareDecodeForced) return;
-        softwareDecodePreference = !softwareDecodePreference;
-        savePref(STORAGE_KEYS.SOFTWARE_DECODE, softwareDecodePreference);
-        S.softwareDecodeEnabled = softwareDecodePreference ? 1 : 0;
-        renderSoftwareDecodeToggle();
-        await initDecoder(true);
-        log.info('UI', 'Software decode toggled', { enabled: softwareDecodePreference });
-    };
-
-    renderSoftwareDecodeToggle();
-}
 monSel.onchange = () => {
     const idx = +monSel.value;
     sendMonitor(idx);
@@ -587,14 +483,7 @@ const formatUptime = totalSeconds => {
 };
 
 const CODEC_NAMES = ['AV1', 'H.265', 'H.264'];
-const getHostEncoderModeLabel = () => {
-    if (S.softwareEncodeForced) return 'SW forced';
-    return S.softwareEncodeEnabled ? 'SW' : 'HW';
-};
-const getHostEncoderDisplay = () => {
-    const mode = getHostEncoderModeLabel();
-    return S.hostEncoderName ? `${mode} (${S.hostEncoderName})` : mode;
-};
+const getHostEncoderDisplay = () => S.hostEncoderName || '--';
 
 const updateStats = data => {
     if (!statsEnabled) return;

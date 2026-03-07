@@ -188,26 +188,23 @@ bool WebRTCServer::SendCtrl(const void* data, size_t byteCount) {
 }
 
 void WebRTCServer::SendHostInfo() {
-    uint8_t buf[7]{};
+    uint8_t buf[6]{};
     WritePod<uint32_t>(buf, MSG_HOST_INFO);
     WritePod<uint16_t>(buf + 4, static_cast<uint16_t>(callbacks_.getHostFps ? callbacks_.getHostFps() : 60));
-    buf[6] = callbacks_.getHostInfoFlags ? callbacks_.getHostInfoFlags() : 0;
     SendCtrl(buf, sizeof(buf));
 }
 
 void WebRTCServer::SendEncoderInfo() {
     const CodecType codec = callbacks_.getCodec ? callbacks_.getCodec() : CODEC_H264;
-    const uint8_t flags = callbacks_.getHostInfoFlags ? callbacks_.getHostInfoFlags() : 0;
     const std::string encoderName = callbacks_.getEncoderName ? callbacks_.getEncoderName() : std::string{};
     const size_t nameLen = std::min<size_t>(encoderName.size(), 64);
 
-    std::vector<uint8_t> buf(7 + nameLen);
+    std::vector<uint8_t> buf(6 + nameLen);
     WritePod<uint32_t>(buf.data(), MSG_ENCODER_INFO);
     buf[4] = static_cast<uint8_t>(codec);
-    buf[5] = flags;
-    buf[6] = static_cast<uint8_t>(nameLen);
+    buf[5] = static_cast<uint8_t>(nameLen);
     if (nameLen > 0) {
-        memcpy(buf.data() + 7, encoderName.data(), nameLen);
+        memcpy(buf.data() + 6, encoderName.data(), nameLen);
     }
     SendCtrl(buf.data(), buf.size());
 }
@@ -319,17 +316,6 @@ void WebRTCServer::HandleCtrl(const rtc::binary& message) {
                 bool accepted = !callbacks_.onCodecChange || callbacks_.onCodecChange(requestedCodec);
                 if (accepted) { curCodec = requestedCodec; needsKey = true; }
                 sendAckU8(MSG_CODEC_ACK, static_cast<uint8_t>(curCodec.load()));
-                SendHostInfo();
-                SendEncoderInfo();
-            }
-            break;
-
-        case MSG_SOFTWARE_ENCODE:
-            if (message.size() == 5) {
-                if (callbacks_.onSoftwareEncodeChange) {
-                    callbacks_.onSoftwareEncodeChange(static_cast<uint8_t>(message[4]) != 0);
-                }
-                needsKey = true;
                 SendHostInfo();
                 SendEncoderInfo();
             }

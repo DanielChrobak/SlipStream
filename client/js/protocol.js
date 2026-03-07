@@ -18,7 +18,6 @@ export const sendMicEnable = (en, options) => mkByte5Msg(MSG.MIC_ENABLE, en ? 1 
 export const sendMonitor = idx => mkByte5Msg(MSG.MONITOR_SET, idx);
 export const sendCursorCapture = (en, options) => mkByte5Msg(MSG.CURSOR_CAPTURE, en ? 1 : 0, options);
 const sendCodec = id => mkByte5Msg(MSG.CODEC_SET, id);
-const sendSoftwareEncode = en => mkByte5Msg(MSG.SOFTWARE_ENCODE, en ? 1 : 0);
 const sendFps = (fps, mode) => mkCtrlMsg(MSG.FPS_SET, 7, v => { v.setUint16(4, fps, true); v.setUint8(6, mode); });
 
 export const sendPing = () => {
@@ -82,15 +81,6 @@ export const pushClipboardToHost = async () => {
 // --- Apply settings ---
 export const applyCodec = id => {
     if (sendCodec(id)) { S.currentCodec = id; S.codecSent = 1; log.info('NET', 'Codec set', { id }); }
-};
-
-export const applySoftwareEncode = enabled => {
-    if (sendSoftwareEncode(enabled)) {
-        S.softwareEncodeSent = 1;
-        log.info('NET', 'Software encode set', { enabled });
-        return true;
-    }
-    return false;
 };
 
 export const applyFps = val => {

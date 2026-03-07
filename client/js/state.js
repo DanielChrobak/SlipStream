@@ -121,8 +121,6 @@ export const S = {
     relativeMouseMode: 0, pointerLocked: 0, keyboardLockActive: 0,
     isReconnecting: 0, firstFrameReceived: 0,
     currentCodec: 1, codecSent: 0, hostCodecs: 0x07,
-    softwareEncodeEnabled: 0, softwareEncodeForced: 0, softwareEncodeSent: 0,
-    softwareDecodeEnabled: 0, softwareDecodeForced: 0,
     hostEncoderName: null,
     clipboardSyncEnabled: 0,
     chunks: new Map(), frameMeta: new Map(), lastFrameId: 0,

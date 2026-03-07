@@ -142,7 +142,7 @@ export const initDecoder = async (force = false) => {
         }
     });
     let configured = false;
-    const decodeModes = S.softwareDecodeEnabled ? [[false, 'SW']] : [[true, 'HW'], [false, 'SW']];
+    const decodeModes = [[true, 'HW'], [false, 'SW']];
     for (const [preferHw, label] of decodeModes) {
         const config = {
             codec,
@@ -161,7 +161,7 @@ export const initDecoder = async (force = false) => {
             decoder.configure(supported.config);
             S.hwAccel = label;
             configured = true;
-            log.info('MEDIA', 'Decoder configured', { codec, accel: label, forcedSoftware: !!S.softwareDecodeEnabled });
+            log.info('MEDIA', 'Decoder configured', { codec, accel: label });
             break;
         }
     }

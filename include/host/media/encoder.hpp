@@ -55,7 +55,7 @@ public:
     [[nodiscard]] static const char* CodecName(CodecType c);
 
     VideoEncoder(int w, int h, int fps, ID3D11Device* d, ID3D11DeviceContext* c,
-                 ID3D11Multithread* m, CodecType cc=CODEC_AV1, bool preferSoftware=false);
+                 ID3D11Multithread* m, CodecType cc=CODEC_AV1);
     ~VideoEncoder();
 
     [[nodiscard]] GPUVendor GetVendor() const { return vendor; }

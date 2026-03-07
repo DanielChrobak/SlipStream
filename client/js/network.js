@@ -6,14 +6,13 @@ import { S, $, safe, updateClockOffset, resetClockSync,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log, bus } from './state.js';
 import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry } from './media.js';
 import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs,
-    updateLoadingStage, showLoading, hideLoading, getStoredCodec, getStoredSoftwareEncode, initCodecDetection,
-    updateSoftwareEncodeState,
+    updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection,
     getStoredFps, updateFpsDropdown, closeTabbedMode } from './ui.js';
 import { resetRenderer, setCursorStyle } from './renderer.js';
 import { stopMic } from './mic.js';
 import { showAuth, clearSession, validateSession } from './auth.js';
 import { sendPing, requestKeyframe, requestRecoveryKeyframe, clearPendingKeyReq,
-    applyCodec, applyFps, applySoftwareEncode, getMaxInFlightFrames, expectedChunkSize,
+    applyCodec, applyFps, getMaxInFlightFrames, expectedChunkSize,
     tryRecoverFrameGroup, resetProtocolState } from './protocol.js';
 
 const BASE_URL = location.origin;
@@ -357,30 +356,19 @@ const handleControl = async e => {
         return recordPacket(length, 'control');
     }
     if (msgType === MSG.HOST_INFO && length >= 6) {
-        const hostFlags = length >= 7 ? view.getUint8(6) : 0;
-        const softwareEncodeEnabled = (hostFlags & 0x01) !== 0;
-        const softwareEncodeForced = (hostFlags & 0x02) !== 0;
         S.hostFps = view.getUint16(4, true);
-        updateSoftwareEncodeState({ enabled: softwareEncodeEnabled, forced: softwareEncodeForced });
         if (!S.fpsSent) setTimeout(() => applyFps(getStoredFps() ?? 60), 50);
-        const softwareEncodePref = getStoredSoftwareEncode();
-        if (!S.softwareEncodeSent && !softwareEncodeForced && softwareEncodeEnabled !== softwareEncodePref) {
-            setTimeout(() => applySoftwareEncode(softwareEncodePref), 75);
-        }
         if (!hasConnection) { updateLoadingStage('Connected'); waitingFirstFrame = true; armFirstFrameWatchdog(); log.info('NET', 'Waiting for first frame', { seq: activeConnectSeq }); }
-        log.info('NET', 'Host info', { fps: S.hostFps, softwareEncodeEnabled, softwareEncodeForced });
+        log.info('NET', 'Host info', { fps: S.hostFps });
         return recordPacket(length, 'control');
     }
-    if (msgType === MSG.ENCODER_INFO && length >= 7) {
+    if (msgType === MSG.ENCODER_INFO && length >= 6) {
         const codecId = view.getUint8(4);
-        const encoderFlags = view.getUint8(5);
-        const nameLen = view.getUint8(6);
-        if (length >= 7 + nameLen && nameLen <= 64) {
-            S.hostEncoderName = nameLen > 0 ? TEXT_DECODER.decode(new Uint8Array(e.data, 7, nameLen)) : null;
+        const nameLen = view.getUint8(5);
+        if (length >= 6 + nameLen && nameLen <= 64) {
+            S.hostEncoderName = nameLen > 0 ? TEXT_DECODER.decode(new Uint8Array(e.data, 6, nameLen)) : null;
             log.info('NET', 'Host encoder info', {
                 codec: codecId,
-                software: (encoderFlags & 0x01) !== 0,
-                forced: (encoderFlags & 0x02) !== 0,
                 encoder: S.hostEncoderName || 'unknown'
             });
         }
@@ -668,7 +656,7 @@ const onAllChannelsOpen = async connectSeq => {
         seq: connectSeq, control: S.dcControl?.readyState, video: S.dcVideo?.readyState,
         audio: S.dcAudio?.readyState, input: S.dcInput?.readyState, mic: S.dcMic?.readyState
     });
-    S.fpsSent = S.codecSent = S.softwareEncodeSent = 0;
+    S.fpsSent = S.codecSent = 0;
     S.authenticated = 1;
     resetClockSync();
     resetSessionStats();
@@ -689,7 +677,7 @@ const onChannelClose = (connectSeq, label) => {
         log.warn('NET', 'Ignoring stale channel close callback', { seq: connectSeq, activeSeq: activeConnectSeq, label });
         return;
     }
-    S.fpsSent = S.codecSent = S.softwareEncodeSent = 0;
+    S.fpsSent = S.codecSent = 0;
     resetActiveSession();
 };
 
@@ -729,7 +717,7 @@ const resetState = () => {
     if (S.decoder && S.decoder.state !== 'closed') safe(() => S.decoder.close(), undefined, 'MEDIA');
     DC_KEYS.forEach(k => S[k] = null);
     S.pc = S.decoder = null;
-    S.ready = S.fpsSent = S.codecSent = S.softwareEncodeSent = waitingFirstFrame = 0;
+    S.ready = S.fpsSent = S.codecSent = waitingFirstFrame = 0;
     S.hostEncoderName = null;
     hasConnection = false;
     lastFrameCompletedAt = 0;

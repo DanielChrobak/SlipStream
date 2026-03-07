@@ -29,10 +29,8 @@ struct WebRTCCallbacks {
     std::function<bool(int)> onMonitorChange;
     std::function<void()> onDisconnect, onConnected;
     std::function<bool(CodecType)> onCodecChange;
-    std::function<bool(bool)> onSoftwareEncodeChange;
     std::function<CodecType()> getCodec;
     std::function<uint8_t()> getCodecCaps;
-    std::function<uint8_t()> getHostInfoFlags;
     std::function<std::string()> getEncoderName;
     std::function<std::string()> getClipboard;
     std::function<bool(const std::string&)> setClipboard;
@@ -117,7 +115,8 @@ public:
     [[nodiscard]] bool IsIceTcpEnabled() const { return rtcConfig_.enableIceTcp; }
 
     [[nodiscard]] bool IsStreaming() const { return conn && fpsRecv && chRdy == NUM_CH; }
-    [[nodiscard]] bool NeedsKey() { return needsKey.exchange(false); }
+    [[nodiscard]] bool NeedsKey() const { return needsKey.load(std::memory_order_acquire); }
+    void OnKeyframeSent() { needsKey.store(false, std::memory_order_release); }
     [[nodiscard]] bool IsCongested() const;
     [[nodiscard]] bool SendCursorShape(CursorType ct);
     [[nodiscard]] bool Send(const EncodedFrame& f);

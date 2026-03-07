@@ -377,6 +377,9 @@ std::thread StartEncoderThread(
                         auto* encoded = encoder->Encode(frame.tex, frame.ts, frame.sourceTs, forceKey);
                         if (encoded) {
                             if (webrtcServer->Send(*encoded)) {
+                                if (encoded->isKey) {
+                                    webrtcServer->OnKeyframeSent();
+                                }
                                 lastEncodeTs.store(frame.ts, std::memory_order_release);
                             } else {
                                 WARN("EncoderThread: WebRTC Send failed (ts=%lld, key=%d, size=%zu)",
@@ -722,9 +725,6 @@ int RunHostApp(int argc, char* argv[]) {
         std::unique_ptr<VideoEncoder> encoder;
         std::atomic<bool> encoderReady{false};
         std::atomic<CodecType> currentCodec{CODEC_AV1};
-        std::atomic<bool> softwareEncodeRequested{false};
-        std::atomic<bool> softwareEncodeEffective{false};
-        std::atomic<bool> softwareEncodeForced{false};
         std::mutex encoderInfoMutex;
         std::string activeEncoderName;
 
@@ -743,28 +743,19 @@ int RunHostApp(int argc, char* argv[]) {
         std::unique_ptr<MicPlayback> micPlayback;
         try { micPlayback = std::make_unique<MicPlayback>("CABLE Input"); } catch (...) { LOG("MicPlayback not available"); }
 
-        auto updateSoftwareEncodeState = [&](CodecType codec, bool requested, const VideoEncoder* activeEncoder) {
-            const bool hardwareAvailable = (hardwareCodecCaps & (1 << static_cast<int>(codec))) != 0;
-            const bool usingHardware = activeEncoder ? activeEncoder->IsUsingHardware() : hardwareAvailable;
-            const bool activeSoftware = !usingHardware;
-            const bool forced = !hardwareAvailable;
-            softwareEncodeEffective.store(activeSoftware, std::memory_order_release);
-            softwareEncodeForced.store(forced, std::memory_order_release);
+        auto updateEncoderInfo = [&](CodecType codec, const VideoEncoder* activeEncoder) {
+            const bool usingHardware = activeEncoder && activeEncoder->IsUsingHardware();
             {
                 std::lock_guard<std::mutex> lock(encoderInfoMutex);
                 activeEncoderName = activeEncoder ? activeEncoder->GetActiveEncoderName() : std::string{};
             }
-            LOG("Software encode state: requested=%d activeSoftware=%d forced=%d usingHardware=%d codec=%s encoder=%s",
-                requested ? 1 : 0,
-                activeSoftware ? 1 : 0,
-                forced ? 1 : 0,
+            LOG("Encoder state: usingHardware=%d codec=%s encoder=%s",
                 usingHardware ? 1 : 0,
                 VideoEncoder::CodecName(codec),
                 activeEncoder ? activeEncoder->GetActiveEncoderName().c_str() : "unknown");
         };
 
         auto createEncoder = [&](int width, int height, int fps, CodecType codec) {
-            const bool preferSoftware = softwareEncodeRequested.load(std::memory_order_acquire);
             auto nextEncoder = std::make_unique<VideoEncoder>(
                 width,
                 height,
@@ -772,10 +763,9 @@ int RunHostApp(int argc, char* argv[]) {
                 capture.GetDev(),
                 capture.GetCtx(),
                 capture.GetMT(),
-                codec,
-                preferSoftware);
+                codec);
             currentCodec.store(codec, std::memory_order_release);
-            updateSoftwareEncodeState(codec, preferSoftware, nextEncoder.get());
+            updateEncoderInfo(codec, nextEncoder.get());
             return nextEncoder;
         };
 
@@ -848,31 +838,8 @@ int RunHostApp(int argc, char* argv[]) {
                 lastEncodeTs.store(0, std::memory_order_release);
                 return true;
             },
-            [&](bool enabled) -> bool {
-                CodecType codec = currentCodec.load(std::memory_order_acquire);
-                const bool forced = (hardwareCodecCaps & (1 << static_cast<int>(codec))) == 0;
-                const bool requested = forced ? true : enabled;
-
-                if (softwareEncodeRequested.load(std::memory_order_acquire) == requested &&
-                    softwareEncodeForced.load(std::memory_order_acquire) == forced) {
-                    updateSoftwareEncodeState(codec, requested, encoder.get());
-                    return true;
-                }
-
-                softwareEncodeRequested.store(requested, std::memory_order_release);
-                if (!rebuildEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), codec)) return false;
-                lastEncodeTs.store(0, std::memory_order_release);
-                frameSlot.Wake();
-                return true;
-            },
             [&] { return currentCodec.load(std::memory_order_acquire); },
             [&] { return codecCaps; },
-            [&] {
-                uint8_t flags = 0;
-                if (softwareEncodeEffective.load(std::memory_order_acquire)) flags |= 0x01;
-                if (softwareEncodeForced.load(std::memory_order_acquire)) flags |= 0x02;
-                return flags;
-            },
             [&] {
                 std::lock_guard<std::mutex> lock(encoderInfoMutex);
                 return activeEncoderName;

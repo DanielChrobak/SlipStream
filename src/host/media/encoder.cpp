@@ -36,19 +36,11 @@ namespace {
     }
 
     inline int64_t CalcMaxRate(int64_t bitrate) {
-        return std::max<int64_t>(bitrate, (bitrate * 115) / 100);
+        return bitrate;
     }
 
     inline int CalcBufferSize(int64_t bitrate) {
-        return static_cast<int>(std::max<int64_t>(4'000'000, bitrate / 3));
-    }
-
-    inline int CalcQualityValue(CodecType codec, int w, int h, int fps) {
-        int value = codec == CODEC_H264 ? 25 : codec == CODEC_H265 ? 28 : 31;
-        if (fps > 90) value += 2;
-        else if (fps > 60) value += 1;
-        if (static_cast<int64_t>(w) * h >= 2560LL * 1440LL) value += 1;
-        return value;
+        return static_cast<int>(std::max<int64_t>(4'000'000, bitrate / 2));
     }
 
     inline const char* GetEncName(CodecType c, GPUVendor v) {
@@ -306,26 +298,24 @@ void VideoEncoder::Configure() {
     }
 
     DBG("VideoEncoder: Configuring for %s", VendorName(vendor));
-    const std::string qualityValue = std::to_string(CalcQualityValue(codec, w, h, curFps));
-    const char* quality = qualityValue.c_str();
 
     switch (vendor) {
         case GPUVendor::NVIDIA:
             set("preset", "p2"); set("tune", "ull"); set("zerolatency", "1");
-            set("rc-lookahead", "0"); set("rc", "vbr"); set("multipass", "disabled");
-            set("delay", "0"); set("surfaces", "3"); set("cq", quality);
+            set("rc-lookahead", "0"); set("rc", "cbr"); set("multipass", "disabled");
+            set("delay", "0"); set("surfaces", "3");
             set("no-scenecut", "1");
             if (codec != CODEC_AV1) { set("forced-idr", "1"); }
             break;
         case GPUVendor::INTEL:
             set("preset", "veryfast"); set("look_ahead", "0");
-            set("async_depth", "1"); set("low_power", "1"); set("global_quality", quality);
+            set("async_depth", "1"); set("low_power", "1"); set("low_delay_brc", "1");
             set("forced_idr", "1"); set("adaptive_i", "0"); set("adaptive_b", "0");
             break;
         case GPUVendor::AMD:
             set("usage", "ultralowlatency"); set("quality", "balanced");
-            set("rc", "vbr_latency"); set("header_insertion_mode", "gop");
-            set("enforce_hrd", "0"); set("qp_i", quality); set("qp_p", quality);
+            set("rc", "cbr"); set("header_insertion_mode", "gop");
+            set("enforce_hrd", "1");
             set("forced_idr", "1");
             break;
         default:
@@ -459,6 +449,7 @@ bool VideoEncoder::TryInitHardware(GPUVendor v, CodecType cc) {
     cctx->time_base = {1, curFps};
     cctx->framerate = {curFps, 1};
     cctx->bit_rate = br;
+    cctx->rc_min_rate = br;
     cctx->rc_max_rate = CalcMaxRate(br);
     cctx->rc_buffer_size = CalcBufferSize(br);
     cctx->gop_size = -1;
@@ -513,6 +504,7 @@ bool VideoEncoder::TryInitSoftware(CodecType cc) {
     cctx->time_base = {1, curFps};
     cctx->framerate = {curFps, 1};
     cctx->bit_rate = br;
+    cctx->rc_min_rate = br;
     cctx->rc_max_rate = CalcMaxRate(br);
     cctx->rc_buffer_size = CalcBufferSize(br);
     cctx->gop_size = -1;
@@ -576,9 +568,9 @@ bool VideoEncoder::DrainPackets(bool& gotKey) {
 }
 
 VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
-                           ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc, bool preferSoftware)
+                           ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc)
     : w(width), h(height), curFps(fps), dev(d), ctx(c), mt(m), codec(cc) {
-    LOG("VideoEncoder: Creating %dx%d @ %dfps, codec: %s, preferSoftware=%d", w, h, fps, CodecName(cc), preferSoftware ? 1 : 0);
+    LOG("VideoEncoder: Creating %dx%d @ %dfps, codec: %s", w, h, fps, CodecName(cc));
 
     dev->AddRef();
     if (ctx) ctx->AddRef(); else dev->GetImmediateContext(&ctx);
@@ -587,19 +579,11 @@ VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
     lastKey = steady_clock::now() - KEY_INT;
     sync.Init(dev, ctx);
 
-    if (!preferSoftware) {
-        for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
-            if (TryInitHardware(v, cc)) break;
-        }
+    for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
+        if (TryInitHardware(v, cc)) break;
     }
 
     if (!cctx) TryInitSoftware(cc);
-
-    if (!cctx && preferSoftware) {
-        for (GPUVendor v : GetVendorPriority(DetectGPU(dev))) {
-            if (TryInitHardware(v, cc)) break;
-        }
-    }
 
     if (!cctx) throw std::runtime_error("No encoder available for requested codec");
 
@@ -638,6 +622,7 @@ bool VideoEncoder::UpdateFPS(int fps) {
     if (fps == curFps || fps < 1 || fps > 240) return false;
     int64_t br = CalcBitrate(codec, w, h, fps);
     cctx->bit_rate = br;
+    cctx->rc_min_rate = br;
     cctx->rc_max_rate = CalcMaxRate(br);
     cctx->rc_buffer_size = CalcBufferSize(br);
     cctx->time_base = {1, fps};
