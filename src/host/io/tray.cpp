@@ -11,6 +11,38 @@ constexpr UINT IDM_TRAY_EXIT = 2002;
 
 HWND g_consoleWnd = nullptr;
 HWND g_trayWnd = nullptr;
+HICON g_smallIcon = nullptr;
+HICON g_bigIcon = nullptr;
+
+HICON LoadAppIcon(int width, int height) {
+    return reinterpret_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(1),
+        IMAGE_ICON,
+        width,
+        height,
+        0));
+}
+
+void ApplyConsoleWindowIcons() {
+    if (!g_consoleWnd) return;
+
+    if (!g_smallIcon) {
+        g_smallIcon = LoadAppIcon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    }
+    if (!g_bigIcon) {
+        g_bigIcon = LoadAppIcon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    }
+
+    if (g_smallIcon) {
+        SendMessageW(g_consoleWnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_smallIcon));
+        SetClassLongPtrW(g_consoleWnd, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(g_smallIcon));
+    }
+    if (g_bigIcon) {
+        SendMessageW(g_consoleWnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_bigIcon));
+        SetClassLongPtrW(g_consoleWnd, GCLP_HICON, reinterpret_cast<LONG_PTR>(g_bigIcon));
+    }
+}
 
 void RestoreFromTray() {
     if(!g_consoleWnd) return;
@@ -75,6 +107,7 @@ LRESULT CALLBACK TrayWindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam
 
 bool InitAppTray() {
     g_consoleWnd = GetConsoleWindow();
+    ApplyConsoleWindowIcons();
 
     const wchar_t* clsName = L"SlipStreamTrayWindowClass";
     WNDCLASSEXW wc{};
@@ -95,7 +128,7 @@ bool InitAppTray() {
         return false;
     }
 
-    HICON icon = reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    HICON icon = g_smallIcon ? g_smallIcon : reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
     if(!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
 
     NOTIFYICONDATAW nid{};
@@ -141,4 +174,13 @@ void CleanupAppTray() {
     Shell_NotifyIconW(NIM_DELETE, &nid);
     DestroyWindow(g_trayWnd);
     g_trayWnd = nullptr;
+
+    if (g_smallIcon) {
+        DestroyIcon(g_smallIcon);
+        g_smallIcon = nullptr;
+    }
+    if (g_bigIcon) {
+        DestroyIcon(g_bigIcon);
+        g_bigIcon = nullptr;
+    }
 }
