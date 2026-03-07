@@ -195,10 +195,10 @@ const handleKey = (e, down) => {
     if (!S.controlEnabled || isInputFocused()) return;
     e.preventDefault();
 
-    if (down && e.repeat) return;
+    const isRepeat = down && e.repeat;
 
     if (e.code === 'Escape') {
-        if (down) {
+        if (down && !isRepeat) {
             escapeDown = true;
             escapeDownAt = performance.now();
         } else {
@@ -225,7 +225,7 @@ const handleKey = (e, down) => {
         return;
     }
 
-    if (down) {
+    if (down && !isRepeat) {
         pressedKeys.set(e.code, vk);
     } else if (pressedKeys.has(e.code)) {
         vk = pressedKeys.get(e.code);
