@@ -239,26 +239,24 @@ const presentQueuedFrame = displayTs => {
         return;
     }
 
-    if (entry.sourceTs && S.clockSync.valid) {
-        recordVideoLatencySample({
-            sourceCaptureMs: entry.meta?.capTs && entry.sourceTs ? Math.max(0, (entry.meta.capTs - entry.sourceTs) / 1000) : NaN,
-            captureEncodeMs: entry.meta?.encodeEndTs && entry.meta?.capTs ? Math.max(0, (entry.meta.encodeEndTs - entry.meta.capTs) / 1000) : NaN,
-            encodeSendMs: entry.meta?.enqueueTs && entry.meta?.encodeEndTs ? Math.max(0, (entry.meta.enqueueTs - entry.meta.encodeEndTs) / 1000) : NaN,
-            sendReceiveMs: entry.meta?.enqueueTs && Number.isFinite(entry.meta?.firstPacketMs)
-                ? syncedServerTimestampAgeMs(entry.meta.enqueueTs, entry.meta.firstPacketMs)
-                : NaN,
-            receiveAssembleMs: Number.isFinite(entry.meta?.firstPacketMs) && Number.isFinite(entry.meta?.reassemblyCompleteMs)
-                ? Math.max(0, entry.meta.reassemblyCompleteMs - entry.meta.firstPacketMs)
-                : NaN,
-            assembleDecodeMs: Number.isFinite(entry.meta?.reassemblyCompleteMs) && Number.isFinite(entry.meta?.decodeOutputMs)
-                ? Math.max(0, entry.meta.decodeOutputMs - entry.meta.reassemblyCompleteMs)
-                : NaN,
-            decodePresentMs: Number.isFinite(entry.meta?.decodeOutputMs)
-                ? Math.max(0, displayTs - entry.meta.decodeOutputMs)
-                : NaN,
-            e2eMs: syncedServerTimestampAgeMs(entry.sourceTs, displayTs)
-        });
-    }
+    recordVideoLatencySample({
+        sourceCaptureMs: entry.meta?.capTs && entry.sourceTs ? Math.max(0, (entry.meta.capTs - entry.sourceTs) / 1000) : NaN,
+        captureEncodeMs: entry.meta?.encodeEndTs && entry.meta?.capTs ? Math.max(0, (entry.meta.encodeEndTs - entry.meta.capTs) / 1000) : NaN,
+        encodeSendMs: entry.meta?.enqueueTs && entry.meta?.encodeEndTs ? Math.max(0, (entry.meta.enqueueTs - entry.meta.encodeEndTs) / 1000) : NaN,
+        sendReceiveMs: S.clockSync.valid && entry.meta?.enqueueTs && Number.isFinite(entry.meta?.firstPacketMs)
+            ? syncedServerTimestampAgeMs(entry.meta.enqueueTs, entry.meta.firstPacketMs)
+            : NaN,
+        receiveAssembleMs: Number.isFinite(entry.meta?.firstPacketMs) && Number.isFinite(entry.meta?.reassemblyCompleteMs)
+            ? Math.max(0, entry.meta.reassemblyCompleteMs - entry.meta.firstPacketMs)
+            : NaN,
+        assembleDecodeMs: Number.isFinite(entry.meta?.reassemblyCompleteMs) && Number.isFinite(entry.meta?.decodeOutputMs)
+            ? Math.max(0, entry.meta.decodeOutputMs - entry.meta.reassemblyCompleteMs)
+            : NaN,
+        decodePresentMs: Number.isFinite(entry.meta?.decodeOutputMs)
+            ? Math.max(0, displayTs - entry.meta.decodeOutputMs)
+            : NaN,
+        e2eMs: entry.sourceTs && S.clockSync.valid ? syncedServerTimestampAgeMs(entry.sourceTs, displayTs) : NaN
+    });
     if (m.lastPresentTs > 0) {
         m.presentIntervals.push(displayTs - m.lastPresentTs);
         if (m.presentIntervals.length > C.JITTER_SAMPLES) {

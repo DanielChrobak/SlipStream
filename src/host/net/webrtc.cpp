@@ -431,7 +431,7 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
             missing.reserve(group.groupSize);
             for (uint32_t i = 0; i < group.groupSize; i++) {
                 uint32_t packetId = groupStart + i;
-                if (!group.dataPackets.contains(packetId)) missing.push_back(packetId);
+                    if (group.dataPackets.find(packetId) == group.dataPackets.end()) missing.push_back(packetId);
             }
 
             if (missing.size() != 1 || group.dataPackets.size() < static_cast<size_t>(group.groupSize - 1)) {
@@ -462,7 +462,7 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
         };
 
         if (header->packetType == PKT_DATA) {
-            if (micSeenPacketIds_.contains(header->packetId)) return;
+            if (micSeenPacketIds_.find(header->packetId) != micSeenPacketIds_.end()) return;
 
             micSeenPacketIds_.insert(header->packetId);
             if (micSeenPacketIds_.size() > 4096) {
@@ -484,7 +484,7 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
             auto recovered = tryRecoverGroup(groupStart, group);
             if (!recovered.empty()) {
                 const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
-                if (!micSeenPacketIds_.contains(recHeader->packetId)) {
+                if (micSeenPacketIds_.find(recHeader->packetId) == micSeenPacketIds_.end()) {
                     micSeenPacketIds_.insert(recHeader->packetId);
                     recoveredPacketToDeliver = std::move(recovered);
                     LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);
@@ -502,7 +502,7 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
             auto recovered = tryRecoverGroup(groupStart, group);
             if (!recovered.empty()) {
                 const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
-                if (!micSeenPacketIds_.contains(recHeader->packetId)) {
+                if (micSeenPacketIds_.find(recHeader->packetId) == micSeenPacketIds_.end()) {
                     micSeenPacketIds_.insert(recHeader->packetId);
                     recoveredPacketToDeliver = std::move(recovered);
                     LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);

@@ -81,6 +81,8 @@ foreach(F index.html styles.css)
     add_custom_command(TARGET SlipStream POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/client/${F} $<TARGET_FILE_DIR:SlipStream>/${F})
 endforeach()
 
+add_custom_command(TARGET SlipStream POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/SlipStream.ico $<TARGET_FILE_DIR:SlipStream>/SlipStream.ico)
+
 add_custom_command(TARGET SlipStream POST_BUILD COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:SlipStream>/js)
 
 foreach(F constants input media network renderer state ui mic auth protocol audio-worklet mic-worklet)
@@ -89,5 +91,6 @@ endforeach()
 
 install(TARGETS SlipStream RUNTIME DESTINATION .)
 install(FILES client/index.html client/styles.css DESTINATION .)
+install(FILES SlipStream.ico DESTINATION .)
 install(DIRECTORY client/js DESTINATION .)
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/Release/ DESTINATION . FILES_MATCHING PATTERN "*.dll")

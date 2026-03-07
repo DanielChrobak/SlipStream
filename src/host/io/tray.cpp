@@ -100,7 +100,7 @@ bool InitAppTray() {
 
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid); nid.hWnd = g_trayWnd; nid.uID = TRAY_ICON_ID;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = WM_TRAYICON; nid.hIcon = icon;
     wcscpy_s(nid.szTip, L"SlipStream");
 

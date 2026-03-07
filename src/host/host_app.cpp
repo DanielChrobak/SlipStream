@@ -155,6 +155,10 @@ void RegisterStaticRoutes(httplib::SSLServer& server) {
         response.set_content(LoadFile("styles.css"), "text/css");
     });
 
+    server.Get("/SlipStream.ico", [](auto&, auto& response) {
+        response.set_content(LoadFile("SlipStream.ico"), "image/x-icon");
+    });
+
     constexpr std::array<const char*, 12> kJsModules = {"constants", "input", "media", "network", "renderer", "state", "ui", "mic", "auth", "protocol", "audio-worklet", "mic-worklet"};
     for (const auto* module : kJsModules) {
         server.Get(std::string("/js/") + module + ".js", [module](auto&, auto& response) {

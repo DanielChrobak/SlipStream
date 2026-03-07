@@ -86,6 +86,7 @@ export const applyCodec = id => {
 
 export const applySoftwareEncode = enabled => {
     if (sendSoftwareEncode(enabled)) {
+        S.softwareEncodeSent = 1;
         log.info('NET', 'Software encode set', { enabled });
         return true;
     }

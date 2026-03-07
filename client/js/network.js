@@ -347,7 +347,7 @@ const handleControl = async e => {
         updateSoftwareEncodeState({ enabled: softwareEncodeEnabled, forced: softwareEncodeForced });
         if (!S.fpsSent) setTimeout(() => applyFps(getStoredFps() ?? 60), 50);
         const softwareEncodePref = getStoredSoftwareEncode();
-        if (!softwareEncodeForced && softwareEncodeEnabled !== softwareEncodePref) {
+        if (!S.softwareEncodeSent && !softwareEncodeForced && softwareEncodeEnabled !== softwareEncodePref) {
             setTimeout(() => applySoftwareEncode(softwareEncodePref), 75);
         }
         if (!hasConnection) { updateLoadingStage('Connected'); waitingFirstFrame = true; armFirstFrameWatchdog(); log.info('NET', 'Waiting for first frame', { seq: activeConnectSeq }); }
@@ -647,7 +647,7 @@ const onAllChannelsOpen = async connectSeq => {
         seq: connectSeq, control: S.dcControl?.readyState, video: S.dcVideo?.readyState,
         audio: S.dcAudio?.readyState, input: S.dcInput?.readyState, mic: S.dcMic?.readyState
     });
-    S.fpsSent = S.codecSent = 0;
+    S.fpsSent = S.codecSent = S.softwareEncodeSent = 0;
     S.authenticated = 1;
     resetClockSync();
     resetSessionStats();
@@ -665,7 +665,7 @@ const onChannelClose = (connectSeq, label) => {
         audio: S.dcAudio?.readyState, input: S.dcInput?.readyState, mic: S.dcMic?.readyState
     });
     if (connectSeq !== activeConnectSeq) log.warn('NET', 'Stale channel close callback', { seq: connectSeq, activeSeq: activeConnectSeq, label });
-    S.fpsSent = S.codecSent = 0;
+    S.fpsSent = S.codecSent = S.softwareEncodeSent = 0;
     clearPing();
     clearFirstFrameWatchdog();
     stopMetricsLogger();
@@ -711,7 +711,7 @@ const resetState = () => {
     if (S.decoder && S.decoder.state !== 'closed') safe(() => S.decoder.close(), undefined, 'MEDIA');
     DC_KEYS.forEach(k => S[k] = null);
     S.pc = S.decoder = null;
-    S.ready = S.fpsSent = S.codecSent = waitingFirstFrame = 0;
+    S.ready = S.fpsSent = S.codecSent = S.softwareEncodeSent = waitingFirstFrame = 0;
     S.hostEncoderName = null;
     hasConnection = false;
     lastFrameCompletedAt = 0;
