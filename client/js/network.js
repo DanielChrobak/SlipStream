@@ -1,7 +1,7 @@
 
 import { enableControl } from './input.js';
 import { MSG, C } from './constants.js';
-import { S, $, safe, safeAsync, updateClockOffset, resetClockSync,
+import { S, $, safe, updateClockOffset, resetClockSync,
     startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log, bus } from './state.js';
 import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry } from './media.js';
@@ -11,7 +11,7 @@ import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs,
     getStoredFps, updateFpsDropdown, closeTabbedMode } from './ui.js';
 import { resetRenderer, setCursorStyle } from './renderer.js';
 import { stopMic } from './mic.js';
-import { showAuth, hideAuth, clearSession, validateSession } from './auth.js';
+import { showAuth, clearSession, validateSession } from './auth.js';
 import { sendPing, requestKeyframe, requestRecoveryKeyframe, clearPendingKeyReq,
     applyCodec, applyFps, applySoftwareEncode, getMaxInFlightFrames, expectedChunkSize,
     tryRecoverFrameGroup, resetProtocolState } from './protocol.js';
@@ -28,6 +28,7 @@ let firstFrameWatchdog = null;
 let activeConnectAbort = null;
 let lastFrameCompletedAt = 0;
 const MAX_SERVER_BUSY_RETRIES = 5;
+const ICE_GATHER_WAIT_MS = 1500;
 const TEXT_DECODER = new TextDecoder();
 let lastChunkCleanupAt = 0;
 let lastPendingFecCleanupAt = 0;
@@ -37,6 +38,8 @@ const audioFecGroups = new Map();
 const seenAudioPacketIds = new Set();
 let lastAudioFecCleanupAt = 0;
 const pendingVideoFec = new Map();
+
+const hasPublicIceCandidate = sdp => sdp.includes(' typ srflx') || sdp.includes(' typ relay');
 
 const cleanupPendingVideoFec = now => {
     if (now - lastPendingFecCleanupAt < 100 && pendingVideoFec.size < 96) return;
@@ -171,6 +174,20 @@ const abortPendingConnect = reason => {
 const clearPing = () => { if (pingInterval) { clearInterval(pingInterval); pingInterval = null; } };
 
 const clearFirstFrameWatchdog = () => { if (firstFrameWatchdog) { clearTimeout(firstFrameWatchdog); firstFrameWatchdog = null; } };
+
+const clearConnectionTimers = () => {
+    clearPing();
+    clearFirstFrameWatchdog();
+};
+
+const resetActiveSession = () => {
+    clearConnectionTimers();
+    stopMetricsLogger();
+    resetRenderer();
+    stopKeyframeRetry();
+    channelsReady = 0;
+    stopMic();
+};
 
 const armFirstFrameWatchdog = () => {
     clearFirstFrameWatchdog();
@@ -643,6 +660,10 @@ const DC_CONFIG = [
 const closeDataChannels = () => { [...DC_KEYS, 'pc'].forEach(key => safe(() => S[key]?.close(), undefined, 'NET')); };
 
 const onAllChannelsOpen = async connectSeq => {
+    if (connectSeq !== activeConnectSeq) {
+        log.warn('NET', 'Ignoring stale all-channels-open callback', { seq: connectSeq, activeSeq: activeConnectSeq });
+        return;
+    }
     log.info('NET', 'All channels open', {
         seq: connectSeq, control: S.dcControl?.readyState, video: S.dcVideo?.readyState,
         audio: S.dcAudio?.readyState, input: S.dcInput?.readyState, mic: S.dcMic?.readyState
@@ -664,20 +685,23 @@ const onChannelClose = (connectSeq, label) => {
         control: S.dcControl?.readyState, video: S.dcVideo?.readyState,
         audio: S.dcAudio?.readyState, input: S.dcInput?.readyState, mic: S.dcMic?.readyState
     });
-    if (connectSeq !== activeConnectSeq) log.warn('NET', 'Stale channel close callback', { seq: connectSeq, activeSeq: activeConnectSeq, label });
+    if (connectSeq !== activeConnectSeq) {
+        log.warn('NET', 'Ignoring stale channel close callback', { seq: connectSeq, activeSeq: activeConnectSeq, label });
+        return;
+    }
     S.fpsSent = S.codecSent = S.softwareEncodeSent = 0;
-    clearPing();
-    clearFirstFrameWatchdog();
-    stopMetricsLogger();
-    resetRenderer();
-    stopKeyframeRetry();
-    channelsReady = 0;
-    stopMic();
+    resetActiveSession();
 };
 
 const setupDataChannel = (dc, onMessage, connectSeq) => {
     dc.binaryType = 'arraybuffer';
     dc.onopen = async () => {
+        if (connectSeq !== activeConnectSeq) {
+            log.warn('NET', 'Ignoring stale channel open callback', {
+                seq: connectSeq, activeSeq: activeConnectSeq, label: dc.label, state: dc.readyState
+            });
+            return;
+        }
         channelsReady++;
         log.info('NET', 'Channel open', { seq: connectSeq, activeSeq: activeConnectSeq, label: dc.label, ready: channelsReady, state: dc.readyState });
         if (channelsReady === 5) await onAllChannelsOpen(connectSeq);
@@ -691,19 +715,13 @@ const setupDataChannel = (dc, onMessage, connectSeq) => {
 const cleanup = () => {
     log.info('NET', 'Cleanup');
     abortPendingConnect('cleanup');
-    clearPing();
-    clearFirstFrameWatchdog();
+    resetActiveSession();
     clearPendingKeyReq();
-    stopMetricsLogger();
-    resetRenderer();
-    stopKeyframeRetry();
     resetClockSync();
     closeDataChannels();
     audioFecGroups.clear();
     seenAudioPacketIds.clear();
     pendingVideoFec.clear();
-    channelsReady = 0;
-    stopMic();
 };
 
 const resetState = () => {
@@ -784,6 +802,15 @@ const connect = async (serverBusyRetry = 0) => {
 
     pc.oniceconnectionstatechange = () => log.info('NET', 'ICE connection state', { seq: connectSeq, activeSeq: activeConnectSeq, state: pc.iceConnectionState });
     pc.onicegatheringstatechange = () => log.debug('NET', 'ICE gathering state', { seq: connectSeq, activeSeq: activeConnectSeq, state: pc.iceGatheringState });
+    pc.onicecandidateerror = event => log.warn('NET', 'ICE candidate error', {
+        seq: connectSeq,
+        activeSeq: activeConnectSeq,
+        address: event.address,
+        port: event.port,
+        url: event.url,
+        errorCode: event.errorCode,
+        errorText: event.errorText
+    });
     pc.onsignalingstatechange = () => log.info('NET', 'Signaling state', { seq: connectSeq, activeSeq: activeConnectSeq, state: pc.signalingState });
 
     DC_CONFIG.forEach(([key, name, config, handler]) => {
@@ -795,11 +822,22 @@ const connect = async (serverBusyRetry = 0) => {
     await pc.setLocalDescription(offer);
     await new Promise(resolve => {
         const done = () => { clearTimeout(timeout); attemptAbort.signal.removeEventListener('abort', done); resolve(); };
-        const timeout = setTimeout(done, 300);
+        const timeout = setTimeout(done, ICE_GATHER_WAIT_MS);
+        if (pc.iceGatheringState === 'complete') {
+            done();
+            return;
+        }
         pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') done(); });
         attemptAbort.signal.addEventListener('abort', done, { once: true });
     });
     ensureActive();
+
+    if (pc.localDescription?.sdp && !hasPublicIceCandidate(pc.localDescription.sdp)) {
+        log.warn('NET', 'Offer SDP has no srflx or relay candidate; direct WAN connectivity may require router port forwarding or ICE-TCP fallback', {
+            seq: connectSeq,
+            activeSeq: activeConnectSeq
+        });
+    }
 
     updateLoadingStage('Connecting...', 'Sending offer...');
     log.debug('NET', 'Sending offer', { seq: connectSeq });

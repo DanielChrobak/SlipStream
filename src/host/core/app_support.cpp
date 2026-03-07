@@ -155,7 +155,11 @@ bool IsPrivateIP(const std::string& ip) {
 
 std::string GetClientIP(const httplib::Request& req) {
     std::string remote = Trim(req.remote_addr);
-    if (!IsPrivateIP(remote)) return remote;
+    if (remote.empty()) return remote;
+
+    // Only trust forwarded headers when a local reverse proxy is in front of the app.
+    // Treat private LAN clients as direct peers so rate limiting cannot be bypassed.
+    if (remote != "127.0.0.1" && remote != "::1" && remote != "localhost") return remote;
 
     auto it = req.headers.find("X-Forwarded-For");
     if (it != req.headers.end() && !it->second.empty()) {

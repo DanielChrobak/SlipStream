@@ -3,6 +3,7 @@
     "version": "1.0.0",
     "dependencies": [
         "libdatachannel",
+        "miniupnpc",
         {"name": "cpp-httplib", "features": ["openssl"]},
         "nlohmann-json",
         "opus",

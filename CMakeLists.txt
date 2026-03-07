@@ -20,6 +20,8 @@ find_package(nlohmann_json REQUIRED)
 find_package(Opus REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(jwt-cpp CONFIG REQUIRED)
+find_path(MINIUPNPC_INCLUDE_DIR miniupnpc/miniupnpc.h)
+find_library(MINIUPNPC_LIBRARY miniupnpc)
 find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h)
 find_library(AVCODEC_LIBRARY avcodec)
 find_path(AVUTIL_INCLUDE_DIR libavutil/avutil.h)
@@ -34,6 +36,7 @@ set(SLIPSTREAM_SOURCES
     src/host/host_app.cpp
     src/host/core/common.cpp
     src/host/core/app_support.cpp
+    src/host/net/port_mapper.cpp
     src/host/net/webrtc.cpp
     src/host/io/tray.cpp
     src/host/media/audio.cpp
@@ -51,6 +54,7 @@ set(SLIPSTREAM_SOURCES
     include/host/io/tray.hpp
     include/host/media/capture.hpp
     include/host/media/encoder.hpp
+    include/host/net/port_mapper.hpp
     include/host/net/webrtc.hpp
     include/host/media/audio.hpp
     include/host/io/input.hpp
@@ -63,11 +67,11 @@ endif()
 add_executable(SlipStream ${SLIPSTREAM_SOURCES})
 
 target_compile_definitions(SlipStream PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-target_include_directories(SlipStream PRIVATE ${AVCODEC_INCLUDE_DIR} ${AVUTIL_INCLUDE_DIR} ${SWSCALE_INCLUDE_DIR} ${SPEEXDSP_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(SlipStream PRIVATE LibDataChannel::LibDataChannel httplib::httplib nlohmann_json::nlohmann_json Opus::opus OpenSSL::SSL OpenSSL::Crypto jwt-cpp::jwt-cpp ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY} ${SPEEXDSP_LIBRARY})
+target_include_directories(SlipStream PRIVATE ${MINIUPNPC_INCLUDE_DIR} ${AVCODEC_INCLUDE_DIR} ${AVUTIL_INCLUDE_DIR} ${SWSCALE_INCLUDE_DIR} ${SPEEXDSP_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(SlipStream PRIVATE LibDataChannel::LibDataChannel httplib::httplib nlohmann_json::nlohmann_json Opus::opus OpenSSL::SSL OpenSSL::Crypto jwt-cpp::jwt-cpp ${MINIUPNPC_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY} ${SPEEXDSP_LIBRARY})
 
 if(WIN32)
-    target_link_libraries(SlipStream PRIVATE ws2_32 d3d11 dxgi dxguid ole32 windowsapp)
+    target_link_libraries(SlipStream PRIVATE ws2_32 iphlpapi d3d11 dxgi dxguid ole32 windowsapp)
     target_compile_options(SlipStream PRIVATE /await:strict /EHsc /W4 /wd4100 /wd4189)
     target_link_options(SlipStream PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
     target_compile_definitions(SlipStream PRIVATE WINRT_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _CRT_SECURE_NO_WARNINGS)

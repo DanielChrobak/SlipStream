@@ -31,7 +31,7 @@ SlipStream captures the Windows desktop with the Windows Graphics Capture API an
 |                          +----------------------+----------------------+     |
 +---------------------------------------------+--------------------------------+
                                               |
-                          WebRTC (UDP 50000-50020)
+                          WebRTC (UDP/TCP 50000-50127)
                                               |
 +---------------------------------------------+--------------------------------+
 |                              CLIENT (Browser)                                |
@@ -126,13 +126,15 @@ At startup, SlipStream prints:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 443 | TCP | HTTPS server and WebRTC signaling |
-| 50000-50020 | UDP | WebRTC media transport |
+| 50000-50127 | UDP/TCP | WebRTC data transport, ICE checks, and ICE-TCP fallback |
+| 1900 | UDP (outbound) | UPnP SSDP discovery for automatic router mapping |
+| 5351 | UDP (outbound) | PCP/NAT-PMP mapping requests and lease renewals to the default gateway |
 
 ### ICE Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| ICE TCP | Disabled |
+| ICE TCP | Enabled on host as a fallback; UDP remains preferred |
 | ICE Candidate Pool | 4 |
 | Bundle Policy | max-bundle |
 | RTCP Mux Policy | require |
@@ -146,13 +148,30 @@ At startup, SlipStream prints:
 - `stun:stun4.l.google.com:19302`
 - `stun:stun.cloudflare.com:3478`
 - `stun:stun.services.mozilla.com:3478`
+- `stun:global.stun.twilio.com:3478`
+
+### NAT Traversal Notes
+
+SlipStream does not bundle a TURN server. For the best chance of direct WAN connectivity without TURN:
+
+- Prefer forwarding `UDP 50000-50127` to the host.
+- If either side is on a network that filters UDP aggressively, also forward `TCP 50000-50127` so ICE-TCP candidates can be reached.
+- SlipStream now attempts consumer-router auto-mapping on the host with `UPnP`, then `PCP`, then `NAT-PMP`.
+- Automatic mapping targets `TCP 443` for signaling, `UDP 50000-50127` for WebRTC, and `TCP 50000-50127` when ICE-TCP fallback is enabled.
+- Automatic mapping also sends outbound router-control traffic on `UDP 1900` for UPnP discovery and `UDP 5351` for PCP/NAT-PMP requests.
+- If you do not want SlipStream to create or renew router mappings automatically, set `SLIPSTREAM_ENABLE_PORT_MAPPING=0` before launch.
+- To change the requested router-mapping lease, set `SLIPSTREAM_PORTMAP_LEASE_SECONDS` to a value between `120` and `86400` before launch.
+- Manual forwarding is still useful when the router does not support these protocols, when the router blocks them by policy, or when you want a permanent mapping instead of a renewable lease.
 
 ### Firewall
 
 ```powershell
 netsh advfirewall firewall add rule name="SlipStream HTTPS" dir=in action=allow protocol=tcp localport=443
-netsh advfirewall firewall add rule name="SlipStream WebRTC" dir=in action=allow protocol=udp localport=50000-50020
+netsh advfirewall firewall add rule name="SlipStream WebRTC UDP" dir=in action=allow protocol=udp localport=50000-50127
+netsh advfirewall firewall add rule name="SlipStream WebRTC TCP" dir=in action=allow protocol=tcp localport=50000-50127
 ```
+
+If outbound firewalling is enabled on the host, also allow `UDP 1900` to the local network for UPnP discovery and `UDP 5351` to the default gateway for PCP/NAT-PMP.
 
 ## Security
 
@@ -876,7 +895,7 @@ If VB-Cable is not installed, SlipStream falls back to the default audio render 
 |---------|----------|
 | vcpkg not found | Set `VCPKG_ROOT` environment variable or install to `C:\vcpkg` |
 | No hardware encoder | SlipStream can fall back to software encode for supported codecs; expect higher CPU usage and lower headroom |
-| Connection refused | Check firewall for TCP 443 and UDP 50000-50020 |
+| Connection refused | Check firewall for TCP 443 and UDP/TCP 50000-50127 |
 | Black screen | Wait for keyframe; verify codec compatibility and channel readiness |
 | No audio | Click "Enable" in settings panel after connecting |
 | Mic not working | Ensure browser has microphone permission and supports `AudioEncoder` plus `AudioData` |

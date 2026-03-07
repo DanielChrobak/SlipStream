@@ -112,6 +112,9 @@ public:
     void Shutdown();
     std::string GetLocal();
     void SetRemote(const std::string& sdp, const std::string& type);
+    [[nodiscard]] uint16_t GetIcePortRangeBegin() const { return rtcConfig_.portRangeBegin; }
+    [[nodiscard]] uint16_t GetIcePortRangeEnd() const { return rtcConfig_.portRangeEnd; }
+    [[nodiscard]] bool IsIceTcpEnabled() const { return rtcConfig_.enableIceTcp; }
 
     [[nodiscard]] bool IsStreaming() const { return conn && fpsRecv && chRdy == NUM_CH; }
     [[nodiscard]] bool NeedsKey() { return needsKey.exchange(false); }

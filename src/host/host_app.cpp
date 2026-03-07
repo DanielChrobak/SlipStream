@@ -7,6 +7,7 @@
 #include "host/media/encoder.hpp"
 #include "host/io/input.hpp"
 #include "host/io/tray.hpp"
+#include "host/net/port_mapper.hpp"
 #include "host/net/webrtc.hpp"
 
 #include <array>
@@ -180,6 +181,42 @@ void RegisterAuthRoutes(httplib::SSLServer& server) {
     }));
 }
 
+void RegisterNetworkRoutes(httplib::SSLServer& server, const std::shared_ptr<PortMapper>& portMapper) {
+    server.Get("/api/network", AuthRequired([portMapper](const httplib::Request&, httplib::Response& response, const std::string&) {
+        if (!portMapper) {
+            response.set_content(json{{"portMapping", json{{"enabled", false}}}}.dump(), "application/json");
+            return;
+        }
+
+        const PortMappingStatus status = portMapper->GetStatus();
+        response.set_content(json{{"portMapping", {
+                {"enabled", status.enabled},
+                {"running", status.running},
+                {"active", status.active},
+                {"signalTcpMapped", status.signalTcpMapped},
+                {"webrtcUdpAvailable", status.webrtcUdpAvailable},
+                {"webrtcTcpAvailable", status.webrtcTcpAvailable},
+                {"httpsPort", status.httpsPort},
+                {"icePortBegin", status.icePortBegin},
+                {"icePortEnd", status.icePortEnd},
+                {"iceTcpEnabled", status.iceTcpEnabled},
+                {"requestedLeaseSeconds", status.requestedLeaseSeconds},
+                {"assignedLeaseSeconds", status.assignedLeaseSeconds},
+                {"requestedUdpPorts", status.requestedUdpPorts},
+                {"requestedTcpPorts", status.requestedTcpPorts},
+                {"mappedUdpPorts", status.mappedUdpPorts},
+                {"mappedTcpPorts", status.mappedTcpPorts},
+                {"failedUdpPorts", status.failedUdpPorts},
+                {"failedTcpPorts", status.failedTcpPorts},
+                {"method", status.method},
+                {"gatewayAddress", status.gatewayAddress},
+                {"localAddress", status.localAddress},
+                {"externalAddress", status.externalAddress},
+                {"lastError", status.lastError},
+            }}}.dump(), "application/json");
+    }));
+}
+
 void RegisterOfferRoute(httplib::SSLServer& server, const std::shared_ptr<WebRTCServer>& webrtcServer, OfferProcessingGate& offerGate) {
     server.Post("/api/offer", AuthRequired([&](const httplib::Request& request, httplib::Response& response, const std::string&) {
         if (request.body.size() > 65536) {
@@ -255,6 +292,10 @@ std::thread StartEncoderThread(
         auto freePending = [&] { frameSlot.MarkReleased(pendingFrame.poolIdx); pendingFrame.Release(); hasPendingFrame = false; };
         auto freeCurrent = [&] { frameSlot.MarkReleased(currentFrame.poolIdx); currentFrame.Release(); };
         auto promoteCurrent = [&] { pendingFrame = currentFrame; currentFrame = {}; hasPendingFrame = true; };
+        auto loadTargetFps = [&] {
+            int fps = targetFps.load(std::memory_order_acquire);
+            return fps > 0 ? fps : 60;
+        };
 
         while (running.load(std::memory_order_acquire)) {
             if (!frameSlot.Pop(currentFrame)) {
@@ -285,18 +326,13 @@ std::thread StartEncoderThread(
             }
 
             if (isStreaming && !wasStreaming) {
-                LOG("EncoderThread: Streaming started (fps=%d)", targetFps.load(std::memory_order_acquire));
+                LOG("EncoderThread: Streaming started (fps=%d)", loadTargetFps());
                 std::lock_guard<std::mutex> lock(encoderMutex);
                 if (encoder) {
                     encoder->Flush();
                 }
 
-                int fps = targetFps.load(std::memory_order_acquire);
-                if (fps <= 0) {
-                    fps = 60;
-                }
-
-                framePeriodUs = 1000000 / fps;
+                framePeriodUs = 1000000 / loadTargetFps();
                 lastEncodeTs.store(0, std::memory_order_release);
                 nextTs = 0;
                 if (hasPendingFrame) freePending();
@@ -313,11 +349,7 @@ std::thread StartEncoderThread(
                 continue;
             }
 
-            int fps = targetFps.load(std::memory_order_acquire);
-            if (fps <= 0) {
-                fps = 60;
-            }
-            framePeriodUs = 1000000 / fps;
+            framePeriodUs = 1000000 / loadTargetFps();
 
             bool needsKeyFrame = true;
             try {
@@ -426,7 +458,7 @@ std::thread StartEncoderThread(
                 if (pendingFrame.generation != currentGeneration) freePending();
                 if (hasPendingFrame) {
                     if (std::abs(currentFrame.ts - nextTs) < std::abs(pendingFrame.ts - nextTs)) {
-                        frameSlot.MarkReleased(pendingFrame.poolIdx); pendingFrame.Release();
+                        freePending();
                         promoteCurrent();
                     } else { freeCurrent(); }
                 } else { promoteCurrent(); }
@@ -487,12 +519,14 @@ bool InitializeHostSecurity(WinsockSession& winsockSession) {
 void ConfigureHttpServer(
     httplib::SSLServer& server,
     const std::shared_ptr<WebRTCServer>& webrtcServer,
+    const std::shared_ptr<PortMapper>& portMapper,
     OfferProcessingGate& offerGate) {
     server.set_post_routing_handler(SetupCORS);
     server.Options(".*", [](auto&, auto& response) { response.status = 204; });
 
     RegisterStaticRoutes(server);
     RegisterAuthRoutes(server);
+    RegisterNetworkRoutes(server, portMapper);
     RegisterOfferRoute(server, webrtcServer, offerGate);
 }
 
@@ -500,7 +534,8 @@ void PrintStartupInfo(
     const std::vector<std::string>& localIpAddresses,
     const AppContext& app,
     const ScreenCapture& capture,
-    const MicPlayback* micPlayback) {
+    const MicPlayback* micPlayback,
+    const PortMapper* portMapper) {
     printf("SlipStream v%s on port %d\n", SLIPSTREAM_VERSION, kHttpsPort);
     printf("  Local: https://localhost:%d\n", kHttpsPort);
     for (const auto& ip : localIpAddresses) {
@@ -508,6 +543,19 @@ void PrintStartupInfo(
     }
     printf("  User: %s | Display: %dHz\n", app.config.username.c_str(), capture.GetHostFPS());
     printf("  Mic: %s\n", micPlayback && micPlayback->IsInitialized() ? micPlayback->GetDeviceName().c_str() : "N/A");
+    if (portMapper) {
+        const PortMappingStatus status = portMapper->GetStatus();
+        printf("  Port mapping: %s", status.enabled ? "enabled" : "disabled");
+        if (status.active) {
+            printf(" via %s", status.method.c_str());
+            if (!status.externalAddress.empty()) {
+                printf(" (%s)", status.externalAddress.c_str());
+            }
+        } else if (!status.lastError.empty()) {
+            printf(" (%s)", status.lastError.c_str());
+        }
+        printf("\n");
+    }
 }
 
 struct WorkerThreads {
@@ -517,7 +565,7 @@ struct WorkerThreads {
     std::thread encoderThread;
 };
 
-WorkerThreads StartWorkerThreads(
+bool StartWorkerThreads(
     AppContext& app,
     httplib::SSLServer& server,
     FrameSlot& frameSlot,
@@ -530,9 +578,20 @@ WorkerThreads StartWorkerThreads(
     std::atomic<bool>& encoderReady,
     std::atomic<int64_t>& lastEncodeTs,
     std::atomic<int>& targetFps,
-    std::unique_ptr<AudioCapture>& audioCapture) {
-    WorkerThreads threads{};
-    threads.serverThread = std::thread([&] { server.listen("0.0.0.0", kHttpsPort); });
+    std::unique_ptr<AudioCapture>& audioCapture,
+    WorkerThreads& threads) {
+    const bool bound = server.bind_to_port("0.0.0.0", kHttpsPort);
+    if (!bound) {
+        ERR("HTTPS server bind failed on port %d", kHttpsPort);
+        return false;
+    }
+
+    threads = {};
+    threads.serverThread = std::thread([&] {
+        if (!server.listen_after_bind()) {
+            ERR("HTTPS server listener exited unexpectedly");
+        }
+    });
 
     threads.audioThread = StartThreadWithPriority(THREAD_PRIORITY_HIGHEST, [audioCapture = audioCapture.get(), webrtcServer, &app] {
         if (audioCapture == nullptr) {
@@ -598,7 +657,7 @@ WorkerThreads StartWorkerThreads(
         lastEncodeTs,
         targetFps);
 
-    return threads;
+    return true;
 }
 
 void ShutdownHost(
@@ -607,6 +666,7 @@ void ShutdownHost(
     httplib::SSLServer& server,
     FrameSlot& frameSlot,
     const std::shared_ptr<WebRTCServer>& webrtcServer,
+    const std::shared_ptr<PortMapper>& portMapper,
     WorkerThreads& threads) {
     if (audioCapture) {
         audioCapture->Stop();
@@ -622,6 +682,10 @@ void ShutdownHost(
     JoinIfJoinable(threads.audioThread);
     JoinIfJoinable(threads.cursorThread);
     JoinIfJoinable(threads.serverThread);
+
+    if (portMapper) {
+        portMapper->Stop();
+    }
 
     if (webrtcServer) {
         webrtcServer->Shutdown();
@@ -647,6 +711,11 @@ int RunHostApp(int argc, char* argv[]) {
 
         FrameSlot frameSlot;
         auto webrtcServer = std::make_shared<WebRTCServer>();
+        auto portMapper = std::make_shared<PortMapper>(
+            static_cast<uint16_t>(kHttpsPort),
+            webrtcServer->GetIcePortRangeBegin(),
+            webrtcServer->GetIcePortRangeEnd(),
+            webrtcServer->IsIceTcpEnabled());
         ScreenCapture capture(&frameSlot);
 
         std::mutex encoderMutex;
@@ -694,24 +763,29 @@ int RunHostApp(int argc, char* argv[]) {
                 activeEncoder ? activeEncoder->GetActiveEncoderName().c_str() : "unknown");
         };
 
+        auto createEncoder = [&](int width, int height, int fps, CodecType codec) {
+            const bool preferSoftware = softwareEncodeRequested.load(std::memory_order_acquire);
+            auto nextEncoder = std::make_unique<VideoEncoder>(
+                width,
+                height,
+                fps,
+                capture.GetDev(),
+                capture.GetCtx(),
+                capture.GetMT(),
+                codec,
+                preferSoftware);
+            currentCodec.store(codec, std::memory_order_release);
+            updateSoftwareEncodeState(codec, preferSoftware, nextEncoder.get());
+            return nextEncoder;
+        };
+
         auto rebuildEncoder = [&](int width, int height, int fps, CodecType codec) -> bool {
             std::lock_guard<std::mutex> lock(encoderMutex);
             encoderReady.store(false, std::memory_order_release);
             encoder.reset();
 
             try {
-                const bool preferSoftware = softwareEncodeRequested.load(std::memory_order_acquire);
-                encoder = std::make_unique<VideoEncoder>(
-                    width,
-                    height,
-                    fps,
-                    capture.GetDev(),
-                    capture.GetCtx(),
-                    capture.GetMT(),
-                    codec,
-                    preferSoftware);
-                currentCodec.store(codec, std::memory_order_release);
-                updateSoftwareEncodeState(codec, preferSoftware, encoder.get());
+                encoder = createEncoder(width, height, fps, codec);
                 encoderReady.store(true, std::memory_order_release);
                 return true;
             } catch (const std::exception& ex) {
@@ -740,11 +814,8 @@ int RunHostApp(int argc, char* argv[]) {
                     encoder->UpdateFPS(fps);
                 } else {
                     try {
-                        const bool preferSoftware = softwareEncodeRequested.load(std::memory_order_acquire);
-                        encoder = std::make_unique<VideoEncoder>(capture.GetW(), capture.GetH(), fps,
-                            capture.GetDev(), capture.GetCtx(), capture.GetMT(),
-                            currentCodec.load(std::memory_order_acquire), preferSoftware);
-                        updateSoftwareEncodeState(currentCodec.load(std::memory_order_acquire), preferSoftware, encoder.get());
+                        encoder = createEncoder(capture.GetW(), capture.GetH(), fps,
+                            currentCodec.load(std::memory_order_acquire));
                         encoderReady.store(true, std::memory_order_release);
                     } catch (const std::exception& e) {
                         ERR("Failed to create encoder: %s", e.what());
@@ -823,25 +894,33 @@ int RunHostApp(int argc, char* argv[]) {
         }
 
         OfferProcessingGate offerGate;
-        ConfigureHttpServer(server, webrtcServer, offerGate);
+        ConfigureHttpServer(server, webrtcServer, portMapper, offerGate);
 
-        WorkerThreads threads = StartWorkerThreads(
-            app,
-            server,
-            frameSlot,
-            capture,
-            webrtcServer,
-            input,
-            cursorCapture,
-            encoderMutex,
-            encoder,
-            encoderReady,
-            lastEncodeTs,
-            targetFps,
-            audioCapture);
+        WorkerThreads threads{};
+        if (!StartWorkerThreads(
+                app,
+                server,
+                frameSlot,
+                capture,
+                webrtcServer,
+                input,
+                cursorCapture,
+                encoderMutex,
+                encoder,
+                encoderReady,
+                lastEncodeTs,
+                targetFps,
+                audioCapture,
+                threads)) {
+            return 1;
+        }
+
+        if (portMapper) {
+            portMapper->Start();
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        PrintStartupInfo(localIpAddresses, app, capture, micPlayback.get());
+        PrintStartupInfo(localIpAddresses, app, capture, micPlayback.get(), portMapper.get());
 
         if (audioCapture) audioCapture->Start();
         if (micPlayback) micPlayback->Start();
@@ -856,7 +935,7 @@ int RunHostApp(int argc, char* argv[]) {
         }
 
         LOG("Shutting down...");
-        ShutdownHost(audioCapture, micPlayback, server, frameSlot, webrtcServer, threads);
+        ShutdownHost(audioCapture, micPlayback, server, frameSlot, webrtcServer, portMapper, threads);
 
         CleanupAppTray();
         LOG("Shutdown complete");

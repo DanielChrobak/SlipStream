@@ -1,5 +1,8 @@
 #include "host/net/webrtc.hpp"
+#include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -34,6 +37,33 @@ bool HasPublicIceCandidate(const std::string& sdp) {
     return sdp.find(" typ srflx") != std::string::npos ||
            sdp.find(" typ relay") != std::string::npos;
 }
+
+int GetEnvInt(const char* name, int fallback, int minValue, int maxValue) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (!end || *end != '\0') return fallback;
+    if (parsed < minValue || parsed > maxValue) return fallback;
+    return static_cast<int>(parsed);
+}
+
+bool GetEnvBool(const char* name, bool fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    return fallback;
+}
+
+constexpr int kDefaultIcePortBegin = 50000;
+constexpr int kDefaultIcePortEnd = 50127;
 
 constexpr size_t kVideoQueueMaxPackets = 2048;
 constexpr size_t kVideoQueueTrimTargetPackets = 512;
@@ -801,12 +831,18 @@ WebRTCServer::WebRTCServer() {
     for (const char* s : {"stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302",
             "stun:stun2.l.google.com:19302", "stun:stun3.l.google.com:19302",
             "stun:stun4.l.google.com:19302", "stun:stun.cloudflare.com:3478",
-            "stun:stun.services.mozilla.com:3478"})
+            "stun:stun.services.mozilla.com:3478", "stun:global.stun.twilio.com:3478"})
         rtcConfig_.iceServers.push_back(rtc::IceServer(s));
-    rtcConfig_.portRangeBegin = 50000;
-    rtcConfig_.portRangeEnd = 50020;
-    rtcConfig_.enableIceTcp = false;
-    LOG("WebRTC: Server initialized");
+
+    const int portRangeBegin = GetEnvInt("SLIPSTREAM_ICE_PORT_BEGIN", kDefaultIcePortBegin, 1024, 65534);
+    const int portRangeEnd = GetEnvInt("SLIPSTREAM_ICE_PORT_END", kDefaultIcePortEnd, portRangeBegin, 65535);
+    const bool enableIceTcp = GetEnvBool("SLIPSTREAM_ENABLE_ICE_TCP", true);
+
+    rtcConfig_.portRangeBegin = static_cast<uint16_t>(portRangeBegin);
+    rtcConfig_.portRangeEnd = static_cast<uint16_t>(portRangeEnd);
+    rtcConfig_.enableIceTcp = enableIceTcp;
+    LOG("WebRTC: Server initialized (stun=%zu portRange=%d-%d iceTcp=%d)",
+        rtcConfig_.iceServers.size(), portRangeBegin, portRangeEnd, enableIceTcp ? 1 : 0);
     SetupPeerConnection();
 }
 
