@@ -2,6 +2,7 @@
 
 Low-latency remote desktop streaming over WebRTC with hardware-first video encode and decode paths.
 
+**Installer workflow, command-line arguments, client UI features, D3D11 sync, and configuration/auth setup are now documented.**
 ## Overview
 
 SlipStream captures the Windows desktop with the Windows Graphics Capture API and encodes frames in real time with FFmpeg-backed encoder paths. It prefers hardware encoders on NVIDIA, Intel, and AMD GPUs, but can fall back to software encoders when the selected codec is not available in hardware. Video, system audio, control traffic, input, and microphone audio are carried over WebRTC data channels with DTLS transport from the browser/libdatachannel stack. The browser client renders decoded frames with WebGL2, uses WebCodecs for video and audio decode, supports software decode fallback when hardware decode is unavailable, and can send microphone audio upstream with WebCodecs AudioEncoder. The server runs as an elevated Windows tray application and can also be installed with a scheduled task for boot-time startup.
@@ -304,29 +305,45 @@ For all codecs, `maxrate` is clamped to at least the target bitrate and otherwis
 | Parameter | Value |
 |-----------|-------|
 | Chunk Size | 1,400 bytes max |
-| Header Size | 55 bytes |
+Output: `build\bin\Release\SlipStream.exe`
 | Data Payload | Up to 1,345 bytes per video packet |
+### 3. Installer Build
+
+To create a Windows installer (with scheduled task, firewall rules, and shortcuts):
+
+```batch
+build_installer_release.bat
+```
+
+Creates `build\SlipStream-1.0.0-Release-Setup.exe` using Inno Setup. See `SlipStream.iss` for installer script details.
+
+For debug builds:
+
+```batch
+build_installer_debug.bat
+```
+
+Creates `build\SlipStream-1.0.0-Debug-Setup.exe` (launches with `--debug`).
+
 | Video Buffer | 256 KB threshold |
 | Max Queue | 2,048 packets (trimmed to 512 on overflow) |
 | Congestion Threshold | 256 queued packets or 128 KB buffered in the video data channel |
 | Delivery | Unordered, maxRetransmits=0 |
+```batch
+build\bin\Release\SlipStream.exe [--debug] [--trace] [--force-software]
+```
+
+**Command-line arguments:**
+- `--debug`: Enables debug logging
+- `--trace`: Enables verbose trace output
+- `--force-software`: Forces software encoding for all codecs
 
 ### Forward Error Correction (FEC)
-
-| Parameter | Value |
-|-----------|-------|
-| Algorithm | XOR parity per group |
-| Group Size (video) | 10 data chunks by default; 20 for larger non-keyframes when FEC remains enabled |
-| Recovery | Single missing chunk per group (client-side XOR reconstruction) |
-| Bypass | Skipped for non-keyframes when queue ≥ 128 packets, buffered ≥ 22,400 bytes, or chunk count ≥ 48 |
-
 ### Video Packet Header (55 bytes)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 8 | timestamp | Capture timestamp (microseconds) |
-| 8 | 8 | sourceTimestamp | WGC source/compositor timestamp |
-| 16 | 8 | encodeEndTimestamp | Timestamp after encode completes |
 | 24 | 8 | enqueueTimestamp | Timestamp when packetization begins |
 | 32 | 4 | encodeTimeUs | Encode duration (microseconds) |
 | 36 | 4 | frameId | Frame sequence number |
@@ -666,28 +683,13 @@ When enabled, displays a tab strip showing all monitors with:
 
 Real-time metrics display organized into sections:
 
+## UI Features
+
 | Section | Metrics |
 |---------|---------|
-| Throughput | FPS (actual/target with efficiency %), bitrate, resolution, codec |
-| Encode | Active host encode mode and encoder name |
-| Latency | RTT, frame age |
-| Jitter | Frame interval mean and standard deviation |
-| Decode | Average decode time, queue size, HW acceleration status |
-| Render | Average render time, frame count |
-| Network | Packet count (total, video, audio), average packet size |
-| Drops | Dropped frames, timeouts, late frames, decode errors |
-| Audio | Packets received/decoded, buffer level (ms) |
-| Audio Drops | Dropped, underruns, overflows |
-| Input | Mouse moves/clicks, keystrokes |
-| Session | Uptime, total frames, total data transferred |
-| Version | Host version |
 
 ## Server Components
 
-### Thread Architecture
-
-| Thread | Priority | Purpose |
-|--------|----------|---------|
 | Main | Default | Tray message pump, main loop |
 | Encoder | Time Critical | Frame encoding and sending |
 | Audio Capture | Time Critical | WASAPI loopback capture and Opus encoding |
