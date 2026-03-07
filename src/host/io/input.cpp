@@ -34,13 +34,6 @@ namespace {
         return cache[i];
     }
 
-    template <typename T>
-    [[nodiscard]] bool ReadPod(const uint8_t* data, size_t len, T& out) {
-        if (len < sizeof(T)) return false;
-        std::memcpy(&out, data, sizeof(T));
-        return true;
-    }
-
     bool IsExtendedKey(WORD vk) {
         return vk == VK_INSERT || vk == VK_DELETE || vk == VK_HOME || vk == VK_END ||
                vk == VK_PRIOR || vk == VK_NEXT || vk == VK_LEFT || vk == VK_RIGHT ||

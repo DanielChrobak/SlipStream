@@ -43,7 +43,7 @@ const buildMicPacket = ({ payload, timestamp, samples, packetId, packetType, gro
 
 const sendMicPacketWithFec = (opusData, timestamp, samples) => {
     const payload = opusData instanceof Uint8Array ? opusData : new Uint8Array(opusData);
-    const groupSize = Math.max(1, C.MIC_FEC_GROUP_SIZE || 4);
+    const groupSize = Math.max(1, C.FEC_GROUP_SIZE || 4);
     const packetId = micPacketId++;
     if (!micFecPackets.length) micFecGroupStart = packetId;
 

@@ -26,7 +26,6 @@ export const C = {
     FEC_GROUP_SIZE: 10,
     AUDIO_RATE: 48000, AUDIO_CH: 2,
     MIC_HEADER: 24, MIC_RATE: 48000, MIC_CH: 1, MIC_FRAME_MS: 10,
-    AUDIO_FEC_GROUP_SIZE: 10, MIC_FEC_GROUP_SIZE: 10,
     DC_CONTROL: { ordered: 1, maxRetransmits: 3 },
     DC_VIDEO: { ordered: 0, maxRetransmits: 0 },
     DC_AUDIO: { ordered: 0, maxRetransmits: 0 },

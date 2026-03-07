@@ -58,6 +58,36 @@ const savePref = (key, val) => {
     safe(() => localStorage.setItem(key, val.toString()), undefined, 'UI');
 };
 
+const loadBoolPref = key => safe(() => localStorage.getItem(key) === 'true', false, 'UI');
+const loadJsonPref = (key, fallback = {}) => safe(() => JSON.parse(localStorage.getItem(key)) || fallback, fallback, 'UI');
+const saveJsonPref = (key, value) => safe(() => localStorage.setItem(key, JSON.stringify(value)), undefined, 'UI');
+const setDisplay = (el, visible, display = 'flex') => {
+    el.style.display = visible ? display : 'none';
+};
+const applySavedFps = (fps, source) => {
+    savePref(STORAGE_KEYS.FPS, fps);
+    applyFps(fps);
+    log.info('UI', source, { fps });
+};
+const bindNumericSelect = (el, apply, logMessage, storageKey = null, dataKey = 'value') => {
+    el.onchange = () => {
+        const value = +el.value;
+        if (storageKey) savePref(storageKey, value);
+        apply(value);
+        log.info('UI', logMessage, { [dataKey]: value });
+    };
+};
+const updateDropSection = (sectionId, hasDrops, values) => {
+    const section = $(sectionId);
+    if (!section) return;
+    section.classList.toggle('has-drops', hasDrops);
+    if (!hasDrops) return;
+    for (const [id, value] of Object.entries(values)) {
+        const el = $(id);
+        if (el) el.textContent = value;
+    }
+};
+
 export const getStoredFps = () => loadPref(STORAGE_KEYS.FPS, v => v >= 1 && v <= 240, null);
 export const getStoredCodec = () => loadPref(STORAGE_KEYS.CODEC, v => v >= 0 && v <= 2, null) ?? defaultCodec ?? 0;
 const togglePanel = show => {
@@ -76,35 +106,30 @@ document.onkeydown = e => {
 export const updateFpsDropdown = fps => {
     const value = +fps;
     const standardValues = ['15', '30', '60', '120', '144'];
+    const isCustom = !standardValues.includes(value.toString());
 
-    if (standardValues.includes(value.toString())) {
+    if (!isCustom) {
         fpsSel.value = value.toString();
-        customFpsRow.style.display = 'none';
     } else {
         fpsSel.value = 'custom';
         customFpsInput.value = value;
-        customFpsRow.style.display = 'flex';
     }
+    setDisplay(customFpsRow, isCustom);
 };
 
 fpsSel.onchange = () => {
     if (fpsSel.value === 'custom') {
-        customFpsRow.style.display = 'flex';
+        setDisplay(customFpsRow, true);
     } else {
-        customFpsRow.style.display = 'none';
-        const fps = +fpsSel.value;
-        savePref(STORAGE_KEYS.FPS, fps);
-        applyFps(fps);
-        log.info('UI', 'FPS changed', { fps });
+        setDisplay(customFpsRow, false);
+        applySavedFps(+fpsSel.value, 'FPS changed');
     }
 };
 
 customFpsApply.onclick = () => {
     const fps = parseInt(customFpsInput.value, 10);
     if (fps >= 1 && fps <= 240) {
-        savePref(STORAGE_KEYS.FPS, fps);
-        applyFps(fps);
-        log.info('UI', 'Custom FPS applied', { fps });
+        applySavedFps(fps, 'Custom FPS applied');
     } else {
         log.warn('UI', 'Invalid FPS value', { fps });
     }
@@ -113,17 +138,9 @@ customFpsApply.onclick = () => {
 customFpsInput.onkeydown = e => {
     if (e.key === 'Enter') { e.preventDefault(); customFpsApply.click(); }
 };
-export const updateCodecDropdown = codecId => {
-    if (codecSel.value !== codecId.toString()) {
-        codecSel.value = codecId.toString();
-    }
-};
+export const updateCodecDropdown = codecId => { if (codecSel.value !== codecId.toString()) codecSel.value = codecId.toString(); };
 
-export const setHostCodecs = caps => {
-    S.hostCodecs = caps;
-    updateCodecOpts();
-    log.debug('UI', 'Host codecs set', { caps: caps.toString(2) });
-};
+export const setHostCodecs = caps => { S.hostCodecs = caps; updateCodecOpts(); log.debug('UI', 'Host codecs set', { caps: caps.toString(2) }); };
 
 let defaultCodec = null;
 
@@ -168,17 +185,8 @@ export const updateCodecOpts = async () => {
     S.currentCodec = +codecSel.value;
 };
 
-codecSel.onchange = () => {
-    const codec = +codecSel.value;
-    savePref(STORAGE_KEYS.CODEC, codec);
-    applyCodec(codec);
-    log.info('UI', 'Codec changed', { codec });
-};
-monSel.onchange = () => {
-    const idx = +monSel.value;
-    sendMonitor(idx);
-    log.info('UI', 'Monitor changed', { index: idx });
-};
+bindNumericSelect(codecSel, applyCodec, 'Codec changed', STORAGE_KEYS.CODEC, 'codec');
+bindNumericSelect(monSel, sendMonitor, 'Monitor changed', null, 'index');
 $('aBtn').onclick = toggleAudio;
 const micBtn = $('micBtn');
 const micTxt = $('micTxt');
@@ -192,10 +200,7 @@ const updateMicUI = () => {
 };
 
 if (micBtn) {
-    micBtn.onclick = async () => {
-        await toggleMic();
-        updateMicUI();
-    };
+    micBtn.onclick = async () => { await toggleMic(); updateMicUI(); };
 
     if (micHint && !isMicSupported()) {
         micHint.textContent = 'Mic not supported';
@@ -272,33 +277,27 @@ const tabStrip = $('tabStrip');
 const tabContainer = $('tabContainer');
 const tabbedModeBtn = $('tabbedModeBtn');
 const tabBack = $('tabBack');
+const monitorNames = loadJsonPref(STORAGE_KEYS.MON_NAMES);
 
 const MONITOR_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>`;
 const STAR_ICON = `<svg class="primary-star" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
 
-const getMonitorNames = () => {
-    try {
-        return JSON.parse(localStorage.getItem(STORAGE_KEYS.MON_NAMES)) || {};
-    } catch (e) {
-        log.warn('UI', 'Failed to parse monitor names from storage', { error: e?.message });
-        return {};
-    }
-};
-
 const setMonitorName = (idx, name) => {
-    const names = getMonitorNames();
     if (name && name.trim()) {
-        names[idx] = name.trim();
+        monitorNames[idx] = name.trim();
     } else {
-        delete names[idx];
+        delete monitorNames[idx];
     }
-    localStorage.setItem(STORAGE_KEYS.MON_NAMES, JSON.stringify(names));
+    saveJsonPref(STORAGE_KEYS.MON_NAMES, monitorNames);
 };
 
-const getMonitorDisplayName = m => {
-    const names = getMonitorNames();
-    return names[m.index] || m.name || `Display ${m.index + 1}`;
+const syncTabbedVisibility = () => {
+    const show = S.tabbedMode && S.monitors.length > 0;
+    tabStrip.classList.toggle('visible', show);
+    if (show) renderTabs();
 };
+
+const getMonitorDisplayName = m => monitorNames[m.index] || m.name || `Display ${m.index + 1}`;
 
 const renderTabs = () => {
     if (!S.monitors.length) {
@@ -374,46 +373,32 @@ const renderTabs = () => {
 const updateTabbedUI = () => {
     tabbedModeBtn.classList.toggle('on', S.tabbedMode);
     document.body.classList.toggle('tabbed-mode', S.tabbedMode);
-
-    const show = S.tabbedMode && S.monitors.length > 0;
-    tabStrip.classList.toggle('visible', show);
-
-    if (show) renderTabs();
+    syncTabbedVisibility();
 
     setTimeout(() => window.dispatchEvent(new Event('resize')), 350);
 };
 
-export const closeTabbedMode = () => {
-    if (!S.tabbedMode) return;
-    S.tabbedMode = false;
-    savePref(STORAGE_KEYS.TABBED, false);
+export const closeTabbedMode = () => { if (setTabbedMode(false)) log.info('UI', 'Tabbed mode closed'); };
+
+const setTabbedMode = enabled => {
+    if (S.tabbedMode === enabled) return false;
+    S.tabbedMode = enabled;
+    savePref(STORAGE_KEYS.TABBED, enabled);
     updateTabbedUI();
-    log.info('UI', 'Tabbed mode closed');
+    return true;
 };
 
-S.tabbedMode = localStorage.getItem(STORAGE_KEYS.TABBED) === 'true';
+S.tabbedMode = loadBoolPref(STORAGE_KEYS.TABBED);
 
 tabbedModeBtn.onclick = () => {
-    S.tabbedMode = !S.tabbedMode;
-    savePref(STORAGE_KEYS.TABBED, S.tabbedMode);
-    updateTabbedUI();
-    log.info('UI', 'Tabbed mode toggled', { enabled: S.tabbedMode });
+    const enabled = !S.tabbedMode;
+    setTabbedMode(enabled);
+    log.info('UI', 'Tabbed mode toggled', { enabled });
 };
 
-tabBack.onclick = () => {
-    S.tabbedMode = false;
-    savePref(STORAGE_KEYS.TABBED, false);
-    updateTabbedUI();
-};
+tabBack.onclick = closeTabbedMode;
 
-if (S.tabbedMode) {
-    tabbedModeBtn.classList.add('on');
-    document.body.classList.add('tabbed-mode');
-    if (S.monitors.length > 0) {
-        tabStrip.classList.add('visible');
-        renderTabs();
-    }
-}
+updateTabbedUI();
 
 export const updateMonOpts = () => {
     monSel.innerHTML = S.monitors.length
@@ -421,11 +406,7 @@ export const updateMonOpts = () => {
         : '<option value="0">Waiting...</option>';
     monSel.value = S.currentMon;
 
-    if (S.tabbedMode) {
-        const show = S.monitors.length > 0;
-        tabStrip.classList.toggle('visible', show);
-        if (show) renderTabs();
-    }
+    if (S.tabbedMode) syncTabbedVisibility();
 
     log.debug('UI', 'Monitor options updated', { count: S.monitors.length });
 };
@@ -463,7 +444,7 @@ initStatsOverlay();
 
 const statsOverlay = $('statsOverlay');
 const statsToggle = $('statsToggleBtn');
-let statsEnabled = localStorage.getItem(STORAGE_KEYS.STATS) === 'true';
+let statsEnabled = loadBoolPref(STORAGE_KEYS.STATS);
 let metricsUnsubscribe = null;
 
 const formatValue = (val, decimals = 2, suffix = '') =>
@@ -538,40 +519,32 @@ const updateStats = data => {
         rttEl.parentElement.className = 'stats-row' + (rttClass ? ` ${rttClass}` : '');
     }
     const totalAudioDrops = audio.packetsDropped + audio.bufferUnderruns + audio.bufferOverflows;
-    const audioDropsSection = $('statsAudioDropsSection');
-    if (audioDropsSection) {
-        audioDropsSection.classList.toggle('has-drops', totalAudioDrops > 0);
-        if (totalAudioDrops > 0) {
-            $('statsAudioDropped').textContent = audio.packetsDropped;
-            $('statsAudioUnderruns').textContent = audio.bufferUnderruns;
-            $('statsAudioOverflows').textContent = audio.bufferOverflows;
-        }
-    }
+    updateDropSection('statsAudioDropsSection', totalAudioDrops > 0, {
+        statsAudioDropped: audio.packetsDropped,
+        statsAudioUnderruns: audio.bufferUnderruns,
+        statsAudioOverflows: audio.bufferOverflows
+    });
     const totalDrops = stats.framesDropped + stats.framesTimeout + jitter.framesDroppedLate + stats.decodeErrors;
-    const dropsSection = $('statsDropsSection');
-    if (dropsSection) {
-        dropsSection.classList.toggle('has-drops', totalDrops > 0);
-        if (totalDrops > 0) {
-            $('statsDropsDropped').textContent = stats.framesDropped;
-            $('statsDropsTimeout').textContent = stats.framesTimeout;
-            $('statsDropsLate').textContent = jitter.framesDroppedLate;
-            $('statsDecodeErrors').textContent = stats.decodeErrors;
-        }
-    }
+    updateDropSection('statsDropsSection', totalDrops > 0, {
+        statsDropsDropped: stats.framesDropped,
+        statsDropsTimeout: stats.framesTimeout,
+        statsDropsLate: jitter.framesDroppedLate,
+        statsDecodeErrors: stats.decodeErrors
+    });
 };
 
 const updateStatsVisibility = () => {
     statsOverlay.classList.toggle('visible', statsEnabled);
     statsToggle.classList.toggle('on', statsEnabled);
-
-    if (statsEnabled && !metricsUnsubscribe) {
+    const shouldSubscribe = statsEnabled && !metricsUnsubscribe;
+    const shouldUnsubscribe = !statsEnabled && metricsUnsubscribe;
+    if (shouldSubscribe) {
         metricsUnsubscribe = subscribeToMetrics(updateStats);
-        log.info('UI', 'Stats overlay enabled');
-    } else if (!statsEnabled && metricsUnsubscribe) {
+    } else if (shouldUnsubscribe) {
         metricsUnsubscribe();
         metricsUnsubscribe = null;
-        log.info('UI', 'Stats overlay disabled');
     }
+    if (shouldSubscribe || shouldUnsubscribe) log.info('UI', `Stats overlay ${statsEnabled ? 'enabled' : 'disabled'}`);
 };
 
 statsToggle.onclick = () => {
@@ -585,7 +558,7 @@ const createToggle = (btnId, storageKey, onChange) => {
     const btn = $(btnId);
     if (!btn) return { get: () => false, set: () => {} };
 
-    let enabled = storageKey ? localStorage.getItem(storageKey) === 'true' : false;
+    let enabled = storageKey ? loadBoolPref(storageKey) : false;
 
     const update = () => {
         btn.classList.toggle('on', enabled);
@@ -609,7 +582,7 @@ window.addEventListener('pointerlockchange', e => {
         relativeMouse.set(false);
     }
 });
-S.clipboardSyncEnabled = localStorage.getItem(STORAGE_KEYS.CLIPBOARD) === 'true';
+S.clipboardSyncEnabled = loadBoolPref(STORAGE_KEYS.CLIPBOARD);
 createToggle('clipboardSyncBtn', STORAGE_KEYS.CLIPBOARD, enabled => {
     S.clipboardSyncEnabled = enabled;
 });

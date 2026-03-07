@@ -146,25 +146,29 @@ void UpdateInputBoundsForMonitor(InputHandler& input, int monitorIndex) {
     input.UpdateFromMonitorInfo(g_monitors[monitorIndex]);
 }
 
+void RegisterStaticAsset(
+    httplib::SSLServer& server,
+    const std::string& route,
+    const char* contentType,
+    const std::string& filePath,
+    const char* missingContent = "") {
+    server.Get(route, [contentType, filePath, missingContent](auto&, auto& response) {
+        const auto content = LoadFile(filePath.c_str());
+        response.set_content(content.empty() ? missingContent : content, contentType);
+    });
+}
+
 void RegisterStaticRoutes(httplib::SSLServer& server) {
-    server.Get("/", [](auto&, auto& response) {
-        const auto content = LoadFile("index.html");
-        response.set_content(content.empty() ? "<h1>index.html not found</h1>" : content, "text/html");
-    });
-
-    server.Get("/styles.css", [](auto&, auto& response) {
-        response.set_content(LoadFile("styles.css"), "text/css");
-    });
-
-    server.Get("/SlipStream.ico", [](auto&, auto& response) {
-        response.set_content(LoadFile("SlipStream.ico"), "image/x-icon");
-    });
+    RegisterStaticAsset(server, "/", "text/html", "index.html", "<h1>index.html not found</h1>");
+    RegisterStaticAsset(server, "/styles.css", "text/css", "styles.css");
+    RegisterStaticAsset(server, "/SlipStream.ico", "image/x-icon", "SlipStream.ico");
 
     constexpr std::array<const char*, 12> kJsModules = {"constants", "input", "media", "network", "renderer", "state", "ui", "mic", "auth", "protocol", "audio-worklet", "mic-worklet"};
     for (const auto* module : kJsModules) {
-        server.Get(std::string("/js/") + module + ".js", [module](auto&, auto& response) {
-            response.set_content(LoadFile((std::string("js/") + module + ".js").c_str()), "application/javascript");
-        });
+        RegisterStaticAsset(server,
+            std::string("/js/") + module + ".js",
+            "application/javascript",
+            std::string("js/") + module + ".js");
     }
 }
 

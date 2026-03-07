@@ -23,7 +23,7 @@ enum CursorType : uint8_t {
 };
 
 #pragma pack(push,1)
-struct AudioPacketHeader {
+struct MediaPacketHeader {
     uint32_t magic;
     int64_t timestamp;
     uint32_t packetId;
@@ -33,14 +33,6 @@ struct AudioPacketHeader {
     uint8_t fecGroupSize;
     uint16_t reserved;
 };
-struct MicPacketHeader {
-    uint32_t magic;
-    int64_t timestamp;
-    uint32_t packetId;
-    uint16_t samples;
-    uint16_t dataLength;
-    uint8_t packetType;
-    uint8_t fecGroupSize;
-    uint16_t reserved;
-};
+using AudioPacketHeader = MediaPacketHeader;
+using MicPacketHeader = MediaPacketHeader;
 #pragma pack(pop)

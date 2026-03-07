@@ -42,33 +42,47 @@ const codeToVK = code => {
     if (code.startsWith('Digit') && code.length === 6) return code.charCodeAt(5);
     return CODE_MAP[code] || 0;
 };
-const mkBtnBuf = (btn, down) => {
-    S.stats.clicks++;
-    return mkBuf(6, v => {
-        v.setUint32(0, MSG.MOUSE_BTN, 1);
-        v.setUint8(4, btn);
-        v.setUint8(5, down ? 1 : 0);
+const INPUT_PACKET_SPECS = {
+    btn: {
+        size: 6,
+        type: MSG.MOUSE_BTN,
+        statKey: 'clicks',
+        write(view, [btn, down]) {
+            view.setUint8(4, btn);
+            view.setUint8(5, down ? 1 : 0);
+        }
+    },
+    wheel: {
+        size: 8,
+        type: MSG.MOUSE_WHEEL,
+        write(view, [dx, dy]) {
+            view.setInt16(4, Math.round(dx), 1);
+            view.setInt16(6, Math.round(dy), 1);
+        }
+    },
+    key: {
+        size: 10,
+        type: MSG.KEY,
+        statKey: 'keys',
+        write(view, [vk, scancode, down, mods]) {
+            view.setUint16(4, vk, 1);
+            view.setUint16(6, scancode, 1);
+            view.setUint8(8, down ? 1 : 0);
+            view.setUint8(9, mods);
+        }
+    }
+};
+
+const buildInputPacket = (type, args) => {
+    const spec = INPUT_PACKET_SPECS[type];
+    if (!spec) return null;
+    if (spec.statKey) S.stats[spec.statKey]++;
+    return mkBuf(spec.size, v => {
+        v.setUint32(0, spec.type, 1);
+        spec.write(v, args);
     });
 };
 
-const mkWheelBuf = (dx, dy) => mkBuf(8, v => {
-    v.setUint32(0, MSG.MOUSE_WHEEL, 1);
-    v.setInt16(4, Math.round(dx), 1);
-    v.setInt16(6, Math.round(dy), 1);
-});
-
-const mkKeyBuf = (vk, scancode, down, mods) => {
-    S.stats.keys++;
-    return mkBuf(10, v => {
-        v.setUint32(0, MSG.KEY, 1);
-        v.setUint16(4, vk, 1);
-        v.setUint16(6, scancode, 1);
-        v.setUint8(8, down ? 1 : 0);
-        v.setUint8(9, mods);
-    });
-};
-
-const MK_MAP = { btn: mkBtnBuf, wheel: mkWheelBuf, key: mkKeyBuf };
 const sendNow = (type, ...args) => {
     if (!S.controlEnabled) {
         log.debug('INPUT', 'Send blocked: control disabled', { type });
@@ -79,13 +93,12 @@ const sendNow = (type, ...args) => {
         return;
     }
 
-    const mkFn = MK_MAP[type];
-    if (!mkFn) {
+    const buf = buildInputPacket(type, args);
+    if (!buf) {
         log.error('INPUT', 'Unknown input type', { type });
         return;
     }
 
-    const buf = mkFn(...args);
     const sent = safe(() => { S.dcInput.send(buf); return true; }, false, 'INPUT');
     if (!sent) {
         log.warn('INPUT', 'Send failed', { type });

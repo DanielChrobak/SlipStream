@@ -33,19 +33,41 @@ export const safeAsync = async (fn, fallback, context = 'ASYNC') => {
         return fallback;
     }
 };
-export const logVideoDrop = (reason, data, options = {}) => {
-    if (options.countDropped !== false) S.stats.framesDropped++;
-    log.warn('VIDEO', `Drop: ${reason}`, { ...data, droppedTotal: S.stats.framesDropped });
+const JITTER_STAGE_FIELDS = [
+    ['sourceCapture', 'avgSourceCaptureMs', 'sourceCaptureMs'],
+    ['captureEncode', 'avgCaptureEncodeMs', 'captureEncodeMs'],
+    ['encodeSend', 'avgEncodeSendMs', 'encodeSendMs'],
+    ['sendReceive', 'avgSendReceiveMs', 'sendReceiveMs'],
+    ['receiveAssemble', 'avgReceiveAssembleMs', 'receiveAssembleMs'],
+    ['assembleDecode', 'avgAssembleDecodeMs', 'assembleDecodeMs'],
+    ['decodePresent', 'avgDecodePresentMs', 'decodePresentMs'],
+    ['e2eLatency', 'avgE2eLatencyMs', 'e2eMs']
+];
+const zeroMetric = (...keys) => Object.fromEntries(keys.map(key => [key, 0]));
+const incrementMetric = (bucket, key, amount = 1) => {
+    bucket[key] += amount;
+    return bucket[key];
 };
 
-export const logAudioDrop = (reason, data) => {
-    S.audioMetrics.packetsDropped++;
-    log.warn('AUDIO', `Drop: ${reason}`, { ...data, total: S.audioMetrics.packetsDropped });
+const logDrop = (module, prefix, reason, data, counterBucket, counterKey, options = {}) => {
+    let payload = data;
+    if (counterBucket && counterKey) {
+        const total = options.countDropped === false
+            ? counterBucket[counterKey]
+            : incrementMetric(counterBucket, counterKey);
+        payload = { ...data, [options.totalKey || 'total']: total };
+    }
+    log.warn(module, `${prefix}: ${reason}`, payload);
 };
 
-export const logNetworkDrop = (reason, data) => {
-    log.warn('NET', `Issue: ${reason}`, data);
-};
+export const logVideoDrop = (reason, data, options = {}) =>
+    logDrop('VIDEO', 'Drop', reason, data, S.stats, 'framesDropped', { ...options, totalKey: 'droppedTotal' });
+
+export const logAudioDrop = (reason, data) =>
+    logDrop('AUDIO', 'Drop', reason, data, S.audioMetrics, 'packetsDropped');
+
+export const logNetworkDrop = (reason, data) =>
+    logDrop('NET', 'Issue', reason, data);
 let codecCache = null;
 
 export const detectCodecs = async () => {
@@ -90,27 +112,18 @@ export const detectCodecs = async () => {
     codecCache = { support: sup, best };
     return codecCache;
 };
-const mkClockSync = () => ({ offset: 0, offsetSamples: [], rttSamples: [], valid: 0, sampleCount: 0, avgRttUs: 0 });
-const mkJitter = () => ({ framesDroppedLate: 0, presentIntervals: [],
-    lastPresentTs: 0,
-    sourceCaptureSum: 0, sourceCaptureSamples: 0, avgSourceCaptureMs: 0,
-    captureEncodeSum: 0, captureEncodeSamples: 0, avgCaptureEncodeMs: 0,
-    encodeSendSum: 0, encodeSendSamples: 0, avgEncodeSendMs: 0,
-    sendReceiveSum: 0, sendReceiveSamples: 0, avgSendReceiveMs: 0,
-    receiveAssembleSum: 0, receiveAssembleSamples: 0, avgReceiveAssembleMs: 0,
-    assembleDecodeSum: 0, assembleDecodeSamples: 0, avgAssembleDecodeMs: 0,
-    decodePresentSum: 0, decodePresentSamples: 0, avgDecodePresentMs: 0,
-    e2eLatencySum: 0, e2eLatencySamples: 0, avgE2eLatencyMs: 0,
-    intervalStdDev: 0, intervalMean: 0 });
-const mkStats = () => ({ bytes: 0, moves: 0, clicks: 0, keys: 0, framesComplete: 0, framesDropped: 0,
-    framesTimeout: 0, keyframesReceived: 0, decodeErrors: 0, renderErrors: 0, lastUpdate: performance.now() });
-const mkAudio = () => ({ packetsReceived: 0, packetsDecoded: 0, packetsDropped: 0,
-    bufferUnderruns: 0, bufferOverflows: 0, bufferHealthSum: 0, bufferHealthSamples: 0 });
-const mkNetwork = () => ({ packetsReceived: 0, videoPackets: 0, controlPackets: 0, audioPackets: 0,
-    micPackets: 0, bytesReceived: 0 });
-const mkDecode = () => ({ decodeCount: 0, decodeTimeSum: 0, maxQueueSize: 0 });
-const mkRender = () => ({ renderCount: 0, renderTimeSum: 0 });
-const mkMic = () => ({ packetsSent: 0, packetsDropped: 0, encodeErrors: 0, bytesSent: 0 });
+const mkClockSync = () => ({ ...zeroMetric('offset', 'valid', 'sampleCount', 'avgRttUs'), offsetSamples: [], rttSamples: [] });
+const mkJitter = () => {
+    const metric = { ...zeroMetric('framesDroppedLate', 'lastPresentTs', 'intervalStdDev', 'intervalMean'), presentIntervals: [] };
+    for (const [prefix, avgKey] of JITTER_STAGE_FIELDS) Object.assign(metric, zeroMetric(`${prefix}Sum`, `${prefix}Samples`, avgKey));
+    return metric;
+};
+const mkStats = () => ({ ...zeroMetric('bytes', 'moves', 'clicks', 'keys', 'framesComplete', 'framesDropped', 'framesTimeout', 'keyframesReceived', 'decodeErrors', 'renderErrors'), lastUpdate: performance.now() });
+const mkAudio = () => zeroMetric('packetsReceived', 'packetsDecoded', 'packetsDropped', 'bufferUnderruns', 'bufferOverflows', 'bufferHealthSum', 'bufferHealthSamples');
+const mkNetwork = () => zeroMetric('packetsReceived', 'videoPackets', 'controlPackets', 'audioPackets', 'micPackets', 'bytesReceived');
+const mkDecode = () => zeroMetric('decodeCount', 'decodeTimeSum', 'maxQueueSize');
+const mkRender = () => zeroMetric('renderCount', 'renderTimeSum');
+const mkMic = () => zeroMetric('packetsSent', 'packetsDropped', 'encodeErrors', 'bytesSent');
 export const S = {
     pc: null, dcControl: null, dcVideo: null, dcAudio: null, dcInput: null, dcMic: null,
     decoder: null, ready: 0, needKey: 1, reinit: 0, hwAccel: 'unknown',
@@ -197,14 +210,9 @@ export const resetStats = () => {
 
 export const resetJitterMetrics = () => {
     const m = S.jitterMetrics;
-    m.avgSourceCaptureMs = m.sourceCaptureSamples > 0 ? m.sourceCaptureSum / m.sourceCaptureSamples : 0;
-    m.avgCaptureEncodeMs = m.captureEncodeSamples > 0 ? m.captureEncodeSum / m.captureEncodeSamples : 0;
-    m.avgEncodeSendMs = m.encodeSendSamples > 0 ? m.encodeSendSum / m.encodeSendSamples : 0;
-    m.avgSendReceiveMs = m.sendReceiveSamples > 0 ? m.sendReceiveSum / m.sendReceiveSamples : 0;
-    m.avgReceiveAssembleMs = m.receiveAssembleSamples > 0 ? m.receiveAssembleSum / m.receiveAssembleSamples : 0;
-    m.avgAssembleDecodeMs = m.assembleDecodeSamples > 0 ? m.assembleDecodeSum / m.assembleDecodeSamples : 0;
-    m.avgDecodePresentMs = m.decodePresentSamples > 0 ? m.decodePresentSum / m.decodePresentSamples : 0;
-    m.avgE2eLatencyMs = m.e2eLatencySamples > 0 ? m.e2eLatencySum / m.e2eLatencySamples : 0;
+    for (const [prefix, avgKey] of JITTER_STAGE_FIELDS) {
+        m[avgKey] = avg(m[`${prefix}Sum`], m[`${prefix}Samples`]);
+    }
 
     if (m.presentIntervals.length > 1) {
         const mean = m.presentIntervals.reduce((a, b) => a + b, 0) / m.presentIntervals.length;
@@ -215,17 +223,11 @@ export const resetJitterMetrics = () => {
     }
 
     const result = {
-        avgSourceCaptureMs: m.avgSourceCaptureMs,
-        avgCaptureEncodeMs: m.avgCaptureEncodeMs,
-        avgEncodeSendMs: m.avgEncodeSendMs,
-        avgSendReceiveMs: m.avgSendReceiveMs,
-        avgReceiveAssembleMs: m.avgReceiveAssembleMs,
-        avgAssembleDecodeMs: m.avgAssembleDecodeMs,
-        avgDecodePresentMs: m.avgDecodePresentMs,
-        avgE2eLatencyMs: m.avgE2eLatencyMs,
-        intervalMean: m.intervalMean, intervalStdDev: m.intervalStdDev,
+        intervalMean: m.intervalMean,
+        intervalStdDev: m.intervalStdDev,
         framesDroppedLate: m.framesDroppedLate
     };
+    for (const [, avgKey] of JITTER_STAGE_FIELDS) result[avgKey] = m[avgKey];
 
     const lastTs = m.lastPresentTs;
     S.jitterMetrics = mkJitter();
@@ -248,22 +250,28 @@ export const resetDecodeMetrics = () => resetMetric('decodeMetrics', mkDecode, '
 export const resetRenderMetrics = () => resetMetric('renderMetrics', mkRender, 'avgRenderTimeMs', 'renderTimeSum', 'renderCount');
 export const resetAudioMetrics = () => resetMetric('audioMetrics', mkAudio, 'avgBufferHealth', 'bufferHealthSum', 'bufferHealthSamples');
 export const resetMicMetrics = () => resetMetric('micMetrics', mkMic);
-export const recordAudioPacket = () => { S.audioMetrics.packetsReceived++; };
-export const recordAudioDecoded = () => { S.audioMetrics.packetsDecoded++; };
-export const recordAudioBufferHealth = h => { S.audioMetrics.bufferHealthSum += h; S.audioMetrics.bufferHealthSamples++; };
-export const recordAudioUnderrun = () => { S.audioMetrics.bufferUnderruns++; };
-export const recordAudioOverflow = () => { S.audioMetrics.bufferOverflows++; };
-export const recordMicPacket = bytes => { S.micMetrics.packetsSent++; S.micMetrics.bytesSent += bytes; };
-export const recordMicEncodeError = () => { S.micMetrics.encodeErrors++; log.warn('MIC', 'Encode error'); };
+export const recordAudioPacket = () => { incrementMetric(S.audioMetrics, 'packetsReceived'); };
+export const recordAudioDecoded = () => { incrementMetric(S.audioMetrics, 'packetsDecoded'); };
+export const recordAudioBufferHealth = h => {
+    incrementMetric(S.audioMetrics, 'bufferHealthSum', h);
+    incrementMetric(S.audioMetrics, 'bufferHealthSamples');
+};
+export const recordAudioUnderrun = () => { incrementMetric(S.audioMetrics, 'bufferUnderruns'); };
+export const recordAudioOverflow = () => { incrementMetric(S.audioMetrics, 'bufferOverflows'); };
+export const recordMicPacket = bytes => {
+    incrementMetric(S.micMetrics, 'packetsSent');
+    incrementMetric(S.micMetrics, 'bytesSent', bytes);
+};
+export const recordMicEncodeError = () => {
+    incrementMetric(S.micMetrics, 'encodeErrors');
+    log.warn('MIC', 'Encode error');
+};
 
 export const recordPacket = (size, type) => {
     const m = S.networkMetrics;
-    m.packetsReceived++;
-    m.bytesReceived += size;
-    if (type === 'video') m.videoPackets++;
-    else if (type === 'audio') m.audioPackets++;
-    else if (type === 'mic') m.micPackets++;
-    else m.controlPackets++;
+    incrementMetric(m, 'packetsReceived');
+    incrementMetric(m, 'bytesReceived', size);
+    incrementMetric(m, type === 'video' ? 'videoPackets' : type === 'audio' ? 'audioPackets' : type === 'mic' ? 'micPackets' : 'controlPackets');
 };
 
 export const recordDecodeTime = (time, queueSize) => {
@@ -285,14 +293,9 @@ const addLatencySample = (metrics, sumKey, countKey, value) => {
 
 export const recordVideoLatencySample = sample => {
     const m = S.jitterMetrics;
-    addLatencySample(m, 'sourceCaptureSum', 'sourceCaptureSamples', sample.sourceCaptureMs);
-    addLatencySample(m, 'captureEncodeSum', 'captureEncodeSamples', sample.captureEncodeMs);
-    addLatencySample(m, 'encodeSendSum', 'encodeSendSamples', sample.encodeSendMs);
-    addLatencySample(m, 'sendReceiveSum', 'sendReceiveSamples', sample.sendReceiveMs);
-    addLatencySample(m, 'receiveAssembleSum', 'receiveAssembleSamples', sample.receiveAssembleMs);
-    addLatencySample(m, 'assembleDecodeSum', 'assembleDecodeSamples', sample.assembleDecodeMs);
-    addLatencySample(m, 'decodePresentSum', 'decodePresentSamples', sample.decodePresentMs);
-    addLatencySample(m, 'e2eLatencySum', 'e2eLatencySamples', sample.e2eMs);
+    for (const [prefix, , sampleKey] of JITTER_STAGE_FIELDS) {
+        addLatencySample(m, `${prefix}Sum`, `${prefix}Samples`, sample[sampleKey]);
+    }
 };
 let metricsSubs = [];
 let metricsInt = null;
@@ -328,11 +331,7 @@ export const startMetricsLogger = () => {
         const stats = resetStats();
         const jitter = resetJitterMetrics();
         const clock = getClockSyncStats();
-        const network = resetNetworkMetrics();
-        const decode = resetDecodeMetrics();
-        const render = resetRenderMetrics();
-        const audio = resetAudioMetrics();
-        const mic = resetMicMetrics();
+        const [network, decode, render, audio, mic] = [resetNetworkMetrics, resetDecodeMetrics, resetRenderMetrics, resetAudioMetrics, resetMicMetrics].map(reset => reset());
 
         sesFrames += stats.framesComplete;
         sesBytes += stats.bytes;
@@ -357,14 +356,10 @@ export const startMetricsLogger = () => {
 };
 
 export const stopMetricsLogger = () => {
-    if (metricsInt) {
-        clearInterval(metricsInt);
-        metricsInt = null;
-        log.info('METRICS', 'Logger stopped', { uptime });
-    }
+    if (!metricsInt) return;
+    clearInterval(metricsInt);
+    metricsInt = null;
+    log.info('METRICS', 'Logger stopped', { uptime });
 };
 
-export const resetSessionStats = () => {
-    uptime = sesFrames = sesBytes = sesDrops = 0;
-    log.debug('METRICS', 'Session stats reset');
-};
+export const resetSessionStats = () => { uptime = sesFrames = sesBytes = sesDrops = 0; log.debug('METRICS', 'Session stats reset'); };

@@ -11,13 +11,14 @@ const sendControl = (buf, options = {}) => {
     return safe(() => { S.dcControl.send(buf); return true; }, false, 'NET');
 };
 const mkCtrlMsg = (type, size, fn, options) => sendControl(mkBuf(size, v => { v.setUint32(0, type, true); fn?.(v); }), options);
-const mkByte5Msg = (type, val, options) => mkCtrlMsg(type, 5, v => v.setUint8(4, val), options);
+const sendByteControl = (type, value, options) => mkCtrlMsg(type, 5, v => v.setUint8(4, value), options);
+const sendBoolControl = (type, enabled, options) => sendByteControl(type, enabled ? 1 : 0, options);
 
-export const sendAudioEnable = (en, options) => mkByte5Msg(MSG.AUDIO_ENABLE, en ? 1 : 0, options);
-export const sendMicEnable = (en, options) => mkByte5Msg(MSG.MIC_ENABLE, en ? 1 : 0, options);
-export const sendMonitor = idx => mkByte5Msg(MSG.MONITOR_SET, idx);
-export const sendCursorCapture = (en, options) => mkByte5Msg(MSG.CURSOR_CAPTURE, en ? 1 : 0, options);
-const sendCodec = id => mkByte5Msg(MSG.CODEC_SET, id);
+export const sendAudioEnable = (en, options) => sendBoolControl(MSG.AUDIO_ENABLE, en, options);
+export const sendMicEnable = (en, options) => sendBoolControl(MSG.MIC_ENABLE, en, options);
+export const sendMonitor = idx => sendByteControl(MSG.MONITOR_SET, idx);
+export const sendCursorCapture = (en, options) => sendBoolControl(MSG.CURSOR_CAPTURE, en, options);
+const sendCodec = id => sendByteControl(MSG.CODEC_SET, id);
 const sendFps = (fps, mode) => mkCtrlMsg(MSG.FPS_SET, 7, v => { v.setUint16(4, fps, true); v.setUint8(6, mode); });
 
 export const sendPing = () => {

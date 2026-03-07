@@ -9,18 +9,6 @@
 using namespace std::chrono_literals;
 
 namespace {
-template <typename T>
-void WritePod(uint8_t* dst, const T& value) {
-    std::memcpy(dst, &value, sizeof(T));
-}
-
-template <typename T>
-[[nodiscard]] T ReadPod(const uint8_t* src) {
-    T value{};
-    std::memcpy(&value, src, sizeof(T));
-    return value;
-}
-
 const char* ToPeerStateString(rtc::PeerConnection::State s) {
     static constexpr const char* names[] = {"new", "connecting", "connected", "disconnected", "failed", "closed"};
     int i = static_cast<int>(s);

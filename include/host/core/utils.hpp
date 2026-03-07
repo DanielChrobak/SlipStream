@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -21,6 +23,25 @@ template<typename Q, typename V>
 void PushBoundedQueue(Q& q, size_t maxSize, V&& value) {
     if (q.size() >= maxSize) q.pop();
     q.push(std::forward<V>(value));
+}
+
+template<typename T>
+void WritePod(uint8_t* dst, const T& value) {
+    std::memcpy(dst, &value, sizeof(T));
+}
+
+template<typename T>
+[[nodiscard]] T ReadPod(const uint8_t* src) {
+    T value{};
+    std::memcpy(&value, src, sizeof(T));
+    return value;
+}
+
+template<typename T>
+[[nodiscard]] bool ReadPod(const uint8_t* data, size_t len, T& out) {
+    if (len < sizeof(T)) return false;
+    out = ReadPod<T>(data);
+    return true;
 }
 
 inline int64_t GetTimestamp() {

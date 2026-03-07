@@ -40,6 +40,62 @@ const pendingVideoFec = new Map();
 
 const hasPublicIceCandidate = sdp => sdp.includes(' typ srflx') || sdp.includes(' typ relay');
 
+const sameVideoFrameMeta = (left, right) =>
+    left.total === right.total &&
+    left.frameSize === right.frameSize &&
+    left.dataChunkSize === right.dataChunkSize &&
+    left.capTs === right.capTs &&
+    left.sourceTs === right.sourceTs &&
+    left.encodeEndTs === right.encodeEndTs &&
+    left.enqueueTs === right.enqueueTs;
+
+const updatePacketTiming = (target, arrivalMs) => {
+    target.arrivalMs = Math.min(target.arrivalMs, arrivalMs);
+    target.lastPacketMs = Math.max(target.lastPacketMs, arrivalMs);
+};
+
+const finalizeAudioFecGroup = groupStart => {
+    const group = audioFecGroups.get(groupStart);
+    if (!group) return;
+    if (tryRecoverAudioGroup(groupStart) || (group.hasFec && group.dataPackets.size >= group.groupSize)) {
+        audioFecGroups.delete(groupStart);
+    }
+};
+
+const ensureAudioFecGroup = (groupStart, groupSize, updatedAt) => {
+    const group = audioFecGroups.get(groupStart) || {
+        groupSize,
+        dataPackets: new Map(),
+        hasFec: false,
+        fecPayload: null,
+        updatedAt
+    };
+    group.groupSize = groupSize;
+    group.updatedAt = updatedAt;
+    audioFecGroups.set(groupStart, group);
+    return group;
+};
+
+const xorPackets = (target, packets) => {
+    for (const packet of packets) {
+        const limit = Math.min(target.length, packet.length);
+        for (let i = 0; i < limit; i++) target[i] ^= packet[i];
+    }
+};
+
+const rememberAndDeliverAudioPacket = (packetId, packet) => {
+    if (seenAudioPacketIds.has(packetId)) return false;
+    seenAudioPacketIds.add(packetId);
+    trimSeenAudioPacketIds();
+    deliverAudioPacket(packet);
+    return true;
+};
+
+const clearTimer = (timer, clear) => {
+    if (timer) clear(timer);
+    return null;
+};
+
 const cleanupPendingVideoFec = now => {
     if (now - lastPendingFecCleanupAt < 100 && pendingVideoFec.size < 96) return;
     lastPendingFecCleanupAt = now;
@@ -64,16 +120,12 @@ const stashPendingVideoFec = (frameId, frameInfo, groupIndex, chunkData, arrival
         groups: new Map()
     };
 
-    if (pending.total !== frameInfo.total || pending.frameSize !== frameInfo.frameSize ||
-        pending.dataChunkSize !== frameInfo.dataChunkSize || pending.capTs !== frameInfo.capTs ||
-        pending.sourceTs !== frameInfo.sourceTs || pending.encodeEndTs !== frameInfo.encodeEndTs ||
-        pending.enqueueTs !== frameInfo.enqueueTs) {
+    if (!sameVideoFrameMeta(pending, frameInfo)) {
         pendingVideoFec.delete(frameId);
         return;
     }
 
-    pending.arrivalMs = Math.min(pending.arrivalMs, arrivalMs);
-    pending.lastPacketMs = Math.max(pending.lastPacketMs, arrivalMs);
+    updatePacketTiming(pending, arrivalMs);
     if (!pending.groups.has(groupIndex)) pending.groups.set(groupIndex, chunkData.slice());
     pendingVideoFec.set(frameId, pending);
 };
@@ -81,15 +133,12 @@ const stashPendingVideoFec = (frameId, frameInfo, groupIndex, chunkData, arrival
 const attachPendingVideoFec = (frameId, frame) => {
     const pending = pendingVideoFec.get(frameId);
     if (!pending) return;
-    if (pending.total !== frame.total || pending.frameSize !== frame.frameSize ||
-        pending.dataChunkSize !== frame.dataChunkSize || pending.capTs !== frame.capTs ||
-        pending.sourceTs !== frame.sourceTs || pending.encodeEndTs !== frame.encodeEndTs ||
-        pending.enqueueTs !== frame.enqueueTs) {
+    if (!sameVideoFrameMeta(pending, frame)) {
         pendingVideoFec.delete(frameId);
         return;
     }
 
-    frame.arrivalMs = Math.min(frame.arrivalMs, pending.arrivalMs);
+    updatePacketTiming(frame, pending.arrivalMs);
     frame.lastPacketMs = Math.max(frame.lastPacketMs, pending.lastPacketMs);
     frame.fecGroupSize = Math.max(frame.fecGroupSize, pending.fecGroupSize || 1);
     for (const [groupIndex, payload] of pending.groups) {
@@ -128,21 +177,18 @@ const tryRecoverAudioGroup = groupStart => {
     if (!group?.hasFec || !group.fecPayload?.length) return false;
 
     const missing = [];
+    const packets = [];
     for (let i = 0; i < group.groupSize; i++) {
         const packetId = groupStart + i;
-        if (!group.dataPackets.has(packetId)) missing.push(packetId);
+        const packet = group.dataPackets.get(packetId);
+        if (!packet) missing.push(packetId);
+        else packets.push(packet);
     }
 
     if (missing.length !== 1 || group.dataPackets.size < group.groupSize - 1) return false;
 
     const recovered = group.fecPayload.slice();
-    for (let i = 0; i < group.groupSize; i++) {
-        const packetId = groupStart + i;
-        const packet = group.dataPackets.get(packetId);
-        if (!packet) continue;
-        const limit = Math.min(recovered.length, packet.length);
-        for (let j = 0; j < limit; j++) recovered[j] ^= packet[j];
-    }
+    xorPackets(recovered, packets);
 
     if (recovered.byteLength < C.AUDIO_HEADER) return false;
     const recoveredView = new DataView(recovered.buffer, recovered.byteOffset, recovered.byteLength);
@@ -154,12 +200,9 @@ const tryRecoverAudioGroup = groupStart => {
 
     if (msgType !== MSG.AUDIO_DATA || packetType !== AUDIO_PKT_DATA) return false;
     if (packetId !== missing[0] || expectedLen > recovered.byteLength || dataLength === 0) return false;
-    if (seenAudioPacketIds.has(packetId)) return false;
 
     const recoveredPacket = recovered.slice(0, expectedLen);
-    seenAudioPacketIds.add(packetId);
-    trimSeenAudioPacketIds();
-    deliverAudioPacket(recoveredPacket);
+    if (!rememberAndDeliverAudioPacket(packetId, recoveredPacket)) return false;
     log.info('NET', 'Audio FEC recovered packet', { packetId, groupStart });
     return true;
 };
@@ -170,9 +213,9 @@ const abortPendingConnect = reason => {
     activeConnectAbort = null;
 };
 
-const clearPing = () => { if (pingInterval) { clearInterval(pingInterval); pingInterval = null; } };
+const clearPing = () => { pingInterval = clearTimer(pingInterval, clearInterval); };
 
-const clearFirstFrameWatchdog = () => { if (firstFrameWatchdog) { clearTimeout(firstFrameWatchdog); firstFrameWatchdog = null; } };
+const clearFirstFrameWatchdog = () => { firstFrameWatchdog = clearTimer(firstFrameWatchdog, clearTimeout); };
 
 const clearConnectionTimers = () => {
     clearPing();
@@ -573,7 +616,7 @@ const handleAudio = e => {
     const packetId = view.getUint32(12, true);
     const dataLen = view.getUint16(18, true);
     const packetType = view.getUint8(20);
-    const groupSize = Math.max(1, view.getUint8(21) || C.AUDIO_FEC_GROUP_SIZE || 4);
+    const groupSize = Math.max(1, view.getUint8(21) || C.FEC_GROUP_SIZE || 4);
     const expectedLen = C.AUDIO_HEADER + dataLen;
 
     if (dataLen === 0 || expectedLen !== length) {
@@ -589,50 +632,23 @@ const handleAudio = e => {
     cleanupAudioFecGroups(now);
 
     if (packetType === AUDIO_PKT_DATA) {
-        if (seenAudioPacketIds.has(packetId)) {
+        if (!rememberAndDeliverAudioPacket(packetId, e.data)) {
             log.debug('NET', 'Duplicate audio packet', { packetId });
             return;
         }
 
-        seenAudioPacketIds.add(packetId);
-        trimSeenAudioPacketIds();
-        deliverAudioPacket(e.data);
-
         const groupStart = getAudioGroupStart(packetId, groupSize);
-        const group = audioFecGroups.get(groupStart) || {
-            groupSize,
-            dataPackets: new Map(),
-            hasFec: false,
-            fecPayload: null,
-            updatedAt: now
-        };
-        group.groupSize = groupSize;
-        group.updatedAt = now;
+        const group = ensureAudioFecGroup(groupStart, groupSize, now);
         group.dataPackets.set(packetId, new Uint8Array(e.data));
-        audioFecGroups.set(groupStart, group);
-
-        if (tryRecoverAudioGroup(groupStart)) audioFecGroups.delete(groupStart);
-        else if (group.dataPackets.size >= group.groupSize && group.hasFec) audioFecGroups.delete(groupStart);
+        finalizeAudioFecGroup(groupStart);
         return;
     }
 
     const groupStart = packetId;
-    const group = audioFecGroups.get(groupStart) || {
-        groupSize,
-        dataPackets: new Map(),
-        hasFec: false,
-        fecPayload: null,
-        updatedAt: now
-    };
-    group.groupSize = groupSize;
+    const group = ensureAudioFecGroup(groupStart, groupSize, now);
     group.hasFec = true;
-    group.updatedAt = now;
     group.fecPayload = new Uint8Array(e.data, C.AUDIO_HEADER, dataLen);
-    audioFecGroups.set(groupStart, group);
-
-    if (tryRecoverAudioGroup(groupStart) || (group.dataPackets.size >= group.groupSize && group.hasFec)) {
-        audioFecGroups.delete(groupStart);
-    }
+    finalizeAudioFecGroup(groupStart);
 };
 
 // --- Channel lifecycle ---
