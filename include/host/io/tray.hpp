@@ -1,6 +1,6 @@
 #pragma once
 
 bool InitAppTray();
-void PumpAppTrayMessages();
+bool PumpAppTrayMessages();
 void HideAppToTray();
 void CleanupAppTray();

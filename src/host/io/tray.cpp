@@ -58,8 +58,18 @@ void DisableConsoleCloseButton() {
 
 void RequestFullExit() {
     auto& app = GetAppContext();
+    if (app.exitRequested.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    LOG("Tray: exit requested");
     app.exitRequested.store(true, std::memory_order_release);
     app.running.store(false, std::memory_order_release);
+
+    if (g_trayWnd && IsWindow(g_trayWnd)) {
+        PostMessageW(g_trayWnd, WM_CLOSE, 0, 0);
+    }
+    PostQuitMessage(0);
 }
 
 void ShowTrayMenu(HWND wnd) {
@@ -151,9 +161,13 @@ bool InitAppTray() {
     return true;
 }
 
-void PumpAppTrayMessages() {
+bool PumpAppTrayMessages() {
     MSG msg;
     while(PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            GetAppContext().running.store(false, std::memory_order_release);
+            return false;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -161,6 +175,8 @@ void PumpAppTrayMessages() {
     if(g_consoleWnd && IsWindow(g_consoleWnd) && IsWindowVisible(g_consoleWnd) && IsIconic(g_consoleWnd)) {
         HideAppToTray();
     }
+
+    return true;
 }
 
 void HideAppToTray() {

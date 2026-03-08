@@ -8,6 +8,57 @@ void InitCOM() {
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) throw std::runtime_error("COM initialization failed");
 }
 void ChkHR(HRESULT h, const char* m) { if (FAILED(h)) throw std::runtime_error(m); }
+
+IMMDeviceEnumerator* CreateDeviceEnumerator() {
+    IMMDeviceEnumerator* enumerator = nullptr;
+    ChkHR(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                           __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator)), "MMDeviceEnumerator");
+    return enumerator;
+}
+
+IAudioClient* ActivateAudioClient(IMMDevice* device, const char* context) {
+    IAudioClient* client = nullptr;
+    ChkHR(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client)), context);
+    return client;
+}
+
+WAVEFORMATEX* GetAudioMixFormat(IAudioClient* client) {
+    WAVEFORMATEX* format = nullptr;
+    ChkHR(client->GetMixFormat(&format), "GetMixFormat");
+    return format;
+}
+
+template <typename LogFn>
+void LimitResamplerBuffer(std::vector<float>& buffer, size_t& readPos, size_t maxSamples, size_t keepSamples, int channelCount, LogFn&& logFn) {
+    const size_t bufferedSamples = buffer.size() > readPos ? (buffer.size() - readPos) : 0;
+    if (bufferedSamples <= maxSamples) return;
+
+    const size_t dropSamples = bufferedSamples - keepSamples;
+    readPos = std::min(readPos + dropSamples, buffer.size());
+    logFn(dropSamples, bufferedSamples, maxSamples, channelCount);
+}
+
+void TrimConsumedResamplerBuffer(std::vector<float>& buffer, size_t& readPos) {
+    if (readPos == 0 || (readPos < buffer.size() && readPos < 8192)) return;
+
+    if (readPos < buffer.size()) {
+        buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(readPos));
+    } else {
+        buffer.clear();
+    }
+    readPos = 0;
+}
+
+void ResetResamplerState(std::unique_ptr<SpeexResampler>& resampler, size_t& readPos) {
+    resampler->Reset();
+    readPos = 0;
+}
+
+template <typename Queue>
+void ClearQueueAndResetResampler(Queue& queue, std::mutex& queueMutex, std::unique_ptr<SpeexResampler>& resampler, size_t& readPos) {
+    ClearQueue(queue, queueMutex);
+    ResetResamplerState(resampler, readPos);
+}
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -17,11 +68,10 @@ void ChkHR(HRESULT h, const char* m) { if (FAILED(h)) throw std::runtime_error(m
 AudioCapture::AudioCapture() {
     InitCOM();
 
-    ChkHR(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                           __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&deviceEnumerator)), "MMDeviceEnumerator");
+    deviceEnumerator = CreateDeviceEnumerator();
     ChkHR(deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &audioDevice), "GetDefaultAudioEndpoint");
-    ChkHR(audioDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audioClient)), "AudioClient activation");
-    ChkHR(audioClient->GetMixFormat(&waveFormat), "GetMixFormat");
+    audioClient = ActivateAudioClient(audioDevice, "AudioClient activation");
+    waveFormat = GetAudioMixFormat(audioClient);
 
     systemSampleRate = waveFormat->nSamplesPerSec;
     channelCount = std::min(static_cast<int>(waveFormat->nChannels), 2);
@@ -131,16 +181,12 @@ void AudioCapture::Process(const float* data, UINT32 frames, int64_t ts) {
 
     resampler->Process(data, frames);
 
-    const size_t bufferedSamples = resampler->buf.size() > resamplerReadPos
-        ? (resampler->buf.size() - resamplerReadPos)
-        : 0;
     const size_t maxBuf = kFrameSamples * channelCount * 6;
-    if (bufferedSamples > maxBuf) {
-        size_t dropSamples = bufferedSamples - kFrameSamples * channelCount * 2;
+    LimitResamplerBuffer(resampler->buf, resamplerReadPos, maxBuf, kFrameSamples * channelCount * 2, channelCount,
+        [&](size_t dropSamples, size_t bufferedSamples, size_t limitSamples, int channels) {
         WARN("AudioCapture: Resampler buffer overflow, dropping %zu samples (buf=%zu, max=%zu)",
-            dropSamples / channelCount, bufferedSamples / channelCount, maxBuf / channelCount);
-        resamplerReadPos = std::min(resamplerReadPos + dropSamples, resampler->buf.size());
-    }
+            dropSamples / channels, bufferedSamples / channels, limitSamples / channels);
+        });
 
     const size_t frameSamples = static_cast<size_t>(kFrameSamples * channelCount);
     while (resampler->buf.size() >= resamplerReadPos + frameSamples) {
@@ -164,14 +210,7 @@ void AudioCapture::Process(const float* data, UINT32 frames, int64_t ts) {
         queueCv.notify_one();
     }
 
-    if (resamplerReadPos > 0 && (resamplerReadPos >= resampler->buf.size() || resamplerReadPos >= 8192)) {
-        if (resamplerReadPos < resampler->buf.size()) {
-            resampler->buf.erase(resampler->buf.begin(), resampler->buf.begin() + static_cast<std::ptrdiff_t>(resamplerReadPos));
-        } else {
-            resampler->buf.clear();
-        }
-        resamplerReadPos = 0;
-    }
+    TrimConsumedResamplerBuffer(resampler->buf, resamplerReadPos);
 }
 
 void AudioCapture::Start() {
@@ -181,8 +220,7 @@ void AudioCapture::Start() {
     }
     running = true;
     captureActive = true;
-    resampler->Reset();
-    resamplerReadPos = 0;
+    ResetResamplerState(resampler, resamplerReadPos);
     HRESULT startHr = audioClient->Start();
     if (FAILED(startHr)) {
         ERR("AudioCapture: IAudioClient::Start failed: 0x%08X", startHr);
@@ -211,9 +249,7 @@ void AudioCapture::SetStreaming(bool s) {
         LOG("AudioCapture: Streaming %s -> %s", was ? "on" : "off", s ? "on" : "off");
     }
     if (s && !was) {
-        ClearQueue(packetQueue, queueMutex);
-        resampler->Reset();
-        resamplerReadPos = 0;
+        ClearQueueAndResetResampler(packetQueue, queueMutex, resampler, resamplerReadPos);
     }
 }
 
@@ -328,24 +364,18 @@ void MicPlayback::Loop() {
             samplesWritten += toW;
         }
 
-        const size_t bufferedSamples = resampler->buf.size() > resamplerReadPos
-            ? (resampler->buf.size() - resamplerReadPos)
-            : 0;
-        if (bufferedSamples > static_cast<size_t>(kFrameSamples * channelCount * 10)) {
-            size_t toDrop = bufferedSamples - static_cast<size_t>(kFrameSamples * channelCount * 4);
-            resamplerReadPos = std::min(resamplerReadPos + toDrop, resampler->buf.size());
+        LimitResamplerBuffer(
+            resampler->buf,
+            resamplerReadPos,
+            static_cast<size_t>(kFrameSamples * channelCount * 10),
+            static_cast<size_t>(kFrameSamples * channelCount * 4),
+            channelCount,
+            [&](size_t dropSamples, size_t, size_t, int channels) {
             bufferOverruns++;
-            DBG("MicPlayback: Buffer overrun, dropped %zu samples", toDrop / channelCount);
-        }
+            DBG("MicPlayback: Buffer overrun, dropped %zu samples", dropSamples / channels);
+            });
 
-        if (resamplerReadPos > 0 && (resamplerReadPos >= resampler->buf.size() || resamplerReadPos >= 8192)) {
-            if (resamplerReadPos < resampler->buf.size()) {
-                resampler->buf.erase(resampler->buf.begin(), resampler->buf.begin() + static_cast<std::ptrdiff_t>(resamplerReadPos));
-            } else {
-                resampler->buf.clear();
-            }
-            resamplerReadPos = 0;
-        }
+        TrimConsumedResamplerBuffer(resampler->buf, resamplerReadPos);
     }
     CoUninitialize();
     DBG("MicPlayback: Loop thread exiting");
@@ -354,8 +384,7 @@ void MicPlayback::Loop() {
 MicPlayback::MicPlayback(const std::string& deviceName) : targetDevice(deviceName) {
     InitCOM();
 
-    ChkHR(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                           __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&deviceEnumerator)), "MMDeviceEnumerator");
+    deviceEnumerator = CreateDeviceEnumerator();
 
     audioDevice = FindDevice(targetDevice);
     if (!audioDevice) {
@@ -364,8 +393,8 @@ MicPlayback::MicPlayback(const std::string& deviceName) : targetDevice(deviceNam
         actualDeviceName = "(default output)";
     }
 
-    ChkHR(audioDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audioClient)), "IAudioClient");
-    ChkHR(audioClient->GetMixFormat(&waveFormat), "GetMixFormat");
+    audioClient = ActivateAudioClient(audioDevice, "IAudioClient");
+    waveFormat = GetAudioMixFormat(audioClient);
 
     deviceSampleRate = waveFormat->nSamplesPerSec;
     channelCount = waveFormat->nChannels;
@@ -407,8 +436,7 @@ MicPlayback::~MicPlayback() {
 void MicPlayback::Start() {
     if (running.load(std::memory_order_acquire) || !init.load(std::memory_order_acquire)) return;
     running.store(true, std::memory_order_release);
-    resampler->Reset();
-    resamplerReadPos = 0;
+    ResetResamplerState(resampler, resamplerReadPos);
     if (FAILED(audioClient->Start())) { ERR("MicPlayback: IAudioClient::Start failed"); running.store(false, std::memory_order_release); return; }
     playbackThread = std::thread(&MicPlayback::Loop, this);
     LOG("MicPlayback: Started");
@@ -428,9 +456,9 @@ void MicPlayback::Stop() {
 void MicPlayback::SetStreaming(bool s) {
     bool was = streaming.exchange(s, std::memory_order_acq_rel);
     if (s && !was) {
-        ClearQueue(packetQueue, queueMutex);
-        resampler->Reset();
-        resamplerReadPos = 0;
+        ClearQueueAndResetResampler(packetQueue, queueMutex, resampler, resamplerReadPos);
+    } else if (!s && was) {
+        ClearQueueAndResetResampler(packetQueue, queueMutex, resampler, resamplerReadPos);
     }
 }
 

@@ -427,7 +427,4 @@ export const setRelativeMouseMode = enable => {
 };
 
 export const enableControl = () => toggleControl(1);
-if (window.matchMedia('(pointer: fine)').matches) {
-    log.debug('INPUT', 'Fine pointer detected, enabling control');
-    enableControl();
-}
+export const disableControl = () => toggleControl(0);

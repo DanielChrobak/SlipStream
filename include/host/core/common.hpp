@@ -37,6 +37,8 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <cstdlib>
+#include <cctype>
 #include <utility>
 #include "host/core/logging.hpp"
 #include "host/core/protocol.hpp"
@@ -73,6 +75,33 @@ std::string BytesToHex(const unsigned char* d, size_t n);
 std::string GenerateSalt(size_t n = 16);
 std::string HashPassword(const std::string& pw, const std::string& salt);
 bool VerifyPassword(const std::string& pw, const std::string& salt, const std::string& stored);
+inline bool GetEnvBool(const char* name, bool fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    return fallback;
+}
+
+inline int GetEnvInt(const char* name, int fallback, int minValue, int maxValue) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (!end || *end != '\0' || parsed < minValue || parsed > maxValue) return fallback;
+    return static_cast<int>(parsed);
+}
+
+inline uint32_t GetEnvUInt(const char* name, uint32_t fallback, uint32_t minValue, uint32_t maxValue) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 10);
+    if (!end || *end != '\0' || parsed < minValue || parsed > maxValue) return fallback;
+    return static_cast<uint32_t>(parsed);
+}
 
 class JWTAuth {
     std::string sec;

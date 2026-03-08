@@ -1,5 +1,7 @@
 #include "host/media/encoder.hpp"
 
+#include <d3dcompiler.h>
+
 using std::chrono::steady_clock;
 
 namespace {
@@ -135,6 +137,116 @@ namespace {
         for (auto v : {GPUVendor::NVIDIA, GPUVendor::INTEL, GPUVendor::AMD})
             if (v != detected) list.push_back(v);
         return list;
+    }
+
+    constexpr const char* kScaleVertexShader = R"(
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+VSOut main(uint vertexId : SV_VertexID) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(-1.0,  3.0),
+        float2( 3.0, -1.0)
+    };
+    float2 texCoords[3] = {
+        float2(0.0, 1.0),
+        float2(0.0, -1.0),
+        float2(2.0, 1.0)
+    };
+
+    VSOut output;
+    output.pos = float4(positions[vertexId], 0.0, 1.0);
+    output.uv = texCoords[vertexId];
+    return output;
+}
+)";
+
+    constexpr const char* kScalePixelShader = R"(
+cbuffer ScaleConstants : register(b0) {
+    float sourceWidth;
+    float sourceHeight;
+    float invSourceWidth;
+    float invSourceHeight;
+};
+
+Texture2D sourceTex : register(t0);
+SamplerState linearClampSampler : register(s0);
+
+float4 SampleCatmullRom(float2 uv) {
+    float2 textureSize = float2(sourceWidth, sourceHeight);
+    float2 inverseTextureSize = float2(invSourceWidth, invSourceHeight);
+    float2 samplePos = uv * textureSize;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 fraction = samplePos - texPos1;
+
+    float2 w0 = fraction * (-0.5 + fraction * (1.0 - 0.5 * fraction));
+    float2 w1 = 1.0 + fraction * fraction * (-2.5 + 1.5 * fraction);
+    float2 w2 = fraction * (0.5 + fraction * (2.0 - 1.5 * fraction));
+    float2 w3 = fraction * fraction * (-0.5 + 0.5 * fraction);
+
+    float2 w12 = w1 + w2;
+    float2 offset12 = w2 / w12;
+
+    float2 texPos0 = (texPos1 - 1.0) * inverseTextureSize;
+    float2 texPos3 = (texPos1 + 2.0) * inverseTextureSize;
+    float2 texPos12 = (texPos1 + offset12) * inverseTextureSize;
+
+    float4 result = 0.0;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos0.x,  texPos0.y),  0.0) * w0.x * w0.y;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos12.x, texPos0.y),  0.0) * w12.x * w0.y;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos3.x,  texPos0.y),  0.0) * w3.x * w0.y;
+
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos0.x,  texPos12.y), 0.0) * w0.x * w12.y;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos12.x, texPos12.y), 0.0) * w12.x * w12.y;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos3.x,  texPos12.y), 0.0) * w3.x * w12.y;
+
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos0.x,  texPos3.y),  0.0) * w0.x * w3.y;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos12.x, texPos3.y),  0.0) * w12.x * w3.y;
+    result += sourceTex.SampleLevel(linearClampSampler, float2(texPos3.x,  texPos3.y),  0.0) * w3.x * w3.y;
+    return result;
+}
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return SampleCatmullRom(uv);
+}
+)";
+
+    bool CompileShader(const char* source, const char* entryPoint, const char* target, ID3DBlob** blob) {
+        UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#ifndef NDEBUG
+        flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+        flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+
+        ID3DBlob* errorBlob = nullptr;
+        const HRESULT hr = D3DCompile(
+            source,
+            strlen(source),
+            nullptr,
+            nullptr,
+            nullptr,
+            entryPoint,
+            target,
+            flags,
+            0,
+            blob,
+            &errorBlob);
+
+        if (FAILED(hr)) {
+            ERR("VideoEncoder: D3DCompile failed for %s/%s: %s",
+                entryPoint,
+                target,
+                errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "unknown error");
+            SafeRelease(errorBlob);
+            return false;
+        }
+
+        SafeRelease(errorBlob);
+        return true;
     }
 }
 
@@ -393,6 +505,180 @@ bool VideoEncoder::InitSwFrame(const AVCodec* enc) {
     return true;
 }
 
+bool VideoEncoder::InitScaler() {
+    if (scaleTex && scaleRtv && scaleVs && scalePs && scaleSampler && scaleConstBuf) {
+        return true;
+    }
+
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    bool ok = false;
+
+    do {
+        if (!CompileShader(kScaleVertexShader, "main", "vs_4_0", &vsBlob) ||
+            !CompileShader(kScalePixelShader, "main", "ps_4_0", &psBlob)) {
+            break;
+        }
+
+        if (FAILED(dev->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &scaleVs))) {
+            ERR("VideoEncoder: CreateVertexShader failed for scaler");
+            break;
+        }
+
+        if (FAILED(dev->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &scalePs))) {
+            ERR("VideoEncoder: CreatePixelShader failed for scaler");
+            break;
+        }
+
+        D3D11_SAMPLER_DESC samplerDesc{};
+        samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samplerDesc.MinLOD = 0.0f;
+        samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(dev->CreateSamplerState(&samplerDesc, &scaleSampler))) {
+            ERR("VideoEncoder: CreateSamplerState failed for scaler");
+            break;
+        }
+
+        D3D11_BUFFER_DESC bufferDesc{};
+        bufferDesc.ByteWidth = sizeof(ScaleConstants);
+        bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+        bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(dev->CreateBuffer(&bufferDesc, nullptr, &scaleConstBuf))) {
+            ERR("VideoEncoder: CreateBuffer failed for scaler constants");
+            break;
+        }
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = static_cast<UINT>(w);
+        td.Height = static_cast<UINT>(h);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &scaleTex))) {
+            ERR("VideoEncoder: CreateTexture2D failed for scaler output");
+            break;
+        }
+
+        if (FAILED(dev->CreateRenderTargetView(scaleTex, nullptr, &scaleRtv))) {
+            ERR("VideoEncoder: CreateRenderTargetView failed for scaler output");
+            break;
+        }
+
+        ok = true;
+    } while (false);
+
+    SafeRelease(vsBlob, psBlob);
+
+    if (!ok) {
+        SafeRelease(scaleConstBuf, scaleSampler, scalePs, scaleVs, scaleRtv, scaleTex);
+    }
+
+    return ok;
+}
+
+ID3D11ShaderResourceView* VideoEncoder::GetScaleSourceView(ID3D11Texture2D* tex) {
+    if (!tex) return nullptr;
+
+    if (const auto it = scaleSourceViews.find(tex); it != scaleSourceViews.end()) {
+        return it->second;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    tex->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        ERR("VideoEncoder: Unsupported scaler source texture format: %d", static_cast<int>(desc.Format));
+        return nullptr;
+    }
+
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (FAILED(dev->CreateShaderResourceView(tex, nullptr, &srv))) {
+        ERR("VideoEncoder: CreateShaderResourceView failed for scaler source");
+        return nullptr;
+    }
+
+    scaleSourceViews.emplace(tex, srv);
+    return srv;
+}
+
+ID3D11Texture2D* VideoEncoder::PrepareInputTexture(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& desc) {
+    if (!tex) return nullptr;
+    if (desc.Width == static_cast<UINT>(w) && desc.Height == static_cast<UINT>(h)) {
+        return tex;
+    }
+
+    if (!InitScaler()) {
+        return nullptr;
+    }
+
+    ID3D11ShaderResourceView* sourceView = GetScaleSourceView(tex);
+    if (!sourceView) {
+        return nullptr;
+    }
+
+    if (scaleSrcW != static_cast<int>(desc.Width) || scaleSrcH != static_cast<int>(desc.Height)) {
+        scaleSrcW = static_cast<int>(desc.Width);
+        scaleSrcH = static_cast<int>(desc.Height);
+        LOG("VideoEncoder: GPU scaling input %dx%d -> %dx%d",
+            scaleSrcW,
+            scaleSrcH,
+            w,
+            h);
+    }
+
+    const ScaleConstants constants{
+        static_cast<float>(desc.Width),
+        static_cast<float>(desc.Height),
+        1.0f / static_cast<float>(desc.Width),
+        1.0f / static_cast<float>(desc.Height)
+    };
+
+    {
+        MTLock lk(mt);
+        ctx->UpdateSubresource(scaleConstBuf, 0, nullptr, &constants, 0, 0);
+
+        ID3D11RenderTargetView* rtv = scaleRtv;
+        ctx->OMSetRenderTargets(1, &rtv, nullptr);
+
+        D3D11_VIEWPORT viewport{};
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = 0.0f;
+        viewport.Width = static_cast<float>(w);
+        viewport.Height = static_cast<float>(h);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        ctx->RSSetViewports(1, &viewport);
+
+        ctx->IASetInputLayout(nullptr);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->VSSetShader(scaleVs, nullptr, 0);
+        ctx->PSSetShader(scalePs, nullptr, 0);
+
+        ID3D11Buffer* constantBuffers[] = {scaleConstBuf};
+        ctx->PSSetConstantBuffers(0, 1, constantBuffers);
+
+        ID3D11SamplerState* samplers[] = {scaleSampler};
+        ctx->PSSetSamplers(0, 1, samplers);
+
+        ID3D11ShaderResourceView* sourceViews[] = {sourceView};
+        ctx->PSSetShaderResources(0, 1, sourceViews);
+
+        ctx->Draw(3, 0);
+
+        ID3D11ShaderResourceView* nullViews[] = {nullptr};
+        ctx->PSSetShaderResources(0, 1, nullViews);
+        ID3D11RenderTargetView* nullRtvs[] = {nullptr};
+        ctx->OMSetRenderTargets(1, nullRtvs, nullptr);
+    }
+
+    return scaleTex;
+}
+
 bool VideoEncoder::UploadSoftwareFrame(ID3D11Texture2D* tex, AVFrame* frame) {
     if (!tex || !frame || !stagingTex || !swsCtx) return false;
 
@@ -622,6 +908,12 @@ VideoEncoder::~VideoEncoder() {
     av_buffer_unref(&hwFrCtx);
     av_buffer_unref(&hwDev);
     if (cctx) avcodec_free_context(&cctx);
+    for (auto& [tex, view] : scaleSourceViews) {
+        (void)tex;
+        SafeRelease(view);
+    }
+    scaleSourceViews.clear();
+    SafeRelease(scaleConstBuf, scaleSampler, scalePs, scaleVs, scaleRtv, scaleTex);
     SafeRelease(stagingTex);
     SafeRelease(mt, ctx, dev);
 }
@@ -669,8 +961,9 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, int64_t sou
 
     D3D11_TEXTURE2D_DESC desc;
     tex->GetDesc(&desc);
-    if (desc.Width != static_cast<UINT>(w) || desc.Height != static_cast<UINT>(h)) {
-        WARN("VideoEncoder: Size mismatch: %ux%u vs %dx%d", desc.Width, desc.Height, w, h);
+    ID3D11Texture2D* inputTex = PrepareInputTexture(tex, desc);
+    if (!inputTex) {
+        WARN("VideoEncoder: Failed to prepare input texture %ux%u for %dx%d encode", desc.Width, desc.Height, w, h);
         return nullptr;
     }
 
@@ -694,7 +987,7 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, int64_t sou
         {
             MTLock lk(mt);
             ctx->CopySubresourceRegion(reinterpret_cast<ID3D11Texture2D*>(hwFr->data[0]),
-                static_cast<UINT>(reinterpret_cast<intptr_t>(hwFr->data[1])), 0, 0, 0, tex, 0, nullptr);
+                static_cast<UINT>(reinterpret_cast<intptr_t>(hwFr->data[1])), 0, 0, 0, inputTex, 0, nullptr);
             sig = sync.Signal();
         }
 
@@ -707,7 +1000,7 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, int64_t sou
 
         encodeFrame = hwFr;
     } else {
-        if (!UploadSoftwareFrame(tex, swFr)) {
+        if (!UploadSoftwareFrame(inputTex, swFr)) {
             failedFrames++;
             return nullptr;
         }

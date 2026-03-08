@@ -72,6 +72,7 @@ public:
     ~ScreenCapture();
 
     void SetResolutionChangeCallback(std::function<void(int, int, int)> cb) { onResChange = cb; }
+    void Shutdown();
     void StartCapture();
     void PauseCapture();
     bool SwitchMonitor(int i);

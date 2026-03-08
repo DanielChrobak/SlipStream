@@ -71,7 +71,7 @@ target_include_directories(SlipStream PRIVATE ${MINIUPNPC_INCLUDE_DIR} ${AVCODEC
 target_link_libraries(SlipStream PRIVATE LibDataChannel::LibDataChannel httplib::httplib nlohmann_json::nlohmann_json Opus::opus OpenSSL::SSL OpenSSL::Crypto jwt-cpp::jwt-cpp ${MINIUPNPC_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY} ${SPEEXDSP_LIBRARY})
 
 if(WIN32)
-    target_link_libraries(SlipStream PRIVATE ws2_32 iphlpapi d3d11 dxgi dxguid ole32 windowsapp)
+    target_link_libraries(SlipStream PRIVATE ws2_32 iphlpapi d3d11 dxgi dxguid d3dcompiler ole32 windowsapp)
     target_compile_options(SlipStream PRIVATE /await:strict /EHsc /W4 /wd4100 /wd4189)
     target_link_options(SlipStream PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
     target_compile_definitions(SlipStream PRIVATE WINRT_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _CRT_SECURE_NO_WARNINGS)

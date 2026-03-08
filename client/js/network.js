@@ -1,5 +1,5 @@
 
-import { enableControl } from './input.js';
+import { enableControl, disableControl } from './input.js';
 import { MSG, C } from './constants.js';
 import { S, $, safe, updateClockOffset, resetClockSync,
     startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket,
@@ -13,6 +13,7 @@ import { stopMic } from './mic.js';
 import { showAuth, clearSession, validateSession } from './auth.js';
 import { sendPing, requestKeyframe, requestRecoveryKeyframe, clearPendingKeyReq,
     applyCodec, applyFps, getMaxInFlightFrames, expectedChunkSize,
+    resendStreamTarget,
     tryRecoverFrameGroup, resetProtocolState } from './protocol.js';
 
 const BASE_URL = location.origin;
@@ -225,6 +226,7 @@ const clearConnectionTimers = () => {
 const resetActiveSession = () => {
     clearConnectionTimers();
     stopMetricsLogger();
+    disableControl();
     resetRenderer();
     stopKeyframeRetry();
     channelsReady = 0;
@@ -378,6 +380,7 @@ const processFrame = (frameId, frame) => {
     if (waitingFirstFrame && decodeAccepted) {
         waitingFirstFrame = false;
         clearFirstFrameWatchdog();
+        enableControl();
         hideLoading();
         hasConnection = true;
         log.info('NET', 'First frame received', { frameId, isKey: frame.isKey ? 1 : 0, size: buffer.byteLength });
@@ -400,7 +403,6 @@ const handleControl = async e => {
     }
     if (msgType === MSG.HOST_INFO && length >= 6) {
         S.hostFps = view.getUint16(4, true);
-        if (!S.fpsSent) setTimeout(() => applyFps(getStoredFps() ?? 60), 50);
         if (!hasConnection) { updateLoadingStage('Connected'); waitingFirstFrame = true; armFirstFrameWatchdog(); log.info('NET', 'Waiting for first frame', { seq: activeConnectSeq }); }
         log.info('NET', 'Host info', { fps: S.hostFps });
         return recordPacket(length, 'control');
@@ -419,14 +421,17 @@ const handleControl = async e => {
     }
     if (msgType === MSG.CODEC_CAPS && length === 5) {
         setHostCodecs(view.getUint8(4));
-        if (!S.codecSent) setTimeout(() => applyCodec(getStoredCodec()), 100);
+        await updateCodecOpts();
+        if (!S.codecSent) applyCodec(S.currentCodec);
         log.info('NET', 'Codec caps', { caps: view.getUint8(4).toString(2) });
         return recordPacket(length, 'control');
     }
     if (msgType === MSG.CODEC_ACK && length === 5) {
         S.currentCodec = view.getUint8(4);
         updateCodecDropdown(S.currentCodec);
-        initDecoder(true);
+        await initDecoder(true);
+        resendStreamTarget();
+        if (!S.fpsSent) applyFps(getStoredFps() ?? 60);
         log.info('NET', 'Codec ack', { codec: S.currentCodec });
         return recordPacket(length, 'control');
     }
@@ -677,7 +682,7 @@ const onAllChannelsOpen = async connectSeq => {
     resetClockSync();
     resetSessionStats();
     updateLoadingStage('Connected');
-    await initDecoder();
+    resendStreamTarget();
     clearPing();
     startMetricsLogger();
     pingInterval = setInterval(sendPing, C.PING_MS);
@@ -899,7 +904,6 @@ const startConnection = async () => {
     S.currentCodec = codecResult.codecId;
     log.info('NET', 'Codec detection', { best: codecResult.codecName });
     await updateCodecOpts();
-    enableControl();
     showLoading(false);
     try { await startConnection(); }
     catch (e) { log.error('NET', 'Connection failed', { error: e.message }); showAuth('Connection failed: ' + e.message); }

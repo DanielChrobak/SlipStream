@@ -260,9 +260,18 @@ ScreenCapture::ScreenCapture(FrameSlot* s) : slot(s) {
 }
 
 ScreenCapture::~ScreenCapture() {
+    Shutdown();
+
+    for (auto& t : texPool) SafeRelease(t);
+    SafeRelease(mt, ctx, dev);
+    try { winrt::uninit_apartment(); } catch (...) { DBG("Capture: uninit_apartment exception"); }
+}
+
+void ScreenCapture::Shutdown() {
     running = false;
     capturing = false;
-    captureGen.fetch_add(1);
+    slot->SetGeneration(captureGen.fetch_add(1) + 1);
+    slot->Wake();
 
     {
         std::lock_guard<std::recursive_mutex> lk(mtx);
@@ -271,13 +280,10 @@ ScreenCapture::~ScreenCapture() {
         sess = nullptr;
         pool = nullptr;
         item = nullptr;
+        started = false;
     }
 
     WaitCB();
-
-    for (auto& t : texPool) SafeRelease(t);
-    SafeRelease(mt, ctx, dev);
-    try { winrt::uninit_apartment(); } catch (...) { DBG("Capture: uninit_apartment exception"); }
 }
 
 void ScreenCapture::StartCapture() {
@@ -297,6 +303,7 @@ void ScreenCapture::StartCapture() {
 void ScreenCapture::PauseCapture() {
     std::lock_guard<std::recursive_mutex> lk(mtx);
     if (!capturing.exchange(false)) return;
+    slot->SetGeneration(captureGen.fetch_add(1) + 1);
     slot->Reset();
     LOG("ScreenCapture: Capture paused");
 }

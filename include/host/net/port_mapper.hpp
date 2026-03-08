@@ -87,6 +87,11 @@ private:
     void DeleteNatPmpMappings(const std::vector<MappingLease>& leases, const std::string& gatewayAddress) const;
     void ApplyOutcomeLocked(Method method, const std::string& gatewayAddress, const std::string& localAddress, const MethodOutcome& outcome);
     void SetFailureLocked(const std::string& gatewayAddress, const std::string& localAddress, const std::string& error);
+    static void RecordRuleFailure(MethodOutcome& outcome, const MappingRule& rule, std::string error);
+    static void RecordRuleSuccess(MethodOutcome& outcome, const MappingRule& rule, uint16_t externalPort, uint32_t lifetimeSeconds,
+                                  const std::array<uint8_t, 12>* nonce = nullptr);
+    static bool IsOutcomeActive(const MethodOutcome& outcome);
+    static std::array<Method, 3> GetMethodOrder(Method activeMethod);
     static const char* MethodName(Method method);
 
     mutable std::mutex mutex_;

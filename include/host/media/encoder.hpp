@@ -1,6 +1,8 @@
 #pragma once
 #include "host/core/common.hpp"
 
+#include <unordered_map>
+
 enum class GPUVendor : uint8_t { NVIDIA=0, INTEL=1, AMD=2, UNKNOWN=255 };
 
 struct EncodedFrame {
@@ -26,6 +28,12 @@ class VideoEncoder {
     ID3D11DeviceContext* ctx=nullptr;
     ID3D11Multithread* mt=nullptr;
     ID3D11Texture2D* stagingTex=nullptr;
+    ID3D11Texture2D* scaleTex=nullptr;
+    ID3D11RenderTargetView* scaleRtv=nullptr;
+    ID3D11VertexShader* scaleVs=nullptr;
+    ID3D11PixelShader* scalePs=nullptr;
+    ID3D11SamplerState* scaleSampler=nullptr;
+    ID3D11Buffer* scaleConstBuf=nullptr;
     D3D11FenceSync sync;
     int w, h, frameNum=0, curFps;
     CodecType codec;
@@ -36,12 +44,24 @@ class VideoEncoder {
     std::chrono::steady_clock::time_point lastKey;
     EncodedFrame out;
     std::atomic<uint64_t> totalFrames{0}, failedFrames{0};
+    std::unordered_map<ID3D11Texture2D*, ID3D11ShaderResourceView*> scaleSourceViews;
+    int scaleSrcW=0, scaleSrcH=0;
 
     static constexpr auto KEY_INT = std::chrono::milliseconds{2000};
+
+    struct ScaleConstants {
+        float sourceWidth;
+        float sourceHeight;
+        float invSourceWidth;
+        float invSourceHeight;
+    };
 
     bool InitHwCtx();
     bool InitSwFrame(const AVCodec* enc);
     bool UploadSoftwareFrame(ID3D11Texture2D* tex, AVFrame* frame);
+    bool InitScaler();
+    ID3D11ShaderResourceView* GetScaleSourceView(ID3D11Texture2D* tex);
+    ID3D11Texture2D* PrepareInputTexture(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& desc);
     void Configure();
     bool TryInitHardware(GPUVendor v, CodecType cc);
     bool TryInitSoftware(CodecType cc);

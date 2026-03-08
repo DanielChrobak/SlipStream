@@ -26,8 +26,8 @@ SlipStream captures the Windows desktop with the Windows Graphics Capture API an
 |                                                 |            +----------+    |
 |                          +----------------------+----------------------+     |
 |                          |       HTTPS Server (port 443)               |     |
-|                          |    cpp-httplib + OpenSSL                     |     |
-|                          |    JWT Auth + Rate Limiting                  |     |
+|                          |    cpp-httplib + OpenSSL                    |     |
+|                          |    JWT Auth + Rate Limiting                 |     |
 |                          +----------------------+----------------------+     |
 +---------------------------------------------+--------------------------------+
                                               |

@@ -20,6 +20,10 @@ export const sendMonitor = idx => sendByteControl(MSG.MONITOR_SET, idx);
 export const sendCursorCapture = (en, options) => sendBoolControl(MSG.CURSOR_CAPTURE, en, options);
 const sendCodec = id => sendByteControl(MSG.CODEC_SET, id);
 const sendFps = (fps, mode) => mkCtrlMsg(MSG.FPS_SET, 7, v => { v.setUint16(4, fps, true); v.setUint8(6, mode); });
+const sendStreamTarget = (width, height, options) => mkCtrlMsg(MSG.STREAM_TARGET, 8, v => {
+    v.setUint16(4, width, true);
+    v.setUint16(6, height, true);
+}, options);
 
 export const sendPing = () => {
     if (S.dcControl?.readyState !== 'open') return;
@@ -92,6 +96,49 @@ export const applyFps = val => {
         bus.emit('fps:applied', fps);
         log.info('NET', 'FPS set', { fps, mode });
     }
+};
+
+let pendingStreamTargetTimer = null;
+let pendingStreamTarget = { width: 0, height: 0 };
+let sentStreamTarget = { width: 0, height: 0 };
+
+const clearPendingStreamTarget = () => {
+    if (pendingStreamTargetTimer) {
+        clearTimeout(pendingStreamTargetTimer);
+        pendingStreamTargetTimer = null;
+    }
+};
+
+const flushStreamTarget = () => {
+    clearPendingStreamTarget();
+    const width = pendingStreamTarget.width | 0;
+    const height = pendingStreamTarget.height | 0;
+    if (width <= 0 || height <= 0) return false;
+    if (width === sentStreamTarget.width && height === sentStreamTarget.height) return false;
+    const sent = sendStreamTarget(width, height, { suppressIfClosed: true });
+    if (sent) {
+        sentStreamTarget = { width, height };
+        log.debug('NET', 'Stream target sent', { width, height });
+    }
+    return sent;
+};
+
+export const updateStreamTarget = (width, height, immediate = false) => {
+    const nextWidth = Math.max(0, width | 0);
+    const nextHeight = Math.max(0, height | 0);
+    if (nextWidth <= 0 || nextHeight <= 0) return;
+    pendingStreamTarget = { width: nextWidth, height: nextHeight };
+    if (immediate) {
+        flushStreamTarget();
+        return;
+    }
+    clearPendingStreamTarget();
+    pendingStreamTargetTimer = setTimeout(flushStreamTarget, 120);
+};
+
+export const resendStreamTarget = () => {
+    sentStreamTarget = { width: 0, height: 0 };
+    flushStreamTarget();
 };
 
 // --- Adaptive quality ---
@@ -172,4 +219,6 @@ export const resetProtocolState = () => {
     lastKeyReqAt = lastRecoveryKeyReqAt = lastAdaptiveQualityAt = 0;
     codecFallbackApplied = false;
     clearPendingKeyReq();
+    clearPendingStreamTarget();
+    sentStreamTarget = { width: 0, height: 0 };
 };

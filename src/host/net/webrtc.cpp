@@ -1,8 +1,6 @@
 #include "host/net/webrtc.hpp"
 #include <algorithm>
 #include <array>
-#include <cctype>
-#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -24,30 +22,6 @@ const char* ToGatherStateString(rtc::PeerConnection::GatheringState s) {
 bool HasPublicIceCandidate(const std::string& sdp) {
     return sdp.find(" typ srflx") != std::string::npos ||
            sdp.find(" typ relay") != std::string::npos;
-}
-
-int GetEnvInt(const char* name, int fallback, int minValue, int maxValue) {
-    const char* raw = std::getenv(name);
-    if (!raw || !*raw) return fallback;
-
-    char* end = nullptr;
-    const long parsed = std::strtol(raw, &end, 10);
-    if (!end || *end != '\0') return fallback;
-    if (parsed < minValue || parsed > maxValue) return fallback;
-    return static_cast<int>(parsed);
-}
-
-bool GetEnvBool(const char* name, bool fallback) {
-    const char* raw = std::getenv(name);
-    if (!raw || !*raw) return fallback;
-
-    std::string value(raw);
-    std::transform(value.begin(), value.end(), value.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
-    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
-    return fallback;
 }
 
 constexpr int kDefaultIcePortBegin = 50000;
@@ -323,11 +297,20 @@ void WebRTCServer::HandleCtrl(const rtc::binary& message) {
             break;
 
         case MSG_MONITOR_SET:
-            if (message.size() == 5 && callbacks_.onMonitorChange) {
-                if (callbacks_.onMonitorChange(static_cast<int>(static_cast<uint8_t>(message[4])))) {
-                    needsKey = true;
-                    SendMonitorList();
-                    SendHostInfo();
+            if (message.size() == 5 && callbacks_.onMonitorChange &&
+                callbacks_.onMonitorChange(static_cast<int>(static_cast<uint8_t>(message[4])))) {
+                needsKey = true;
+                SendMonitorList();
+                SendHostInfo();
+            }
+            break;
+
+        case MSG_STREAM_TARGET:
+            if (message.size() == 8 && callbacks_.onStreamTargetChange) {
+                const uint16_t width = ReadPod<uint16_t>(data + 4);
+                const uint16_t height = ReadPod<uint16_t>(data + 6);
+                if (width && height) {
+                    callbacks_.onStreamTargetChange(static_cast<int>(width), static_cast<int>(height));
                 }
             }
             break;
@@ -428,6 +411,17 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
     {
         std::lock_guard<std::mutex> lk(micFecMutex_);
 
+        auto acceptRecoveredPacket = [&](uint32_t groupStart, std::vector<uint8_t> recovered) {
+            if (recovered.empty()) return;
+            const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
+            if (micSeenPacketIds_.find(recHeader->packetId) == micSeenPacketIds_.end()) {
+                micSeenPacketIds_.insert(recHeader->packetId);
+                recoveredPacketToDeliver = std::move(recovered);
+                LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);
+            }
+            micFecGroups_.erase(groupStart);
+        };
+
         auto tryRecoverGroup = [&](uint32_t groupStart, MicFecGroupState& group) -> std::vector<uint8_t> {
             if (!group.hasFec || group.fecPayload.empty()) return {};
 
@@ -435,7 +429,7 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
             missing.reserve(group.groupSize);
             for (uint32_t i = 0; i < group.groupSize; i++) {
                 uint32_t packetId = groupStart + i;
-                    if (group.dataPackets.find(packetId) == group.dataPackets.end()) missing.push_back(packetId);
+                if (group.dataPackets.find(packetId) == group.dataPackets.end()) missing.push_back(packetId);
             }
 
             if (missing.size() != 1 || group.dataPackets.size() < static_cast<size_t>(group.groupSize - 1)) {
@@ -465,6 +459,13 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
             return recovered;
         };
 
+        const uint32_t groupStart = header->packetType == PKT_DATA
+            ? header->packetId - (header->packetId % groupSize)
+            : header->packetId;
+        auto& group = micFecGroups_[groupStart];
+        group.groupSize = groupSize;
+        group.updatedMs = nowMs;
+
         if (header->packetType == PKT_DATA) {
             if (micSeenPacketIds_.find(header->packetId) != micSeenPacketIds_.end()) return;
 
@@ -477,42 +478,13 @@ void WebRTCServer::HandleMic(const rtc::binary& message) {
                 }
             }
 
-            const uint32_t groupStart = header->packetId - (header->packetId % groupSize);
-            auto& group = micFecGroups_[groupStart];
-            group.groupSize = groupSize;
-            group.updatedMs = nowMs;
             group.dataPackets[header->packetId] = std::vector<uint8_t>(bytes, bytes + message.size());
-
             dataPacketToDeliver = group.dataPackets[header->packetId];
-
-            auto recovered = tryRecoverGroup(groupStart, group);
-            if (!recovered.empty()) {
-                const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
-                if (micSeenPacketIds_.find(recHeader->packetId) == micSeenPacketIds_.end()) {
-                    micSeenPacketIds_.insert(recHeader->packetId);
-                    recoveredPacketToDeliver = std::move(recovered);
-                    LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);
-                }
-                micFecGroups_.erase(groupStart);
-            }
+            acceptRecoveredPacket(groupStart, tryRecoverGroup(groupStart, group));
         } else {
-            const uint32_t groupStart = header->packetId;
-            auto& group = micFecGroups_[groupStart];
-            group.groupSize = groupSize;
-            group.updatedMs = nowMs;
             group.hasFec = true;
             group.fecPayload.assign(bytes + sizeof(MicPacketHeader), bytes + message.size());
-
-            auto recovered = tryRecoverGroup(groupStart, group);
-            if (!recovered.empty()) {
-                const auto* recHeader = reinterpret_cast<const MicPacketHeader*>(recovered.data());
-                if (micSeenPacketIds_.find(recHeader->packetId) == micSeenPacketIds_.end()) {
-                    micSeenPacketIds_.insert(recHeader->packetId);
-                    recoveredPacketToDeliver = std::move(recovered);
-                    LOG("WebRTC: Mic FEC recovered packet id=%u group=%u", recHeader->packetId, groupStart);
-                }
-                micFecGroups_.erase(groupStart);
-            }
+            acceptRecoveredPacket(groupStart, tryRecoverGroup(groupStart, group));
         }
 
         if (micFecGroups_.size() > 128) {
@@ -698,6 +670,8 @@ void WebRTCServer::SetupPeerConnection() {
             DBG("WebRTC: Failed to send KICKED message");
         }
     }
+
+    if (existingPc && callbacks_.onSessionReset) callbacks_.onSessionReset();
 
     Reset();
     needsKey = true;

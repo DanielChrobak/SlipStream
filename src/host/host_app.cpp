@@ -22,8 +22,69 @@
 namespace host {
 namespace {
 
+template <typename F>
+void SafeCall(const char* context, F&& fn) {
+    try { fn(); }
+    catch (const std::exception& e) { ERR("%s: %s", context, e.what()); }
+    catch (...) { ERR("%s: unknown exception", context); }
+}
+
+template <typename T, typename F>
+T SafeCall(const char* context, T fallback, F&& fn) {
+    try { return fn(); }
+    catch (const std::exception& e) { ERR("%s: %s", context, e.what()); }
+    catch (...) { ERR("%s: unknown exception", context); }
+    return fallback;
+}
+
 constexpr int kHttpsPort = 443;
 constexpr int64_t kFallbackFramePeriodUs = 16667;
+constexpr int kEncodeSizeQuantum = 8;
+
+int AlignEncodeDimension(int value, int maxValue) {
+    if (maxValue <= 0) return 0;
+
+    const int maxEven = std::max(2, maxValue & ~1);
+    int aligned = std::clamp(value, 2, maxEven) & ~1;
+    if (aligned >= maxEven) return maxEven;
+
+    if (aligned >= kEncodeSizeQuantum) {
+        aligned = (aligned / kEncodeSizeQuantum) * kEncodeSizeQuantum;
+    }
+
+    if (aligned < 2) aligned = 2;
+    if (aligned > maxEven) aligned = maxEven;
+    return aligned;
+}
+
+std::pair<int, int> ResolveEncodeResolution(int sourceW, int sourceH, int clientW, int clientH) {
+    if (sourceW <= 0 || sourceH <= 0) return {0, 0};
+
+    if (clientW <= 0 || clientH <= 0 || (clientW >= sourceW && clientH >= sourceH)) {
+        return {AlignEncodeDimension(sourceW, sourceW), AlignEncodeDimension(sourceH, sourceH)};
+    }
+
+    const double scale = std::min(
+        static_cast<double>(clientW) / static_cast<double>(sourceW),
+        static_cast<double>(clientH) / static_cast<double>(sourceH));
+
+    if (scale >= 1.0) return {AlignEncodeDimension(sourceW, sourceW), AlignEncodeDimension(sourceH, sourceH)};
+
+    int targetW = AlignEncodeDimension(static_cast<int>(std::floor(sourceW * scale)), sourceW);
+    int targetH = AlignEncodeDimension(static_cast<int>(std::floor(sourceH * scale)), sourceH);
+
+    const int heightFromWidth = AlignEncodeDimension(
+        static_cast<int>(std::floor(static_cast<double>(targetW) * static_cast<double>(sourceH) / static_cast<double>(sourceW))),
+        sourceH);
+    if (heightFromWidth <= clientH) targetH = std::max(2, heightFromWidth);
+
+    const int widthFromHeight = AlignEncodeDimension(
+        static_cast<int>(std::floor(static_cast<double>(targetH) * static_cast<double>(sourceW) / static_cast<double>(sourceH))),
+        sourceW);
+    if (widthFromHeight <= clientW) targetW = std::max(2, widthFromHeight);
+
+    return {std::max(2, targetW), std::max(2, targetH)};
+}
 
 class WinsockSession {
 public:
@@ -296,10 +357,7 @@ std::thread StartEncoderThread(
         auto freePending = [&] { frameSlot.MarkReleased(pendingFrame.poolIdx); pendingFrame.Release(); hasPendingFrame = false; };
         auto freeCurrent = [&] { frameSlot.MarkReleased(currentFrame.poolIdx); currentFrame.Release(); };
         auto promoteCurrent = [&] { pendingFrame = currentFrame; currentFrame = {}; hasPendingFrame = true; };
-        auto loadTargetFps = [&] {
-            int fps = targetFps.load(std::memory_order_acquire);
-            return fps > 0 ? fps : 60;
-        };
+        auto loadTargetFps = [&] { int fps = targetFps.load(std::memory_order_acquire); return fps > 0 ? fps : 60; };
 
         while (running.load(std::memory_order_acquire)) {
             if (!frameSlot.Pop(currentFrame)) {
@@ -320,21 +378,14 @@ std::thread StartEncoderThread(
 
             if (currentFrame.generation != currentGeneration) { freeCurrent(); continue; }
 
-            bool isStreaming = false;
-            try {
-                isStreaming = webrtcServer->IsStreaming() && encoderReady.load(std::memory_order_acquire);
-            } catch (const std::exception& e) {
-                ERR("EncoderThread: Exception checking streaming state: %s", e.what());
-            } catch (...) {
-                ERR("EncoderThread: Unknown exception checking streaming state");
-            }
+            bool isStreaming = SafeCall("EncoderThread: Exception checking streaming state", false, [&] {
+                return webrtcServer->IsStreaming() && encoderReady.load(std::memory_order_acquire);
+            });
 
             if (isStreaming && !wasStreaming) {
                 LOG("EncoderThread: Streaming started (fps=%d)", loadTargetFps());
                 std::lock_guard<std::mutex> lock(encoderMutex);
-                if (encoder) {
-                    encoder->Flush();
-                }
+                if (encoder) encoder->Flush();
 
                 framePeriodUs = 1000000 / loadTargetFps();
                 lastEncodeTs.store(0, std::memory_order_release);
@@ -355,14 +406,9 @@ std::thread StartEncoderThread(
 
             framePeriodUs = 1000000 / loadTargetFps();
 
-            bool needsKeyFrame = true;
-            try {
-                needsKeyFrame = webrtcServer->NeedsKey();
-            } catch (const std::exception& e) {
-                ERR("EncoderThread: Exception checking NeedsKey: %s", e.what());
-            } catch (...) {
-                ERR("EncoderThread: Unknown exception checking NeedsKey");
-            }
+            bool needsKeyFrame = SafeCall("EncoderThread: Exception checking NeedsKey", true, [&] {
+                return webrtcServer->NeedsKey();
+            });
 
             if (nextTs == 0) {
                 nextTs = currentFrame.ts;
@@ -434,8 +480,9 @@ std::thread StartEncoderThread(
             // Backpressure: skip encoding when the network send queue is congested
             static int congestionSkipCount = 0;
             static int64_t congestionStartUs = 0;
-            bool congested = false;
-            try { congested = webrtcServer->IsCongested(); } catch (...) {}
+            bool congested = SafeCall("EncoderThread: Exception checking congestion state", false, [&] {
+                return webrtcServer->IsCongested();
+            });
             if (congested && !needsKeyFrame) {
                 if (congestionSkipCount == 0) congestionStartUs = GetTimestamp();
                 congestionSkipCount++;
@@ -594,11 +641,7 @@ bool StartWorkerThreads(
     }
 
     threads = {};
-    threads.serverThread = std::thread([&] {
-        if (!server.listen_after_bind()) {
-            ERR("HTTPS server listener exited unexpectedly");
-        }
-    });
+    threads.serverThread = std::thread([&] { if (!server.listen_after_bind()) ERR("HTTPS server listener exited unexpectedly"); });
 
     threads.audioThread = StartThreadWithPriority(THREAD_PRIORITY_HIGHEST, [audioCapture = audioCapture.get(), webrtcServer, &app] {
         if (audioCapture == nullptr) {
@@ -613,17 +656,13 @@ bool StartWorkerThreads(
             }
 
             if (audioCapture->PopPacket(packet, 5)) {
-                try {
+                SafeCall("AudioThread: Exception sending audio", [&] {
                     bool sent = webrtcServer->SendAudio(packet.data, packet.ts, packet.samples);
                     if (!sent) {
                         DBG("AudioThread: SendAudio returned false (dataSize=%zu, ts=%lld, samples=%d)",
                             packet.data.size(), packet.ts, packet.samples);
                     }
-                } catch (const std::exception& e) {
-                    ERR("AudioThread: Exception sending audio: %s", e.what());
-                } catch (...) {
-                    ERR("AudioThread: Unknown exception sending audio");
-                }
+                });
             }
         }
     });
@@ -637,16 +676,12 @@ bool StartWorkerThreads(
 
             CursorType cursor{};
             if (input.GetCurrentCursor(cursor)) {
-                try {
+                SafeCall("CursorThread: Exception sending cursor", [&] {
                     bool sent = webrtcServer->SendCursorShape(cursor);
                     if (!sent) {
                         DBG("CursorThread: SendCursorShape returned false");
                     }
-                } catch (const std::exception& e) {
-                    ERR("CursorThread: Exception sending cursor: %s", e.what());
-                } catch (...) {
-                    ERR("CursorThread: Unknown exception sending cursor");
-                }
+                });
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
@@ -672,9 +707,16 @@ void ShutdownHost(
     std::unique_ptr<MicPlayback>& micPlayback,
     httplib::SSLServer& server,
     FrameSlot& frameSlot,
+    ScreenCapture& capture,
     const std::shared_ptr<WebRTCServer>& webrtcServer,
     const std::shared_ptr<PortMapper>& portMapper,
     WorkerThreads& threads) {
+    capture.Shutdown();
+
+    if (webrtcServer) {
+        webrtcServer->Shutdown();
+    }
+
     if (audioCapture) {
         audioCapture->Stop();
     }
@@ -692,10 +734,6 @@ void ShutdownHost(
 
     if (portMapper) {
         portMapper->Stop();
-    }
-
-    if (webrtcServer) {
-        webrtcServer->Shutdown();
     }
 }
 
@@ -731,6 +769,10 @@ int RunHostApp(int argc, char* argv[]) {
         std::atomic<CodecType> currentCodec{CODEC_AV1};
         std::mutex encoderInfoMutex;
         std::string activeEncoderName;
+        std::atomic<int> clientTargetWidth{0};
+        std::atomic<int> clientTargetHeight{0};
+        std::atomic<int> encodeTargetWidth{0};
+        std::atomic<int> encodeTargetHeight{0};
 
         InputHandler input;
         input.Enable();
@@ -773,6 +815,12 @@ int RunHostApp(int argc, char* argv[]) {
             return nextEncoder;
         };
 
+        auto resolveEncodeTarget = [&]() { return ResolveEncodeResolution(
+            capture.GetW(),
+            capture.GetH(),
+            clientTargetWidth.load(std::memory_order_acquire),
+            clientTargetHeight.load(std::memory_order_acquire)); };
+
         auto rebuildEncoder = [&](int width, int height, int fps, CodecType codec) -> bool {
             std::lock_guard<std::mutex> lock(encoderMutex);
             encoderReady.store(false, std::memory_order_release);
@@ -780,6 +828,8 @@ int RunHostApp(int argc, char* argv[]) {
 
             try {
                 encoder = createEncoder(width, height, fps, codec);
+                encodeTargetWidth.store(width, std::memory_order_release);
+                encodeTargetHeight.store(height, std::memory_order_release);
                 encoderReady.store(true, std::memory_order_release);
                 return true;
             } catch (const std::exception& ex) {
@@ -788,18 +838,62 @@ int RunHostApp(int argc, char* argv[]) {
             }
         };
 
+        auto rebuildResolvedEncoder = [&](int fps, CodecType codec, const char* reason) -> bool {
+            const auto [targetWidth, targetHeight] = resolveEncodeTarget();
+            if (targetWidth <= 0 || targetHeight <= 0) {
+                ERR("Invalid encode target size resolved for %s", reason ? reason : "unknown");
+                return false;
+            }
+
+            const int previousWidth = encodeTargetWidth.load(std::memory_order_acquire);
+            const int previousHeight = encodeTargetHeight.load(std::memory_order_acquire);
+            if (targetWidth != previousWidth || targetHeight != previousHeight) {
+                LOG("Encode target: %s -> %dx%d (source=%dx%d, client=%dx%d)",
+                    reason ? reason : "update",
+                    targetWidth,
+                    targetHeight,
+                    capture.GetW(),
+                    capture.GetH(),
+                    clientTargetWidth.load(std::memory_order_acquire),
+                    clientTargetHeight.load(std::memory_order_acquire));
+            }
+
+            return rebuildEncoder(targetWidth, targetHeight, fps, codec);
+        };
+
         capture.SetResolutionChangeCallback([&](int width, int height, int fps) {
             LOG("Resolution change: %dx%d@%d", width, height, fps);
-            rebuildEncoder(width, height, fps, currentCodec.load(std::memory_order_acquire));
+            if (rebuildResolvedEncoder(fps, currentCodec.load(std::memory_order_acquire), "source-resolution-change")) {
+                webrtcServer->RequestKeyframe();
+            }
         });
 
         std::atomic<bool> cursorCapture{false};
         std::atomic<int64_t> lastEncodeTs{0};
         std::atomic<int> targetFps{60};
 
-        webrtcServer->Init({
-            &input,
-            [&](int fps, uint8_t) {
+        auto clearStreamingState = [&](bool resetFrameSlot) {
+            lastEncodeTs.store(0, std::memory_order_release);
+            clientTargetWidth.store(0, std::memory_order_release);
+            clientTargetHeight.store(0, std::memory_order_release);
+            encodeTargetWidth.store(0, std::memory_order_release);
+            encodeTargetHeight.store(0, std::memory_order_release);
+            encoderReady.store(false, std::memory_order_release);
+            { std::lock_guard<std::mutex> lock(encoderMutex); encoder.reset(); }
+            { std::lock_guard<std::mutex> lock(encoderInfoMutex); activeEncoderName.clear(); }
+            if (audioCapture) audioCapture->SetStreaming(false);
+            if (micPlayback) micPlayback->SetStreaming(false);
+            if (resetFrameSlot) {
+                frameSlot.SetGeneration(frameSlot.GetGeneration() + 1);
+                frameSlot.Reset();
+                wiggle.Request();
+            }
+            frameSlot.Wake();
+        };
+
+        WebRTCCallbacks callbacks{};
+        callbacks.input = &input;
+        callbacks.onFpsChange = [&](int fps, uint8_t) {
                 capture.SetFPS(fps);
                 targetFps.store(fps, std::memory_order_release);
                 lastEncodeTs.store(0, std::memory_order_release);
@@ -808,8 +902,11 @@ int RunHostApp(int argc, char* argv[]) {
                     encoder->UpdateFPS(fps);
                 } else {
                     try {
-                        encoder = createEncoder(capture.GetW(), capture.GetH(), fps,
+                        const auto [targetWidth, targetHeight] = resolveEncodeTarget();
+                        encoder = createEncoder(targetWidth, targetHeight, fps,
                             currentCodec.load(std::memory_order_acquire));
+                        encodeTargetWidth.store(targetWidth, std::memory_order_release);
+                        encodeTargetHeight.store(targetHeight, std::memory_order_release);
                         encoderReady.store(true, std::memory_order_release);
                     } catch (const std::exception& e) {
                         ERR("Failed to create encoder: %s", e.what());
@@ -819,42 +916,67 @@ int RunHostApp(int argc, char* argv[]) {
                 }
                 if (!capture.IsCapturing()) capture.StartCapture();
                 frameSlot.Wake();
-            },
-            [&] { return capture.RefreshHostFPS(); },
-            [&] { return capture.GetCurrentMonitorIndex(); },
-            [&](int idx) -> bool {
+            };
+        callbacks.getHostFps = [&] { return capture.RefreshHostFPS(); };
+        callbacks.getMonitor = [&] { return capture.GetCurrentMonitorIndex(); };
+        callbacks.onMonitorChange = [&](int idx) -> bool {
                 if (!capture.SwitchMonitor(idx)) return false;
                 UpdateInputBoundsForMonitor(input, idx);
                 lastEncodeTs.store(0, std::memory_order_release);
                 wiggle.Request();
                 return true;
-            },
-            [&] {
-                capture.PauseCapture(); frameSlot.Wake();
-                lastEncodeTs.store(0, std::memory_order_release);
-                if (audioCapture) audioCapture->SetStreaming(false);
-            },
-            [&] { frameSlot.Wake(); lastEncodeTs.store(0, std::memory_order_release); wiggle.Request(); },
-            [&](CodecType codec) -> bool {
+            };
+        callbacks.onDisconnect = [&] {
+                capture.PauseCapture();
+                clearStreamingState(false);
+            };
+        callbacks.onConnected = [&] {
+            frameSlot.Wake();
+            lastEncodeTs.store(0, std::memory_order_release);
+            wiggle.Request();
+        };
+        callbacks.onCodecChange = [&](CodecType codec) -> bool {
                 if (codec == currentCodec.load(std::memory_order_acquire)) return true;
                 if (!(codecCaps & (1 << static_cast<int>(codec)))) return false;
-                if (!rebuildEncoder(capture.GetW(), capture.GetH(), capture.GetCurrentFPS(), codec)) return false;
+                if (!rebuildResolvedEncoder(capture.GetCurrentFPS(), codec, "codec-change")) return false;
                 lastEncodeTs.store(0, std::memory_order_release);
                 return true;
-            },
-            [&] { return currentCodec.load(std::memory_order_acquire); },
-            [&] { return codecCaps; },
-            [&] {
+            };
+        callbacks.getCodec = [&] { return currentCodec.load(std::memory_order_acquire); };
+        callbacks.getCodecCaps = [&] { return codecCaps; };
+        callbacks.getEncoderName = [&] {
                 std::lock_guard<std::mutex> lock(encoderInfoMutex);
                 return activeEncoderName;
-            },
-            [&] { return input.GetClipboardText(); },
-            [&](const std::string& text) { return input.SetClipboardText(text); },
-            [&](bool e) { cursorCapture.store(e, std::memory_order_release); capture.SetCursorCapture(e); },
-            [&](bool e) { if (audioCapture) audioCapture->SetStreaming(e); },
-            [&](bool e) { if (micPlayback) micPlayback->SetStreaming(e); },
-            [&](const uint8_t* d, size_t n) { if (micPlayback && micPlayback->IsInitialized()) micPlayback->PushPacket(d, n); },
-        });
+            };
+        callbacks.onStreamTargetChange = [&](int width, int height) {
+                clientTargetWidth.store(width, std::memory_order_release);
+                clientTargetHeight.store(height, std::memory_order_release);
+
+                const auto [targetWidth, targetHeight] = resolveEncodeTarget();
+                const int currentWidth = encodeTargetWidth.load(std::memory_order_acquire);
+                const int currentHeight = encodeTargetHeight.load(std::memory_order_acquire);
+                if (targetWidth == currentWidth && targetHeight == currentHeight) return;
+
+                if (rebuildResolvedEncoder(capture.GetCurrentFPS(), currentCodec.load(std::memory_order_acquire), "client-stream-target")) {
+                    webrtcServer->RequestKeyframe();
+                    lastEncodeTs.store(0, std::memory_order_release);
+                    frameSlot.Wake();
+                }
+            };
+        callbacks.getClipboard = [&] { return input.GetClipboardText(); };
+        callbacks.setClipboard = [&](const std::string& text) { return input.SetClipboardText(text); };
+        callbacks.onCursorCapture = [&](bool e) { cursorCapture.store(e, std::memory_order_release); capture.SetCursorCapture(e); };
+        callbacks.onAudioEnable = [&](bool e) { if (audioCapture) audioCapture->SetStreaming(e); };
+        callbacks.onMicEnable = [&](bool e) { if (micPlayback) micPlayback->SetStreaming(e); };
+        callbacks.onMicData = [&](const uint8_t* d, size_t n) {
+            if (micPlayback && micPlayback->IsInitialized()) micPlayback->PushPacket(d, n);
+        };
+        callbacks.onSessionReset = [&] {
+            capture.PauseCapture();
+            clearStreamingState(true);
+        };
+
+        webrtcServer->Init(std::move(callbacks));
 
         const auto certPath = GetSSLCertFilePath();
         const auto keyPath = GetSSLKeyFilePath();
@@ -869,20 +991,20 @@ int RunHostApp(int argc, char* argv[]) {
 
         WorkerThreads threads{};
         if (!StartWorkerThreads(
-                app,
-                server,
-                frameSlot,
-                capture,
-                webrtcServer,
-                input,
-                cursorCapture,
-                encoderMutex,
-                encoder,
-                encoderReady,
-                lastEncodeTs,
-                targetFps,
-                audioCapture,
-                threads)) {
+            app,
+            server,
+            frameSlot,
+            capture,
+            webrtcServer,
+            input,
+            cursorCapture,
+            encoderMutex,
+            encoder,
+            encoderReady,
+            lastEncodeTs,
+            targetFps,
+            audioCapture,
+            threads)) {
             return 1;
         }
 
@@ -901,12 +1023,14 @@ int RunHostApp(int argc, char* argv[]) {
         }
 
         while (app.running.load(std::memory_order_acquire)) {
-            PumpAppTrayMessages();
+            if (!PumpAppTrayMessages()) {
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
         LOG("Shutting down...");
-        ShutdownHost(audioCapture, micPlayback, server, frameSlot, webrtcServer, portMapper, threads);
+        ShutdownHost(audioCapture, micPlayback, server, frameSlot, capture, webrtcServer, portMapper, threads);
 
         CleanupAppTray();
         LOG("Shutdown complete");

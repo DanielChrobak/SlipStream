@@ -55,6 +55,7 @@ Source: "build\bin\{#BuildConfig}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "build\bin\{#BuildConfig}\index.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "build\bin\{#BuildConfig}\styles.css"; DestDir: "{app}"; Flags: ignoreversion
 Source: "build\bin\{#BuildConfig}\js\*"; DestDir: "{app}\js"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "SlipStream.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#RunArgs}"

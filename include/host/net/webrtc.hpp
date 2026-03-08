@@ -32,10 +32,12 @@ struct WebRTCCallbacks {
     std::function<CodecType()> getCodec;
     std::function<uint8_t()> getCodecCaps;
     std::function<std::string()> getEncoderName;
+    std::function<void(int, int)> onStreamTargetChange;
     std::function<std::string()> getClipboard;
     std::function<bool(const std::string&)> setClipboard;
     std::function<void(bool)> onCursorCapture, onAudioEnable, onMicEnable;
     std::function<void(const uint8_t*, size_t)> onMicData;
+    std::function<void()> onSessionReset;
 };
 
 class WebRTCServer {
@@ -116,6 +118,7 @@ public:
 
     [[nodiscard]] bool IsStreaming() const { return conn && fpsRecv && chRdy == NUM_CH; }
     [[nodiscard]] bool NeedsKey() const { return needsKey.load(std::memory_order_acquire); }
+    void RequestKeyframe() { needsKey.store(true, std::memory_order_release); }
     void OnKeyframeSent() { needsKey.store(false, std::memory_order_release); }
     [[nodiscard]] bool IsCongested() const;
     [[nodiscard]] bool SendCursorShape(CursorType ct);

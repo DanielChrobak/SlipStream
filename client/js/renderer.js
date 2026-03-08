@@ -1,6 +1,7 @@
 
 import { C, CURSOR_TYPES } from './constants.js';
 import { S, syncedServerTimestampAgeMs, recordRenderTime, recordVideoLatencySample, logVideoDrop, log, safe } from './state.js';
+import { updateStreamTarget } from './protocol.js';
 
 export const canvas = document.querySelector('#c');
 export let canvasW = 0, canvasH = 0;
@@ -28,6 +29,7 @@ const updateSize = () => {
     if (displayW > 0 && displayH > 0 && (canvas.width !== displayW || canvas.height !== displayH)) {
         canvas.width = canvasW = displayW;
         canvas.height = canvasH = displayH;
+        updateStreamTarget(canvasW, canvasH);
         log.debug('RENDER', 'Canvas resized', { w: canvasW, h: canvasH, dpr });
         return true;
     }
